@@ -173,12 +173,13 @@ class WebRTCProxyRobot(Robot):
     config_class = WebRTCProxyRobotConfig
     name = "webrtc_proxy"
 
-    def __init__(self, config: WebRTCProxyRobotConfig, inventory: DeviceInventory | None = None):
+    def __init__(self, config: WebRTCProxyRobotConfig, inventory: DeviceInventory | None = None, camera=None):
         super().__init__(config)
         self.config = config
-        # Loopback only: the device inventory the in-process Mac agent answers from.
-        # Real mode reaches the Mac's own inventory over the control channel.
+        # Loopback only: the device inventory + camera the in-process Mac agent uses.
+        # Real mode reaches the Mac's own devices over the WebRTC link / control channel.
         self._loopback_inventory = inventory
+        self._loopback_camera = camera
         if len(config.cameras) != 1:
             # M1 transports a single media track. Multi-camera is M2 (one track each).
             raise NotImplementedError(
@@ -249,6 +250,7 @@ class WebRTCProxyRobot(Robot):
                     capture_fps=self.config.capture_fps,
                     action_timeout_s=self.config.action_timeout_s,
                     inventory=self._loopback_inventory,
+                    camera=self._loopback_camera,
                 )
                 await asyncio.gather(self._endpoint.run(proxy_sig), self._agent.run())
             else:

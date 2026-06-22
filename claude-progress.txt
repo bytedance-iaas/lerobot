@@ -8,7 +8,10 @@ Current summary:
 - M3 控制面 (F8-F9) completed：control DataChannel + RPC；设备发现 list_ports/list_cameras/
   find_port(begin→result 事件驱动)；物理 ID 只在 Mac，云端只有逻辑名。
   - 新增 LocalDeviceInventory（包 lerobot find_available_ports / find_*_cameras），
-    mac_daemon `--real-devices` 开关枚举真实串口/相机；真串口经控制面回环已验证(16 passed)。
+    mac_daemon `--real-devices` 开关枚举真实串口/相机；真串口经控制面回环已验证。
+  - 真相机推流：CaptureAgent 接 camera(read_latest) + _fit_frame 归一到声明尺寸；
+    mac_daemon `--real-camera <index|/dev/videoN>` 开 OpenCVCamera 推流（daemon 持有相机生命周期，跨 session 复用）。
+    回环用 FakeCamera 验证帧颜色穿过 VP8 编解码到云端（18 passed）。关节/send_action 仍是合成，属 M2。
 - F10 completed：真 Mac daemon ↔ 云端 controller。
   - signaling.py 加 WebSocketSignaling client；signaling_server.py 信令 relay（按 session/role 转发 SDP，
     缓冲晚到方，对端断开发 bye）。

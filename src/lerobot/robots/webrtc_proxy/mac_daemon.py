@@ -55,9 +55,14 @@ async def run_daemon(
     action_timeout_s: float = 0.5,
     ice_servers: list[str] | None = None,
     inventory: DeviceInventory | None = None,
+    camera=None,
     stop: asyncio.Event | None = None,
 ) -> None:
-    """Serve cloud sessions forever (until ``stop`` is set), one session at a time."""
+    """Serve cloud sessions forever (until ``stop`` is set), one session at a time.
+
+    The camera (if any) is owned by the caller and reused across sessions — only the
+    per-session WebRTC peer is rebuilt each loop.
+    """
     motors = list(motors or SO100_MOTORS)
     stop = stop or asyncio.Event()
     while not stop.is_set():
@@ -72,6 +77,7 @@ async def run_daemon(
             action_timeout_s=action_timeout_s,
             inventory=inventory if inventory is not None else SyntheticInventory(),
             ice_servers=ice_servers,
+            camera=camera,
         )
         try:
             await agent.run()  # blocks here until a controller answers the offer
@@ -108,11 +114,27 @@ def main() -> None:
         action="store_true",
         help="enumerate the Mac's actual serial ports + cameras (find_port/list_cameras return real ids)",
     )
+    parser.add_argument(
+        "--real-camera",
+        default=None,
+        help="open this opencv camera (index e.g. 0, or /dev/videoN) and stream it instead of synthetic frames",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
     inventory: DeviceInventory = LocalDeviceInventory() if args.real_devices else SyntheticInventory()
     logger.info("daemon device inventory: %s", type(inventory).__name__)
+
+    camera = None
+    if args.real_camera is not None:
+        from lerobot.cameras.opencv import OpenCVCamera, OpenCVCameraConfig
+
+        index_or_path = int(args.real_camera) if args.real_camera.isdigit() else args.real_camera
+        camera = OpenCVCamera(
+            OpenCVCameraConfig(index_or_path=index_or_path, fps=args.fps, width=args.width, height=args.height)
+        )
+        camera.connect()
+        logger.info("daemon streaming real camera %r @ %dx%d", index_or_path, args.width, args.height)
 
     try:
         asyncio.run(
@@ -126,10 +148,14 @@ def main() -> None:
                 action_timeout_s=args.action_timeout,
                 ice_servers=args.ice_server,
                 inventory=inventory,
+                camera=camera,
             )
         )
     except KeyboardInterrupt:
         pass
+    finally:
+        if camera is not None:
+            camera.disconnect()
 
 
 if __name__ == "__main__":
