@@ -42,9 +42,33 @@ import os
 import sys
 from typing import Any, Protocol
 
+import numpy as np
+
 from .protocol import RpcRequest, RpcResponse
 
 logger = logging.getLogger(__name__)
+
+
+def _encode_jpeg_b64(rgb: np.ndarray, quality: int = 75) -> str:
+    """RGB uint8 frame -> base64 JPEG string (small enough for the control DataChannel)."""
+    import base64
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.fromarray(rgb).save(buf, format="JPEG", quality=quality)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _decode_jpeg_b64(b64: str) -> np.ndarray:
+    """Inverse of :func:`_encode_jpeg_b64`: base64 JPEG -> RGB uint8 ndarray."""
+    import base64
+    import io
+
+    from PIL import Image
+
+    return np.asarray(Image.open(io.BytesIO(base64.b64decode(b64))))
 
 
 @contextlib.contextmanager
@@ -82,6 +106,10 @@ class DeviceInventory(Protocol):
 
     def list_cameras(self) -> list[dict[str, Any]]: ...
 
+    def grab_frame(self, cam_id: Any, width: int, height: int) -> np.ndarray:
+        """Open camera ``cam_id``, return one RGB uint8 frame (for an onboarding preview)."""
+        ...
+
 
 class SyntheticInventory:
     """In-memory inventory for loopback tests / the synthetic capture agent.
@@ -114,6 +142,13 @@ class SyntheticInventory:
 
     def list_cameras(self) -> list[dict[str, Any]]:
         return [dict(c) for c in self._cameras]
+
+    def grab_frame(self, cam_id: Any, width: int = 320, height: int = 240) -> np.ndarray:
+        # Distinct flat colour per id so previews are visually distinguishable in tests.
+        seed = int(cam_id) if str(cam_id).lstrip("-").isdigit() else abs(hash(str(cam_id)))
+        img = np.empty((height, width, 3), dtype=np.uint8)
+        img[:] = ((seed * 70) % 256, (seed * 40 + 80) % 256, 120)
+        return img
 
     def simulate_unplug(self, port: str) -> None:
         if port in self._ports:
@@ -149,6 +184,29 @@ class LocalDeviceInventory:
 
             # Each dict carries a stable id ('id' = opencv index_or_path / realsense serial).
             return [*find_all_opencv_cameras(), *find_all_realsense_cameras()]
+
+    def grab_frame(self, cam_id: Any, width: int = 320, height: int = 240) -> np.ndarray:
+        """Open this opencv camera at its *native* resolution, read one frame, close it,
+        then downscale to a small preview. Onboarding preview only — fails if the camera
+        is already in use (e.g. currently being streamed).
+
+        We deliberately don't request a capture size: OpenCVCamera errors if the camera
+        can't apply it. Resize happens in software afterwards.
+        """
+        import cv2
+
+        from lerobot.cameras.opencv import OpenCVCamera, OpenCVCameraConfig
+
+        index_or_path = int(cam_id) if str(cam_id).isdigit() else cam_id
+        with _silence_native_stderr():
+            cam = OpenCVCamera(OpenCVCameraConfig(index_or_path=index_or_path))
+            cam.connect(warmup=True)
+            try:
+                frame = cam.read()  # RGB uint8, native resolution
+            finally:
+                cam.disconnect()
+            frame = cv2.resize(frame, (width, height))
+        return np.ascontiguousarray(frame)
 
 
 class ControlServer:
@@ -186,6 +244,11 @@ class ControlServer:
             return {"ports": self.inventory.list_ports()}
         if req.method == "list_cameras":
             return {"cameras": self.inventory.list_cameras()}
+        if req.method == "grab_camera":
+            width = int(req.params.get("width", 320))
+            height = int(req.params.get("height", 240))
+            frame = self.inventory.grab_frame(req.params["id"], width, height)
+            return {"jpeg_b64": _encode_jpeg_b64(frame), "width": frame.shape[1], "height": frame.shape[0]}
         if req.method == "find_port_begin":
             self._ports_before = self.inventory.list_ports()
             return {"ports": list(self._ports_before)}

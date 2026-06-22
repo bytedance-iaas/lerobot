@@ -47,6 +47,28 @@ def test_fit_frame_resizes_and_normalizes():
     assert out.flags["C_CONTIGUOUS"]
 
 
+def test_grab_camera_preview_over_loopback():
+    """Cloud-driven single-frame grab returns a decoded RGB image of the asked size."""
+    from lerobot.robots.webrtc_proxy.control import SyntheticInventory
+
+    cfg = WebRTCProxyRobotConfig(
+        cameras={"front": WebRTCCameraSpec(height=48, width=64, fps=30)},
+        capture_fps=30,
+        connect_timeout_s=15.0,
+    )
+    robot = WebRTCProxyRobot(cfg, inventory=SyntheticInventory())
+    robot.connect()
+    try:
+        img = robot.grab_camera_preview(1, width=64, height=48)
+        assert img.shape == (48, 64, 3)
+        assert img.dtype == np.uint8
+        # SyntheticInventory colours each id distinctly -> id 0 and id 1 differ.
+        other = robot.grab_camera_preview(0, width=64, height=48)
+        assert not np.array_equal(img, other)
+    finally:
+        robot.disconnect()
+
+
 def test_real_camera_frames_reach_the_cloud():
     color = (200, 100, 50)
     cam = _FakeCamera(48, 64, color)
