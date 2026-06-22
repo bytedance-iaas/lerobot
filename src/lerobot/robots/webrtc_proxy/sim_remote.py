@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import threading
 import time
@@ -102,7 +103,7 @@ def main() -> None:
 
     # cloud: signaling relay
     relay_loop = _spawn_loop()
-    _, port = asyncio.run_coroutine_threadsafe(start_relay("127.0.0.1", 0), relay_loop).result(timeout=5)
+    runner, port = asyncio.run_coroutine_threadsafe(start_relay("127.0.0.1", 0), relay_loop).result(timeout=5)
     url = f"ws://127.0.0.1:{port}/ws"
 
     # Mac: daemon
@@ -129,11 +130,15 @@ def main() -> None:
     try:
         _run_rpc(robot, args.rpc, inventory)
     finally:
-        robot.disconnect()
-        daemon_fut.cancel()
-        time.sleep(0.2)
+        # Ordered, graceful shutdown so aiohttp/aiortc close cleanly (no pending-task spam):
+        robot.disconnect()  # closes the controller pc + its ws session
+        daemon_fut.cancel()  # interrupts the daemon's wait; its finally closes agent + ws
+        time.sleep(0.3)  # let that finally run on the still-spinning daemon loop
+        with contextlib.suppress(Exception):
+            asyncio.run_coroutine_threadsafe(runner.cleanup(), relay_loop).result(timeout=3)
         daemon_loop.call_soon_threadsafe(daemon_loop.stop)
         relay_loop.call_soon_threadsafe(relay_loop.stop)
+        time.sleep(0.1)
     print("done")
 
 
