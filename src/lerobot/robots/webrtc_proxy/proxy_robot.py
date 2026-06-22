@@ -323,6 +323,18 @@ class WebRTCProxyRobot(Robot):
         """Step 2/2 (after the user unplugged): the port that disappeared = the bus."""
         return self._control("find_port_result")["port"]
 
+    def grab_camera_preview(self, cam_id, width: int = 320, height: int = 240) -> np.ndarray:
+        """Grab one frame from camera ``cam_id`` on the Mac (RGB uint8 ndarray).
+
+        For onboarding previews — pick which physical camera is "front"/"wrist" before
+        pinning the stream. Opens the camera on the Mac, so it fails if that camera is
+        already being streamed; preview the others first, then start streaming.
+        """
+        from .control import _decode_jpeg_b64
+
+        res = self._control("grab_camera", {"id": cam_id, "width": width, "height": height}, timeout=15.0)
+        return _decode_jpeg_b64(res["jpeg_b64"])
+
     def disconnect(self) -> None:
         if not self._connected:
             return

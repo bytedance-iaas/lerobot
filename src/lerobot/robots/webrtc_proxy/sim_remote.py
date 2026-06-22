@@ -61,7 +61,17 @@ def _spawn_loop() -> asyncio.AbstractEventLoop:
     return loop
 
 
-def _run_rpc(robot: WebRTCProxyRobot, rpc: str, inventory: DeviceInventory) -> None:
+def _run_rpc(robot: WebRTCProxyRobot, rpc: str, inventory: DeviceInventory, camera_id, save: str | None) -> None:
+    if rpc == "grab":
+        img = robot.grab_camera_preview(camera_id, width=320, height=240)
+        print(f"REMOTE grab_camera_preview(id={camera_id!r}): {img.shape} {img.dtype} "
+              f"mean RGB {img.reshape(-1, 3).mean(0).round(1)}")
+        if save:
+            from PIL import Image
+
+            Image.fromarray(img).save(save)
+            print(f"  saved {save}")
+        return
     if rpc in ("list_ports", "all"):
         print("REMOTE list_ports():", robot.list_ports())
     if rpc in ("list_cameras", "all"):
@@ -89,10 +99,13 @@ def main() -> None:
     parser.add_argument(
         "--rpc",
         default="list_cameras",
-        choices=["list_ports", "list_cameras", "find_port", "observe", "all"],
+        choices=["list_ports", "list_cameras", "grab", "find_port", "observe", "all"],
     )
     parser.add_argument("--real-devices", action="store_true", help="enumerate this machine's real devices")
+    parser.add_argument("--camera-id", default="0", help="camera id for --rpc grab (int index or path)")
+    parser.add_argument("--save", default=None, help="for --rpc grab: save the frame to this PNG path")
     args = parser.parse_args()
+    camera_id = int(args.camera_id) if args.camera_id.isdigit() else args.camera_id
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 
     inventory: DeviceInventory = (
@@ -128,7 +141,7 @@ def main() -> None:
     print(f"controller connecting to {url} ...")
     robot.connect()
     try:
-        _run_rpc(robot, args.rpc, inventory)
+        _run_rpc(robot, args.rpc, inventory, camera_id, args.save)
     finally:
         # Ordered, graceful shutdown so aiohttp/aiortc close cleanly (no pending-task spam):
         robot.disconnect()  # closes the controller pc + its ws session
