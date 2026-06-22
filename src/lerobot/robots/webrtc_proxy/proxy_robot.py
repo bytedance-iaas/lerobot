@@ -48,7 +48,8 @@ from ..robot import Robot
 from .alignment import AlignmentBuffer
 from .capture_agent import CaptureAgent
 from .configuration_webrtc_proxy import WebRTCProxyRobotConfig
-from .protocol import CH_ACTION, CH_FRAMEMETA, CH_STATE, ActionMsg, FrameMetaMsg, StateMsg
+from .control import ControlClient, DeviceInventory
+from .protocol import CH_ACTION, CH_CONTROL, CH_FRAMEMETA, CH_STATE, ActionMsg, FrameMetaMsg, StateMsg
 from .signaling import Signaling, loopback_signaling_pair
 
 logger = logging.getLogger(__name__)
@@ -67,6 +68,7 @@ class _ProxyEndpoint:
         self._framemeta: deque[FrameMetaMsg] = deque(maxlen=256)
         self.connected = asyncio.Event()
         self._action_seq = 0
+        self._control = ControlClient()
         self._register()
 
     def _register(self) -> None:
@@ -78,6 +80,8 @@ class _ProxyEndpoint:
                 channel.on("message", self._on_framemeta)
             elif channel.label == CH_ACTION:
                 self._ch_action = channel
+            elif channel.label == CH_CONTROL:
+                self._control.attach(channel)
 
         @self.pc.on("track")
         def _on_track(track):  # noqa: ANN001
@@ -132,6 +136,9 @@ class _ProxyEndpoint:
         self._ch_action.send(ActionMsg(t=time.monotonic(), seq=self._action_seq, goal=goal).to_json())
         return goal
 
+    async def control_call(self, method: str, params: dict | None = None, timeout: float = 10.0):
+        return await self._control.call(method, params, timeout)
+
     async def close(self) -> None:
         await self.pc.close()
 
@@ -164,9 +171,12 @@ class WebRTCProxyRobot(Robot):
     config_class = WebRTCProxyRobotConfig
     name = "webrtc_proxy"
 
-    def __init__(self, config: WebRTCProxyRobotConfig):
+    def __init__(self, config: WebRTCProxyRobotConfig, inventory: DeviceInventory | None = None):
         super().__init__(config)
         self.config = config
+        # Loopback only: the device inventory the in-process Mac agent answers from.
+        # Real mode reaches the Mac's own inventory over the control channel.
+        self._loopback_inventory = inventory
         if len(config.cameras) != 1:
             # M1 transports a single media track. Multi-camera is M2 (one track each).
             raise NotImplementedError(
@@ -235,6 +245,7 @@ class WebRTCProxyRobot(Robot):
                 cam_width=self.cam_spec.width,
                 capture_fps=self.config.capture_fps,
                 action_timeout_s=self.config.action_timeout_s,
+                inventory=self._loopback_inventory,
             )
             await asyncio.gather(self._endpoint.run(proxy_sig), self._agent.run())
             await self._endpoint.connected.wait()
@@ -274,6 +285,31 @@ class WebRTCProxyRobot(Robot):
             raise RuntimeError("WebRTCProxyRobot not connected")
         goal = {k: float(v) for k, v in action.items() if k.endswith(".pos")}
         return self._loop.run(self._endpoint.send_action(goal), timeout=2.0)
+
+    # ----- control plane: cloud-driven device onboarding (M3) ---------------
+    # These reach the *Mac's* OS over the control channel; port/camera IDs never
+    # live in the cloud config. find_port is two-step because the human unplugs
+    # the bus on the Mac between the calls (the cloud cannot share that stdin).
+    def _control(self, method: str, params: dict | None = None, timeout: float = 10.0):
+        if not self._connected or self._endpoint is None or self._loop is None:
+            raise RuntimeError("WebRTCProxyRobot not connected")
+        return self._loop.run(self._endpoint.control_call(method, params, timeout), timeout=timeout + 1.0)
+
+    def list_ports(self) -> list[str]:
+        """Serial ports currently visible on the Mac."""
+        return self._control("list_ports")["ports"]
+
+    def list_cameras(self) -> list[dict]:
+        """Cameras on the Mac, each with a stable id (opencv index_or_path / realsense serial)."""
+        return self._control("list_cameras")["cameras"]
+
+    def find_port_begin(self) -> list[str]:
+        """Step 1/2: snapshot ports, then prompt the user (Mac-side) to unplug the bus."""
+        return self._control("find_port_begin")["ports"]
+
+    def find_port_result(self) -> str:
+        """Step 2/2 (after the user unplugged): the port that disappeared = the bus."""
+        return self._control("find_port_result")["port"]
 
     def disconnect(self) -> None:
         if not self._connected:

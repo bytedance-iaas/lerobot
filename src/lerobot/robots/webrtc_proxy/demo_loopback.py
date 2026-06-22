@@ -45,6 +45,15 @@ def main() -> None:
     print("action_features:    ", robot.action_features)
 
     robot.connect()
+
+    print("\n== control plane: cloud-driven device discovery (over the Mac) ==")
+    print("  list_ports():  ", robot.list_ports())
+    print("  list_cameras():", robot.list_cameras())
+    before = robot.find_port_begin()
+    # In production the user unplugs the bus here; the synthetic Mac simulates it.
+    robot._agent._control.inventory.simulate_unplug(before[-1])
+    print(f"  find_port: begin={before} -> result={robot.find_port_result()!r} (the bus)")
+
     print("\n== connected; streaming re-assembled observations (capture-ts aligned) ==")
     try:
         for _ in range(30):
