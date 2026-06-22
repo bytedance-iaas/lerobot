@@ -50,6 +50,9 @@ is declared correctly.
 - **`mac_daemon.py`** — the persistent Mac-side daemon: connect → offer → serve one
   session → safe the arm on drop → loop. Standalone entrypoint with reconnect.
 - **`demo_loopback.py`** — runnable single-machine (in-process) demo.
+- **`sim_remote.py`** — simulate the *remote* control plane on one machine: relay +
+  daemon + controller as three loops over localhost, then run one RPC and print the
+  result. `python -m ...sim_remote --rpc list_cameras|list_ports|find_port|observe|all`.
 
 ## Install
 
@@ -73,6 +76,14 @@ clean disconnect.
 
 The demo also exercises the **control plane**: `list_ports()`, `list_cameras()`, and
 the two-step `find_port_begin()` → (user unplugs the bus) → `find_port_result()`.
+
+To simulate one such call over the *remote* path (relay + daemon + controller, three
+loops, localhost sockets) without three terminals:
+
+```bash
+python -m lerobot.robots.webrtc_proxy.sim_remote --rpc list_cameras   # or list_ports / find_port / observe / all
+python -m lerobot.robots.webrtc_proxy.sim_remote --rpc list_cameras --real-devices   # this machine's real devices
+```
 
 ### Device onboarding (port + camera IDs)
 
