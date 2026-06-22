@@ -105,9 +105,10 @@ any single cloud session. They meet on a WebSocket signaling relay. On one machi
 ```bash
 # 1) signaling relay (lives cloud-side in prod)
 python -m lerobot.robots.webrtc_proxy.signaling_server --port 8765
-# 2) Mac daemon (synthetic source in M3; real so_follower + cameras in M2).
-#    add --real-devices to enumerate the Mac's actual ports/cameras for find_port.
-python -m lerobot.robots.webrtc_proxy.mac_daemon --signaling-url ws://127.0.0.1:8765/ws
+# 2) Mac daemon. --real-devices => real find_port/list_cameras; --real-camera 0 =>
+#    open & stream that opencv camera (index or /dev/videoN) instead of synthetic frames.
+python -m lerobot.robots.webrtc_proxy.mac_daemon \
+    --signaling-url ws://127.0.0.1:8765/ws --real-devices --real-camera 0 --width 640 --height 480
 # 3) cloud controller
 python - <<'PY'
 from lerobot.robots.webrtc_proxy.configuration_webrtc_proxy import WebRTCProxyRobotConfig, WebRTCCameraSpec
@@ -139,8 +140,10 @@ uv run pytest tests/robots/test_webrtc_proxy_alignment.py \
   drops this de-syncs. Production must carry `seq` in an RTP header extension or
   in-pixel. (M3)
 - **Single camera.** M1 transports one media track. Multi-camera = one track each. (M2)
-- **Synthetic source.** `CaptureAgent._capture_sample` / `_apply_action` /
-  `_safe_stop` are stubs; M2 wires them to a real `so_follower` + cameras.
+- **Source: camera real, arm still synthetic.** `--real-camera` streams a real
+  opencv camera over the media track (`CaptureAgent` reads `camera.read_latest()`).
+  Joints (`_capture_sample`), `_apply_action` and `_safe_stop` are still stubs — M2
+  wires them to a real `so_follower` (read present position, drive goal, cut torque).
 - **Device inventory: real but read-only.** `--real-devices` enumerates the Mac's
   actual ports + cameras (`LocalDeviceInventory`), so cloud-driven `find_port` /
   `list_cameras` return real ids. Default stays `SyntheticInventory`. Persisting the

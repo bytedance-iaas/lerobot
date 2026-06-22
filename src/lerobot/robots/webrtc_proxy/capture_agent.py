@@ -61,6 +61,22 @@ from .signaling import Signaling
 logger = logging.getLogger(__name__)
 
 
+def _fit_frame(img: np.ndarray, height: int, width: int) -> np.ndarray:
+    """Coerce a camera frame to the contiguous ``(height, width, 3)`` uint8 RGB the
+    media track requires (the cloud declared this shape in ``observation_features``)."""
+    if img.dtype != np.uint8:
+        img = img.astype(np.uint8)
+    if img.ndim == 2:
+        img = np.stack([img] * 3, axis=-1)
+    if img.shape[2] == 4:
+        img = img[:, :, :3]
+    if img.shape[0] != height or img.shape[1] != width:
+        import cv2
+
+        img = cv2.resize(img, (width, height))
+    return np.ascontiguousarray(img)
+
+
 class _SyntheticCameraTrack(MediaStreamTrack):
     """Outbound video track fed by the capture loop via an asyncio queue.
 
@@ -101,6 +117,7 @@ class CaptureAgent:
         on_safe_stop: Callable[[], None] | None = None,
         inventory: DeviceInventory | None = None,
         ice_servers: list[str] | None = None,
+        camera=None,  # an opened lerobot Camera (read_latest); None => synthetic frames
     ) -> None:
         self.signaling = signaling
         self.motors = list(motors)
@@ -122,6 +139,8 @@ class CaptureAgent:
         self._ch_action = None
         self._ch_control = None
         self._control = ControlServer(inventory if inventory is not None else SyntheticInventory())
+        self._camera = camera
+        self._last_real_frame: np.ndarray | None = None
         self._seq = 0
         self._action_seq = 0  # last action seq applied (for telemetry)
         self._last_goal: dict[str, float] = {f"{m}.pos": 0.0 for m in self.motors}
@@ -188,10 +207,24 @@ class CaptureAgent:
 
     # ----- capture (replace these 3 for real hardware in M2) ---------------
     def _capture_sample(self, t: float, seq: int) -> tuple[dict[str, float], np.ndarray]:
-        """Synthetic sample: slow sinusoidal joints + a frame whose colour encodes seq."""
+        """One sample: joints + a camera frame.
+
+        Joints are still synthetic (no robot wired yet — that half of M2). The frame
+        is a real camera read when one is attached, else a seq-coloured synthetic frame.
+        """
         joints = {f"{m}.pos": 30.0 * np.sin(t + i) for i, m in enumerate(self.motors)}
-        img = np.empty((self.cam_h, self.cam_w, 3), dtype=np.uint8)
-        img[:] = (seq % 256, (seq * 5) % 256, 128)
+        if self._camera is not None:
+            try:
+                img = _fit_frame(self._camera.read_latest(max_age_ms=1000), self.cam_h, self.cam_w)
+                self._last_real_frame = img
+            except Exception:
+                # Camera warming up / momentarily stale: reuse last good frame (or black).
+                img = self._last_real_frame
+                if img is None:
+                    img = np.zeros((self.cam_h, self.cam_w, 3), dtype=np.uint8)
+        else:
+            img = np.empty((self.cam_h, self.cam_w, 3), dtype=np.uint8)
+            img[:] = (seq % 256, (seq * 5) % 256, 128)
         return joints, img
 
     def _apply_action(self, goal: dict[str, float]) -> dict[str, float]:
