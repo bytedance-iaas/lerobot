@@ -36,12 +36,39 @@ hardware bring-up.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import os
+import sys
 from typing import Any, Protocol
 
 from .protocol import RpcRequest, RpcResponse
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def _silence_native_stderr():
+    """Redirect OS-level fd 2 to /dev/null for the duration of the block.
+
+    lerobot's ``OpenCVCamera.find_cameras`` brute-force-opens every camera index, and
+    OpenCV/AVFoundation writes "out device of bound / camera failed to initialize" for
+    each nonexistent one straight to the C stderr — Python logging can't intercept it.
+    RealSense probing on a machine without a device also logs noisily. This swallows
+    both around the (one-shot, onboarding) enumeration call. Process-wide for the brief
+    call window, so it is intentionally narrow.
+    """
+    sys.stderr.flush()
+    saved_fd = os.dup(2)
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull_fd, 2)
+        yield
+    finally:
+        sys.stderr.flush()
+        os.dup2(saved_fd, 2)
+        os.close(devnull_fd)
+        os.close(saved_fd)
 
 
 class FindPortError(RuntimeError):
@@ -117,7 +144,9 @@ class LocalDeviceInventory:
         )
 
         # Each dict already carries a stable id ('id' = opencv index_or_path / realsense serial).
-        return [*find_all_opencv_cameras(), *find_all_realsense_cameras()]
+        # Probing is noisy at the C level (see _silence_native_stderr) — hush it.
+        with _silence_native_stderr():
+            return [*find_all_opencv_cameras(), *find_all_realsense_cameras()]
 
 
 class ControlServer:
