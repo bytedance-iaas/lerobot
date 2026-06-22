@@ -33,8 +33,9 @@ is declared correctly.
 - **`protocol.py`** — channel labels, reliability flags, JSON message schemas (incl. RPC).
 - **`control.py`** — cloud-driven onboarding (M3): a reliable `control` DataChannel +
   request/response RPC. `DeviceInventory` is the OS seam; `ControlServer` (Mac)
-  answers `list_ports` / `list_cameras` / `find_port_begin` / `find_port_result`;
-  `ControlClient` (cloud) matches responses by id. Port/camera IDs stay Mac-local.
+  answers `list_ports` / `list_cameras` / `grab_camera` / `find_port_*` /
+  `set_camera_plan`; `ControlClient` (cloud) matches responses by id. Port/camera IDs
+  stay Mac-local.
 - **`alignment.py`** — `AlignmentBuffer`: thread-safe nearest-neighbour pairing of
   state↔frame by Mac-side `time.monotonic()` capture timestamp (难点 A). Public-net
   jitter becomes latency, never reordering.
@@ -153,8 +154,12 @@ uv run pytest tests/robots/test_webrtc_proxy_alignment.py \
 - **Single camera.** M1 transports one media track. Multi-camera = one track each. (M2)
 - **Source: camera real, arm still synthetic.** `--real-camera` streams a real
   opencv camera over the media track (`CaptureAgent` reads `camera.read_latest()`).
-  Joints (`_capture_sample`), `_apply_action` and `_safe_stop` are still stubs — M2
-  wires them to a real `so_follower` (read present position, drive goal, cut torque).
+  The daemon opens at the requested capture size, falling back to native if the
+  camera rejects it; `_fit_frame` + the cloud's defensive re-fit guarantee the
+  declared obs shape, so `--width/--height` need not match the cloud config exactly
+  (the cloud also pushes its spec via `set_camera_plan` at connect). Joints
+  (`_capture_sample`), `_apply_action` and `_safe_stop` are still stubs — M2 wires
+  them to a real `so_follower` (read present position, drive goal, cut torque).
 - **Device inventory: real but read-only.** `--real-devices` enumerates the Mac's
   actual ports + cameras (`LocalDeviceInventory`), so cloud-driven `find_port` /
   `list_cameras` return real ids. Default stays `SyntheticInventory`. Persisting the
