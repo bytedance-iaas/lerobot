@@ -47,6 +47,44 @@ def test_fit_frame_resizes_and_normalizes():
     assert out.flags["C_CONTIGUOUS"]
 
 
+def test_get_observation_enforces_declared_shape():
+    """A wrong-sized frame in the buffer is re-fit to the declared obs shape."""
+    cfg = WebRTCProxyRobotConfig(
+        cameras={"front": WebRTCCameraSpec(height=48, width=64, fps=30)},
+        capture_fps=30,
+        connect_timeout_s=15.0,
+    )
+    robot = WebRTCProxyRobot(cfg)
+    robot.connect()
+    try:
+        # Inject a frame of the WRONG size straight into the alignment buffer.
+        robot._buffer.add_frame(9.0, np.full((100, 200, 3), 77, np.uint8))
+        robot._buffer.add_state(9.0, {f"{m}.pos": 0.0 for m in robot.motors}, seq=999)
+        obs = robot.get_observation()
+        assert obs["front"].shape == (48, 64, 3)  # re-fit to the declared spec
+    finally:
+        robot.disconnect()
+
+
+def test_camera_plan_updates_agent_obs_size():
+    """The cloud's set_camera_plan reaches the (in-process loopback) agent."""
+    cfg = WebRTCProxyRobotConfig(
+        cameras={"front": WebRTCCameraSpec(height=48, width=64, fps=30)},
+        capture_fps=30,
+        connect_timeout_s=15.0,
+    )
+    robot = WebRTCProxyRobot(cfg)
+    robot.connect()
+    try:
+        # The plan is pushed at connect; the agent's resize target matches the spec.
+        assert (robot._agent.cam_w, robot._agent.cam_h) == (64, 48)
+        # A fresh plan is applied too.
+        robot._agent._apply_camera_plan({"width": 32, "height": 24})
+        assert (robot._agent.cam_w, robot._agent.cam_h) == (32, 24)
+    finally:
+        robot.disconnect()
+
+
 def test_grab_camera_preview_over_loopback():
     """Cloud-driven single-frame grab returns a decoded RGB image of the asked size."""
     from lerobot.robots.webrtc_proxy.control import SyntheticInventory
