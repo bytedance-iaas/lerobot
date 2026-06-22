@@ -38,7 +38,7 @@ import logging
 
 from .capture_agent import CaptureAgent
 from .configuration_webrtc_proxy import SO100_MOTORS
-from .control import DeviceInventory, SyntheticInventory
+from .control import DeviceInventory, LocalDeviceInventory, SyntheticInventory
 from .signaling import SignalingClosed, WebSocketSignaling
 
 logger = logging.getLogger(__name__)
@@ -103,8 +103,16 @@ def main() -> None:
     parser.add_argument(
         "--ice-server", action="append", default=[], help="STUN/TURN url (repeatable); omit for same-host"
     )
+    parser.add_argument(
+        "--real-devices",
+        action="store_true",
+        help="enumerate the Mac's actual serial ports + cameras (find_port/list_cameras return real ids)",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
+    inventory: DeviceInventory = LocalDeviceInventory() if args.real_devices else SyntheticInventory()
+    logger.info("daemon device inventory: %s", type(inventory).__name__)
 
     try:
         asyncio.run(
@@ -117,6 +125,7 @@ def main() -> None:
                 capture_fps=args.fps,
                 action_timeout_s=args.action_timeout,
                 ice_servers=args.ice_server,
+                inventory=inventory,
             )
         )
     except KeyboardInterrupt:

@@ -81,6 +81,30 @@ def test_discovery_rpc_over_loopback():
         robot.disconnect()
 
 
+def test_local_inventory_lists_real_ports():
+    """LocalDeviceInventory enumerates the host's actual serial ports."""
+    pytest.importorskip("serial", reason="find_available_ports needs pyserial (lerobot[hardware])")
+    from lerobot.robots.webrtc_proxy.control import LocalDeviceInventory
+
+    ports = LocalDeviceInventory().list_ports()
+    assert isinstance(ports, list)
+    assert all(isinstance(p, str) for p in ports)
+
+
+def test_real_inventory_over_loopback():
+    """Real ports flow through the control channel (cloud-driven find_port for real)."""
+    pytest.importorskip("serial", reason="find_available_ports needs pyserial (lerobot[hardware])")
+    from lerobot.robots.webrtc_proxy.control import LocalDeviceInventory
+
+    robot = WebRTCProxyRobot(_config(), inventory=LocalDeviceInventory())
+    robot.connect()
+    try:
+        ports = robot.list_ports()
+        assert isinstance(ports, list) and all(isinstance(p, str) for p in ports)
+    finally:
+        robot.disconnect()
+
+
 def test_control_rpc_error_propagates():
     robot = WebRTCProxyRobot(_config(), inventory=SyntheticInventory())
     robot.connect()

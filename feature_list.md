@@ -90,7 +90,9 @@
   云端 `WebRTCProxyRobot` 暴露 `list_ports()/list_cameras()/find_port_begin()/find_port_result()`。
 - **验收**：回环下 `find_port_begin`→模拟拔线→`find_port_result` 返回正确串口；
   `list_cameras` 返回带稳定标识（opencv index_or_path / realsense serial）的清单。
-- **状态**：completed（SyntheticInventory 验证；真 LocalDeviceInventory 待 M2/M4 硬件）
+- **状态**：completed（SyntheticInventory + 真 `LocalDeviceInventory`，daemon `--real-devices`
+  开关枚举 Mac 真实串口/相机；真实串口已经控制面回环验证。把选定的 port/camera→role 持久化并据此
+  开真总线属 M2。）
 - **设备绑定原则**：物理 ID（port / camera index|serial）只存在 Mac 端 CaptureAgent，
   云端 config 只有逻辑名 + 分辨率；onboarding 由云端 UI 驱动、人在 Mac 旁确认拔插/选相机。
 
