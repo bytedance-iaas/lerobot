@@ -155,14 +155,16 @@ uv run pytest tests/robots/test_webrtc_proxy_*.py -p no:hydra_pytest -q
   drops this de-syncs. Production must carry `seq` in an RTP header extension or
   in-pixel. (M3)
 - **Single camera.** M1 transports one media track. Multi-camera = one track each. (M2)
-- **Source: camera real, arm still synthetic.** `--real-camera` streams a real
-  opencv camera over the media track (`CaptureAgent` reads `camera.read_latest()`).
-  The daemon opens at the requested capture size, falling back to native if the
-  camera rejects it; `_fit_frame` + the cloud's defensive re-fit guarantee the
-  declared obs shape, so `--width/--height` need not match the cloud config exactly
-  (the cloud also pushes its spec via `set_camera_plan` at connect). Joints
-  (`_capture_sample`), `_apply_action` and `_safe_stop` are still stubs — M2 wires
-  them to a real `so_follower` (read present position, drive goal, cut torque).
+- **Real robot (M2).** Pass a connected lerobot `Robot` (e.g. `SO100Follower`) to the
+  daemon (`run_daemon(robot=...)`): joints + camera come from one `robot.get_observation()`
+  (shared capture instant), actions call `robot.send_action`, and the watchdog cuts
+  torque via `robot.bus.disable_torque()`. All serial-bus access runs on one worker
+  thread so the public-net loop never blocks and the bus is never touched concurrently.
+  See `examples/webrtc_remote_so100`. Without a robot, the synthetic source (or a bare
+  `--real-camera`) still works for transport testing.
+- **Camera sizing.** The daemon opens at the requested capture size, falling back to
+  native if the camera rejects it; `_fit_frame` + the cloud's defensive re-fit guarantee
+  the declared obs shape, and the cloud pushes its spec via `set_camera_plan` at connect.
 - **Device inventory: real but read-only.** `--real-devices` enumerates the Mac's
   actual ports + cameras (`LocalDeviceInventory`), so cloud-driven `find_port` /
   `list_cameras` return real ids. Default stays `SyntheticInventory`. Persisting the
