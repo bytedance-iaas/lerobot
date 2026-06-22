@@ -40,7 +40,7 @@ from collections import deque
 from functools import cached_property
 
 import numpy as np
-from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
+from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
 
 from lerobot.types import RobotAction, RobotObservation
 
@@ -50,7 +50,7 @@ from .capture_agent import CaptureAgent
 from .configuration_webrtc_proxy import WebRTCProxyRobotConfig
 from .control import ControlClient, DeviceInventory
 from .protocol import CH_ACTION, CH_CONTROL, CH_FRAMEMETA, CH_STATE, ActionMsg, FrameMetaMsg, StateMsg
-from .signaling import Signaling, loopback_signaling_pair
+from .signaling import Signaling, WebSocketSignaling, loopback_signaling_pair
 
 logger = logging.getLogger(__name__)
 
@@ -58,11 +58,12 @@ logger = logging.getLogger(__name__)
 class _ProxyEndpoint:
     """Async answerer: receives state/framemeta/action channels + a video track."""
 
-    def __init__(self, buffer: AlignmentBuffer, cam_name: str) -> None:
+    def __init__(self, buffer: AlignmentBuffer, cam_name: str, ice_servers: list[str] | None = None) -> None:
         self.buffer = buffer
         self.cam_name = cam_name
-        # iceServers=[] => no STUN (loopback). M3 supplies STUN/TURN for real peers.
-        self.pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=[]))
+        # iceServers=[] => host candidates only (loopback / same-host). M4 supplies STUN/TURN.
+        ice = [RTCIceServer(urls=u) for u in (ice_servers or [])]
+        self.pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=ice))
         self._ch_action = None
         # ordered framemeta acts as the frame<->capture-time index (popped 1:1 per frame).
         self._framemeta: deque[FrameMetaMsg] = deque(maxlen=256)
@@ -122,6 +123,7 @@ class _ProxyEndpoint:
             self.buffer.add_frame(meta.t, img)
 
     async def run(self, signaling: Signaling) -> None:
+        await signaling.open()
         offer = await signaling.recv()
         if not isinstance(offer, RTCSessionDescription):
             raise RuntimeError(f"proxy expected an SDP offer, got {type(offer)!r}")
@@ -189,6 +191,7 @@ class WebRTCProxyRobot(Robot):
         self._loop: _EventLoopThread | None = None
         self._endpoint: _ProxyEndpoint | None = None
         self._agent: CaptureAgent | None = None  # loopback only
+        self._ws_sig: WebSocketSignaling | None = None  # ws controller mode only
         self._last_frame: np.ndarray | None = None
         self._connected = False
 
@@ -225,8 +228,6 @@ class WebRTCProxyRobot(Robot):
         if self._connected:
             raise RuntimeError("WebRTCProxyRobot already connected")
         loopback = self.config.signaling_url in (None, "loopback")
-        if not loopback:
-            raise NotImplementedError("real signaling (WebSocket/STUN/TURN) is M3; use loopback for now")
 
         self._loop = _EventLoopThread()
         self._loop.start()
@@ -235,19 +236,28 @@ class WebRTCProxyRobot(Robot):
         # asyncio.Queue must be constructed *on the loop thread* so it binds to the
         # right running loop. Building them in the caller thread silently deadlocks.
         async def _bringup() -> None:
-            self._endpoint = _ProxyEndpoint(self._buffer, self.cam_name)
-            proxy_sig, agent_sig = loopback_signaling_pair()
-            self._agent = CaptureAgent(
-                signaling=agent_sig,
-                motors=self.motors,
-                cam_name=self.cam_name,
-                cam_height=self.cam_spec.height,
-                cam_width=self.cam_spec.width,
-                capture_fps=self.config.capture_fps,
-                action_timeout_s=self.config.action_timeout_s,
-                inventory=self._loopback_inventory,
-            )
-            await asyncio.gather(self._endpoint.run(proxy_sig), self._agent.run())
+            self._endpoint = _ProxyEndpoint(self._buffer, self.cam_name, ice_servers=self.config.ice_servers)
+            if loopback:
+                # Self-contained: spin up the synthetic Mac agent in this loop too.
+                proxy_sig, agent_sig = loopback_signaling_pair()
+                self._agent = CaptureAgent(
+                    signaling=agent_sig,
+                    motors=self.motors,
+                    cam_name=self.cam_name,
+                    cam_height=self.cam_spec.height,
+                    cam_width=self.cam_spec.width,
+                    capture_fps=self.config.capture_fps,
+                    action_timeout_s=self.config.action_timeout_s,
+                    inventory=self._loopback_inventory,
+                )
+                await asyncio.gather(self._endpoint.run(proxy_sig), self._agent.run())
+            else:
+                # Real link: reach a remote Mac daemon over the signaling relay. No
+                # in-process agent — the daemon owns the hardware.
+                self._ws_sig = WebSocketSignaling(
+                    self.config.signaling_url, self.config.session_id, role="controller"
+                )
+                await self._endpoint.run(self._ws_sig)
             await self._endpoint.connected.wait()
 
         self._loop.run(_bringup(), timeout=self.config.connect_timeout_s)
@@ -325,5 +335,10 @@ class WebRTCProxyRobot(Robot):
                     self._loop.run(self._endpoint.close(), timeout=2.0)
                 except Exception:
                     logger.exception("error closing proxy endpoint")
+            if self._ws_sig is not None:
+                try:
+                    self._loop.run(self._ws_sig.close(), timeout=2.0)
+                except Exception:
+                    logger.exception("error closing signaling")
             self._loop.stop()
         self._connected = False

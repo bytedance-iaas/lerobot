@@ -70,5 +70,12 @@ class WebRTCProxyRobotConfig(RobotConfig):
     # How long connect() waits for the WebRTC link + first observation.
     connect_timeout_s: float = 10.0
 
-    # Signaling (M3+). None / "loopback" => in-process loopback used by demo + tests.
+    # Signaling. None / "loopback" => in-process loopback (demo + unit tests).
+    # "ws://host:port/ws" => connect to a WebSocket signaling relay as the controller
+    # and reach a real Mac daemon (no in-process capture agent). See signaling_server.py.
     signaling_url: str | None = None
+    # Session id pairing this controller with its Mac daemon on the relay.
+    session_id: str = "default"
+    # ICE servers for the controller's peer connection. Empty => host candidates only
+    # (loopback / same-host two-process). M4 injects STUN/TURN for real public-net peers.
+    ice_servers: list[str] = field(default_factory=list)

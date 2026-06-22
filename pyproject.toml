@@ -131,6 +131,7 @@ viz = [
 # aiortc pulls in PyAV (decoded frames as ndarray) + DataChannels; see src/lerobot/robots/webrtc_proxy.
 webrtc = [
     "aiortc>=1.9.0,<2.0.0",
+    "aiohttp>=3.9.0,<4.0.0",  # WebSocket signaling client + relay server
     "lerobot[av-dep]",
 ]
 # ── User-facing composite extras (map to CLI scripts) ─────

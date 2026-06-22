@@ -34,7 +34,13 @@ from collections.abc import Awaitable, Callable
 from fractions import Fraction
 
 import numpy as np
-from aiortc import MediaStreamTrack, RTCConfiguration, RTCPeerConnection, RTCSessionDescription
+from aiortc import (
+    MediaStreamTrack,
+    RTCConfiguration,
+    RTCIceServer,
+    RTCPeerConnection,
+    RTCSessionDescription,
+)
 from av import VideoFrame
 
 from .control import ControlServer, DeviceInventory, SyntheticInventory
@@ -94,9 +100,11 @@ class CaptureAgent:
         action_timeout_s: float = 0.5,
         on_safe_stop: Callable[[], None] | None = None,
         inventory: DeviceInventory | None = None,
+        ice_servers: list[str] | None = None,
     ) -> None:
         self.signaling = signaling
         self.motors = list(motors)
+        self._ice_servers = list(ice_servers or [])
         self.cam_name = cam_name
         self.cam_h = cam_height
         self.cam_w = cam_width
@@ -104,9 +112,10 @@ class CaptureAgent:
         self.action_timeout_s = action_timeout_s
         self._on_safe_stop = on_safe_stop
 
-        # iceServers=[] => host candidates only (no STUN). Loopback needs no NAT
-        # traversal; M3 will inject STUN/TURN here for real public-net peers.
-        self.pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=[]))
+        # iceServers=[] => host candidates only (loopback / same-host two-process).
+        # M4 passes STUN/TURN urls here for real public-net peers.
+        ice = [RTCIceServer(urls=u) for u in self._ice_servers]
+        self.pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=ice))
         self._frame_q: asyncio.Queue[np.ndarray] = asyncio.Queue(maxsize=2)
         self._ch_state = None
         self._ch_framemeta = None
@@ -120,10 +129,23 @@ class CaptureAgent:
         self._safed = False
         self._tasks: list[asyncio.Task] = []
         self._stop = asyncio.Event()
+        self.closed = asyncio.Event()  # set when the peer connection drops
 
     # ----- lifecycle -------------------------------------------------------
     async def run(self) -> None:
-        """Connect (as offerer) and run until ``close()`` / signaling ends."""
+        """Connect (as offerer) and start the capture/watchdog loops.
+
+        Opens its own signaling, offers, waits for the answer, then returns once the
+        loops are running. Use :pymeth:`wait_closed` to block until the link drops.
+        """
+
+        @self.pc.on("connectionstatechange")
+        async def _on_conn_state() -> None:
+            logger.info("CaptureAgent connectionState=%s", self.pc.connectionState)
+            if self.pc.connectionState in ("failed", "closed", "disconnected"):
+                self.closed.set()
+
+        await self.signaling.open()
         self._ch_state = self.pc.createDataChannel(CH_STATE, **RT_CHANNEL_KWARGS)
         self._ch_framemeta = self.pc.createDataChannel(CH_FRAMEMETA, **ORDERED_CHANNEL_KWARGS)
         self._ch_action = self.pc.createDataChannel(CH_ACTION, **RT_CHANNEL_KWARGS)
@@ -146,11 +168,23 @@ class CaptureAgent:
         ]
         logger.info("CaptureAgent connected; streaming %d motors + camera %r", len(self.motors), self.cam_name)
 
+    async def wait_closed(self) -> None:
+        """Block until the WebRTC link to the controller drops."""
+        await self.closed.wait()
+
+    def force_safe_stop(self) -> None:
+        """Idempotently engage the safe state (used when a session ends)."""
+        if not self._safed:
+            self._safed = True
+            self._safe_stop()
+
     async def close(self) -> None:
         self._stop.set()
+        self.closed.set()
         for t in self._tasks:
             t.cancel()
         await self.pc.close()
+        await self.signaling.close()
 
     # ----- capture (replace these 3 for real hardware in M2) ---------------
     def _capture_sample(self, t: float, seq: int) -> tuple[dict[str, float], np.ndarray]:
