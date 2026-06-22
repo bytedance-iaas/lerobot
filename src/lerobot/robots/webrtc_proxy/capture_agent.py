@@ -138,7 +138,10 @@ class CaptureAgent:
         self._ch_framemeta = None
         self._ch_action = None
         self._ch_control = None
-        self._control = ControlServer(inventory if inventory is not None else SyntheticInventory())
+        self._control = ControlServer(
+            inventory if inventory is not None else SyntheticInventory(),
+            on_camera_plan=self._apply_camera_plan,
+        )
         self._camera = camera
         self._last_real_frame: np.ndarray | None = None
         self._seq = 0
@@ -231,6 +234,13 @@ class CaptureAgent:
         """Pretend to drive the arm. Real impl clips + calls robot.send_action (M2)."""
         self._last_goal = dict(goal)
         return self._last_goal
+
+    def _apply_camera_plan(self, plan: dict) -> None:
+        """Cloud told us its desired obs size — encode/resize frames to it (bandwidth)."""
+        w, h = plan.get("width"), plan.get("height")
+        if w and h and (w != self.cam_w or h != self.cam_h):
+            logger.info("camera plan: obs size %dx%d -> %dx%d", self.cam_w, self.cam_h, w, h)
+            self.cam_w, self.cam_h = int(w), int(h)
 
     def _safe_stop(self) -> None:
         """P0: called by the watchdog when actions stop arriving. Real impl cuts torque."""

@@ -34,14 +34,39 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 
 from .capture_agent import CaptureAgent
 from .configuration_webrtc_proxy import SO100_MOTORS
-from .control import DeviceInventory, LocalDeviceInventory, SyntheticInventory
+from .control import DeviceInventory, LocalDeviceInventory, SyntheticInventory, _silence_native_stderr
 from .signaling import SignalingClosed, WebSocketSignaling
 
 logger = logging.getLogger(__name__)
+
+
+def _open_streaming_camera(index_or_path, fps: int, width: int, height: int):
+    """Open an opencv camera for streaming, robustly.
+
+    Try the requested capture size first (cheaper than native+resize for bandwidth/CPU),
+    but fall back to the camera's native profile if it can't apply it — OpenCVCamera
+    raises rather than silently using another size. Either way the capture loop's
+    ``_fit_frame`` (and the cloud's get_observation) resize to the declared obs shape.
+    """
+    from lerobot.cameras.opencv import OpenCVCamera, OpenCVCameraConfig
+
+    with _silence_native_stderr():
+        for kwargs in ({"fps": fps, "width": width, "height": height}, {}):
+            cam = OpenCVCamera(OpenCVCameraConfig(index_or_path=index_or_path, **kwargs))
+            try:
+                cam.connect(warmup=True)
+                logger.info("opened camera %r (%s)", index_or_path, kwargs or "native resolution")
+                return cam
+            except Exception as e:
+                logger.warning("camera %r open at %s failed (%s)", index_or_path, kwargs or "native", e)
+                with contextlib.suppress(Exception):
+                    cam.disconnect()
+    raise RuntimeError(f"could not open camera {index_or_path!r}")
 
 
 async def run_daemon(
@@ -127,14 +152,8 @@ def main() -> None:
 
     camera = None
     if args.real_camera is not None:
-        from lerobot.cameras.opencv import OpenCVCamera, OpenCVCameraConfig
-
         index_or_path = int(args.real_camera) if args.real_camera.isdigit() else args.real_camera
-        camera = OpenCVCamera(
-            OpenCVCameraConfig(index_or_path=index_or_path, fps=args.fps, width=args.width, height=args.height)
-        )
-        camera.connect()
-        logger.info("daemon streaming real camera %r @ %dx%d", index_or_path, args.width, args.height)
+        camera = _open_streaming_camera(index_or_path, args.fps, args.width, args.height)
 
     try:
         asyncio.run(

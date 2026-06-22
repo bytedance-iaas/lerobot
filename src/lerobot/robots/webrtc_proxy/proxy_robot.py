@@ -33,6 +33,7 @@ WebSocket signaler and drops the in-process capture agent.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import threading
 import time
@@ -46,7 +47,7 @@ from lerobot.types import RobotAction, RobotObservation
 
 from ..robot import Robot
 from .alignment import AlignmentBuffer
-from .capture_agent import CaptureAgent
+from .capture_agent import CaptureAgent, _fit_frame
 from .configuration_webrtc_proxy import WebRTCProxyRobotConfig
 from .control import ControlClient, DeviceInventory
 from .protocol import CH_ACTION, CH_CONTROL, CH_FRAMEMETA, CH_STATE, ActionMsg, FrameMetaMsg, StateMsg
@@ -261,6 +262,14 @@ class WebRTCProxyRobot(Robot):
                 )
                 await self._endpoint.run(self._ws_sig)
             await self._endpoint.connected.wait()
+            # Push our desired obs size so the Mac resizes/encodes to it (bandwidth).
+            # Correctness doesn't depend on this — get_observation re-fits to the spec.
+            with contextlib.suppress(Exception):
+                await self._endpoint.control_call(
+                    "set_camera_plan",
+                    {"width": self.cam_spec.width, "height": self.cam_spec.height, "fps": self.cam_spec.fps},
+                    timeout=5.0,
+                )
 
         self._loop.run(_bringup(), timeout=self.config.connect_timeout_s)
         self._wait_first_obs(self.config.connect_timeout_s)
@@ -289,6 +298,10 @@ class WebRTCProxyRobot(Robot):
         if aligned.skew_ms is not None and aligned.skew_ms > self.config.pair_tolerance_s * 1e3:
             logger.warning("state<->frame skew %.0fms exceeds tolerance", aligned.skew_ms)
         obs: RobotObservation = dict(aligned.joints)
+        # Enforce the declared obs shape regardless of what the Mac sent — so the dataset/
+        # policy schema holds even before the camera plan lands or if the daemon drifts.
+        if frame is not None:
+            frame = _fit_frame(frame, self.cam_spec.height, self.cam_spec.width)
         obs[self.cam_name] = frame
         return obs
 

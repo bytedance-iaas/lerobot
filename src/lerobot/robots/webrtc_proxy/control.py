@@ -216,8 +216,10 @@ class ControlServer:
     pre-unplug port snapshot between the two calls).
     """
 
-    def __init__(self, inventory: DeviceInventory) -> None:
+    def __init__(self, inventory: DeviceInventory, on_camera_plan=None) -> None:
         self.inventory = inventory
+        # Called with the cloud's desired camera spec {width,height,fps} at session start.
+        self._on_camera_plan = on_camera_plan
         self._channel = None
         self._ports_before: list[str] | None = None
 
@@ -249,6 +251,11 @@ class ControlServer:
             height = int(req.params.get("height", 240))
             frame = self.inventory.grab_frame(req.params["id"], width, height)
             return {"jpeg_b64": _encode_jpeg_b64(frame), "width": frame.shape[1], "height": frame.shape[0]}
+        if req.method == "set_camera_plan":
+            # Cloud declares the obs size it wants; the Mac resizes/encodes to it.
+            if self._on_camera_plan is not None:
+                self._on_camera_plan(req.params)
+            return {"applied": req.params}
         if req.method == "find_port_begin":
             self._ports_before = self.inventory.list_ports()
             return {"ports": list(self._ports_before)}
