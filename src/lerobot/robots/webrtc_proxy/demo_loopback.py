@@ -12,73 +12,95 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Runnable M1 loopback demo for ``WebRTCProxyRobot``.
+"""Single-machine demo of the full WebRTCProxyRobot link.
 
     uv run python -m lerobot.robots.webrtc_proxy.demo_loopback
 
-Brings up the full WebRTC link (synthetic Mac capture agent <-> cloud proxy) on one
-machine, then drives it through the *synchronous* LeRobot Robot API: streams
-re-assembled observations for a couple seconds, sends actions, and demonstrates the
-P0 watchdog firing once the action stream stops.
+Starts the relay + a synthetic Mac daemon + the cloud controller as three event
+loops in one process (localhost sockets — the same path as a real cloud pod and a
+real Mac daemon). Then drives it through the synchronous Robot API: control-plane
+discovery, re-assembled observation streaming, and the P0 watchdog.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
+import threading
 import time
 
 from .configuration_webrtc_proxy import WebRTCCameraSpec, WebRTCProxyRobotConfig
+from .control import SyntheticInventory
+from .mac_daemon import run_daemon
 from .proxy_robot import WebRTCProxyRobot
+from .signaling_server import start_relay
+
+
+def _spawn_loop() -> asyncio.AbstractEventLoop:
+    loop = asyncio.new_event_loop()
+    threading.Thread(target=lambda: (asyncio.set_event_loop(loop), loop.run_forever()), daemon=True).start()
+    return loop
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
-    config = WebRTCProxyRobotConfig(
-        cameras={"front": WebRTCCameraSpec(height=120, width=160, fps=30)},
-        capture_fps=30,
-        action_timeout_s=0.4,
+    relay_loop = _spawn_loop()
+    runner, port = asyncio.run_coroutine_threadsafe(start_relay("127.0.0.1", 0), relay_loop).result(timeout=5)
+    url = f"ws://127.0.0.1:{port}/ws"
+
+    inv = SyntheticInventory()
+    agent_box: dict = {}
+    daemon_loop = _spawn_loop()
+    daemon_fut = asyncio.run_coroutine_threadsafe(
+        run_daemon(url, "demo", cam_name="front", cam_height=120, cam_width=160, capture_fps=30,
+                   action_timeout_s=0.4, ice_servers=[], inventory=inv,
+                   on_agent=lambda a: agent_box.__setitem__("agent", a)),
+        daemon_loop,
     )
-    robot = WebRTCProxyRobot(config)
+    time.sleep(0.5)  # let the daemon connect + buffer its offer
 
-    print("observation_features:", {k: v for k, v in robot.observation_features.items()})
+    robot = WebRTCProxyRobot(
+        WebRTCProxyRobotConfig(
+            cameras={"front": WebRTCCameraSpec(height=120, width=160, fps=30)},
+            signaling_url=url, session_id="demo", ice_servers=[],
+            capture_fps=30, action_timeout_s=0.4, connect_timeout_s=20.0,
+        )
+    )
+    print("observation_features:", dict(robot.observation_features))
     print("action_features:    ", robot.action_features)
-
     robot.connect()
 
-    print("\n== control plane: cloud-driven device discovery (over the Mac) ==")
-    print("  list_ports():  ", robot.list_ports())
-    print("  list_cameras():", robot.list_cameras())
-    before = robot.find_port_begin()
-    # In production the user unplugs the bus here; the synthetic Mac simulates it.
-    robot._agent._control.inventory.simulate_unplug(before[-1])
-    print(f"  find_port: begin={before} -> result={robot.find_port_result()!r} (the bus)")
-
-    print("\n== connected; streaming re-assembled observations (capture-ts aligned) ==")
     try:
-        for _ in range(30):
+        print("\n== control plane: cloud-driven device discovery (over the Mac daemon) ==")
+        print("  list_ports():  ", robot.list_ports())
+        before = robot.find_port_begin()
+        inv.simulate_unplug(before[-1])  # in production the user unplugs the bus
+        print(f"  find_port: begin={before} -> result={robot.find_port_result()!r} (the bus)")
+
+        print("\n== streaming re-assembled observations (capture-ts aligned) ==")
+        for _ in range(20):
             obs = robot.get_observation()
-            aligned = robot._buffer.assemble()  # for skew telemetry only
-            skew = aligned.skew_ms if aligned else None
-            frame = obs["front"]
             pan = obs["shoulder_pan.pos"]
-            skew_s = f"{skew:.1f}ms" if skew is not None else "n/a"
-            print(f"  shoulder_pan.pos={pan:+7.2f}  front={frame.shape}{frame.dtype}  skew={skew_s}")
+            print(f"  shoulder_pan.pos={pan:+7.2f}  front={obs['front'].shape}{obs['front'].dtype}")
             robot.send_action({"shoulder_pan.pos": pan + 1.0})
             time.sleep(1 / 15)
 
-        print("\n== stop sending actions; watchdog should SAFE STOP within action_timeout_s ==")
+        print("\n== stop sending actions; daemon watchdog should SAFE STOP within action_timeout_s ==")
+        agent = agent_box.get("agent")
         deadline = time.monotonic() + 1.5
-        while time.monotonic() < deadline and not robot._agent.is_safed:
+        while time.monotonic() < deadline and not (agent and agent.is_safed):
             time.sleep(0.05)
-        print(f"  watchdog safed = {robot._agent.is_safed}")
-
-        print("\n== resume actions; watchdog should clear ==")
-        robot.send_action({"shoulder_pan.pos": 0.0})
-        time.sleep(0.1)
-        print(f"  watchdog safed = {robot._agent.is_safed}")
+        print(f"  watchdog safed = {agent.is_safed if agent else 'n/a'}")
     finally:
         robot.disconnect()
+        daemon_fut.cancel()
+        time.sleep(0.3)
+        with contextlib.suppress(Exception):
+            asyncio.run_coroutine_threadsafe(runner.cleanup(), relay_loop).result(timeout=3)
+        daemon_loop.call_soon_threadsafe(daemon_loop.stop)
+        relay_loop.call_soon_threadsafe(relay_loop.stop)
         print("\n== disconnected cleanly ==")
 
 

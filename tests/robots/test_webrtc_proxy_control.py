@@ -12,34 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Control-plane (device discovery) tests over the loopback link."""
+"""Control-plane (device discovery) tests."""
 
 import pytest
 
-pytest.importorskip("aiortc", reason="WebRTCProxyRobot needs the lerobot[webrtc] extra (aiortc)")
+from lerobot.robots.webrtc_proxy.control import ControlServer, FindPortError, SyntheticInventory
+from lerobot.robots.webrtc_proxy.protocol import RpcRequest
 
-from lerobot.robots.webrtc_proxy.configuration_webrtc_proxy import (  # noqa: E402
-    WebRTCCameraSpec,
-    WebRTCProxyRobotConfig,
-)
-from lerobot.robots.webrtc_proxy.control import FindPortError, SyntheticInventory  # noqa: E402
-from lerobot.robots.webrtc_proxy.proxy_robot import WebRTCProxyRobot  # noqa: E402
-
-
-def _config() -> WebRTCProxyRobotConfig:
-    return WebRTCProxyRobotConfig(
-        cameras={"front": WebRTCCameraSpec(height=48, width=64, fps=30)},
-        capture_fps=30,
-        action_timeout_s=0.5,
-        connect_timeout_s=15.0,
-    )
+aiortc = pytest.importorskip("aiortc", reason="WebRTCProxyRobot needs the lerobot[webrtc] extra (aiortc)")
 
 
 # ---- pure server logic (no transport) -------------------------------------
 def test_find_port_diff_logic():
-    from lerobot.robots.webrtc_proxy.control import ControlServer
-    from lerobot.robots.webrtc_proxy.protocol import RpcRequest
-
     inv = SyntheticInventory(ports=["/dev/a", "/dev/b", "/dev/c"])
     srv = ControlServer(inv)
     srv._dispatch(RpcRequest(1, "find_port_begin", {}))
@@ -48,41 +32,20 @@ def test_find_port_diff_logic():
 
 
 def test_find_port_ambiguous_raises():
-    from lerobot.robots.webrtc_proxy.control import ControlServer
-    from lerobot.robots.webrtc_proxy.protocol import RpcRequest
-
-    inv = SyntheticInventory(ports=["/dev/a", "/dev/b"])
-    srv = ControlServer(inv)
+    srv = ControlServer(SyntheticInventory(ports=["/dev/a", "/dev/b"]))
     srv._dispatch(RpcRequest(1, "find_port_begin", {}))
-    # nothing unplugged -> 0 diff -> error
     with pytest.raises(FindPortError):
         srv._dispatch(RpcRequest(2, "find_port_result", {}))
 
 
-# ---- end-to-end over the loopback control channel -------------------------
-def test_discovery_rpc_over_loopback():
-    inv = SyntheticInventory(
-        ports=["/dev/tty.usbmodem-A", "/dev/tty.usbmodem-B"],
-        cameras=[{"type": "opencv", "index_or_path": 0, "name": "front cam"}],
-    )
-    robot = WebRTCProxyRobot(_config(), inventory=inv)
-    robot.connect()
-    try:
-        assert set(robot.list_ports()) == {"/dev/tty.usbmodem-A", "/dev/tty.usbmodem-B"}
-        cams = robot.list_cameras()
-        assert cams == [{"type": "opencv", "index_or_path": 0, "name": "front cam"}]
-
-        # Event-driven find_port: begin, (human unplugs == simulate), result.
-        before = robot.find_port_begin()
-        assert "/dev/tty.usbmodem-B" in before
-        inv.simulate_unplug("/dev/tty.usbmodem-B")
-        assert robot.find_port_result() == "/dev/tty.usbmodem-B"
-    finally:
-        robot.disconnect()
+def test_set_camera_plan_invokes_callback():
+    seen = {}
+    srv = ControlServer(SyntheticInventory(), on_camera_plan=seen.update)
+    srv._dispatch(RpcRequest(1, "set_camera_plan", {"width": 320, "height": 240, "fps": 30}))
+    assert seen == {"width": 320, "height": 240, "fps": 30}
 
 
 def test_local_inventory_lists_real_ports():
-    """LocalDeviceInventory enumerates the host's actual serial ports."""
     pytest.importorskip("serial", reason="find_available_ports needs pyserial (lerobot[hardware])")
     from lerobot.robots.webrtc_proxy.control import LocalDeviceInventory
 
@@ -91,26 +54,33 @@ def test_local_inventory_lists_real_ports():
     assert all(isinstance(p, str) for p in ports)
 
 
-def test_real_inventory_over_loopback():
-    """Real ports flow through the control channel (cloud-driven find_port for real)."""
+# ---- end-to-end over the real control channel -----------------------------
+def test_discovery_rpc_over_link(webrtc_link):
+    inv = SyntheticInventory(
+        ports=["/dev/tty.usbmodem-A", "/dev/tty.usbmodem-B"],
+        cameras=[{"type": "opencv", "id": 0, "name": "front cam"}],
+    )
+    with webrtc_link(inventory=inv) as link:
+        robot = link.robot
+        assert set(robot.list_ports()) == {"/dev/tty.usbmodem-A", "/dev/tty.usbmodem-B"}
+        assert robot.list_cameras() == [{"type": "opencv", "id": 0, "name": "front cam"}]
+
+        before = robot.find_port_begin()
+        assert "/dev/tty.usbmodem-B" in before
+        inv.simulate_unplug("/dev/tty.usbmodem-B")  # the test holds the daemon's inventory
+        assert robot.find_port_result() == "/dev/tty.usbmodem-B"
+
+
+def test_real_inventory_over_link(webrtc_link):
     pytest.importorskip("serial", reason="find_available_ports needs pyserial (lerobot[hardware])")
     from lerobot.robots.webrtc_proxy.control import LocalDeviceInventory
 
-    robot = WebRTCProxyRobot(_config(), inventory=LocalDeviceInventory())
-    robot.connect()
-    try:
-        ports = robot.list_ports()
+    with webrtc_link(inventory=LocalDeviceInventory()) as link:
+        ports = link.robot.list_ports()
         assert isinstance(ports, list) and all(isinstance(p, str) for p in ports)
-    finally:
-        robot.disconnect()
 
 
-def test_control_rpc_error_propagates():
-    robot = WebRTCProxyRobot(_config(), inventory=SyntheticInventory())
-    robot.connect()
-    try:
-        # find_port_result before begin -> server raises -> surfaces as RuntimeError on cloud.
+def test_control_rpc_error_propagates(webrtc_link):
+    with webrtc_link(inventory=SyntheticInventory()) as link:
         with pytest.raises(RuntimeError):
-            robot.find_port_result()
-    finally:
-        robot.disconnect()
+            link.robot.find_port_result()  # before begin -> server raises -> RuntimeError on cloud

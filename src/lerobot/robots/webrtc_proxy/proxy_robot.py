@@ -47,11 +47,11 @@ from lerobot.types import RobotAction, RobotObservation
 
 from ..robot import Robot
 from .alignment import AlignmentBuffer
-from .capture_agent import CaptureAgent, _fit_frame
+from .capture_agent import _fit_frame
 from .configuration_webrtc_proxy import WebRTCProxyRobotConfig
-from .control import ControlClient, DeviceInventory
+from .control import ControlClient
 from .protocol import CH_ACTION, CH_CONTROL, CH_FRAMEMETA, CH_STATE, ActionMsg, FrameMetaMsg, StateMsg
-from .signaling import Signaling, WebSocketSignaling, loopback_signaling_pair
+from .signaling import Signaling, WebSocketSignaling
 
 logger = logging.getLogger(__name__)
 
@@ -174,13 +174,9 @@ class WebRTCProxyRobot(Robot):
     config_class = WebRTCProxyRobotConfig
     name = "webrtc_proxy"
 
-    def __init__(self, config: WebRTCProxyRobotConfig, inventory: DeviceInventory | None = None, camera=None):
+    def __init__(self, config: WebRTCProxyRobotConfig):
         super().__init__(config)
         self.config = config
-        # Loopback only: the device inventory + camera the in-process Mac agent uses.
-        # Real mode reaches the Mac's own devices over the WebRTC link / control channel.
-        self._loopback_inventory = inventory
-        self._loopback_camera = camera
         if len(config.cameras) != 1:
             # M1 transports a single media track. Multi-camera is M2 (one track each).
             raise NotImplementedError(
@@ -192,8 +188,7 @@ class WebRTCProxyRobot(Robot):
         self._buffer = AlignmentBuffer(pair_tolerance_s=config.pair_tolerance_s)
         self._loop: _EventLoopThread | None = None
         self._endpoint: _ProxyEndpoint | None = None
-        self._agent: CaptureAgent | None = None  # loopback only
-        self._ws_sig: WebSocketSignaling | None = None  # ws controller mode only
+        self._ws_sig: WebSocketSignaling | None = None
         self._last_frame: np.ndarray | None = None
         self._connected = False
 
@@ -229,7 +224,10 @@ class WebRTCProxyRobot(Robot):
     def connect(self, calibrate: bool = True) -> None:
         if self._connected:
             raise RuntimeError("WebRTCProxyRobot already connected")
-        loopback = self.config.signaling_url in (None, "loopback")
+        if not self.config.signaling_url or not self.config.signaling_url.startswith("ws"):
+            raise ValueError(
+                "WebRTCProxyRobot needs a WebSocket signaling_url (ws://host:port/ws) to reach a Mac daemon"
+            )
 
         self._loop = _EventLoopThread()
         self._loop.start()
@@ -239,28 +237,11 @@ class WebRTCProxyRobot(Robot):
         # right running loop. Building them in the caller thread silently deadlocks.
         async def _bringup() -> None:
             self._endpoint = _ProxyEndpoint(self._buffer, self.cam_name, ice_servers=self.config.ice_servers)
-            if loopback:
-                # Self-contained: spin up the synthetic Mac agent in this loop too.
-                proxy_sig, agent_sig = loopback_signaling_pair()
-                self._agent = CaptureAgent(
-                    signaling=agent_sig,
-                    motors=self.motors,
-                    cam_name=self.cam_name,
-                    cam_height=self.cam_spec.height,
-                    cam_width=self.cam_spec.width,
-                    capture_fps=self.config.capture_fps,
-                    action_timeout_s=self.config.action_timeout_s,
-                    inventory=self._loopback_inventory,
-                    camera=self._loopback_camera,
-                )
-                await asyncio.gather(self._endpoint.run(proxy_sig), self._agent.run())
-            else:
-                # Real link: reach a remote Mac daemon over the signaling relay. No
-                # in-process agent — the daemon owns the hardware.
-                self._ws_sig = WebSocketSignaling(
-                    self.config.signaling_url, self.config.session_id, role="controller"
-                )
-                await self._endpoint.run(self._ws_sig)
+            # Pure controller: reach the remote Mac daemon over the signaling relay.
+            self._ws_sig = WebSocketSignaling(
+                self.config.signaling_url, self.config.session_id, role="controller"
+            )
+            await self._endpoint.run(self._ws_sig)
             await self._endpoint.connected.wait()
             # Push our desired obs size so the Mac resizes/encodes to it (bandwidth).
             # Correctness doesn't depend on this — get_observation re-fits to the spec.
@@ -274,7 +255,7 @@ class WebRTCProxyRobot(Robot):
         self._loop.run(_bringup(), timeout=self.config.connect_timeout_s)
         self._wait_first_obs(self.config.connect_timeout_s)
         self._connected = True
-        logger.info("WebRTCProxyRobot connected (%s)", "loopback" if loopback else self.config.signaling_url)
+        logger.info("WebRTCProxyRobot connected (%s)", self.config.signaling_url)
 
     def _wait_first_obs(self, timeout: float) -> None:
         deadline = time.monotonic() + timeout
@@ -352,11 +333,6 @@ class WebRTCProxyRobot(Robot):
         if not self._connected:
             return
         if self._loop is not None:
-            if self._agent is not None:
-                try:
-                    self._loop.run(self._agent.close(), timeout=2.0)
-                except Exception:
-                    logger.exception("error closing capture agent")
             if self._endpoint is not None:
                 try:
                     self._loop.run(self._endpoint.close(), timeout=2.0)

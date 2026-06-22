@@ -17,10 +17,15 @@ USB packets). We subclass + register — never monkey-patch — so LeRobot upgra
 don't break us and the schema metadata (`observation_features` / `action_features`)
 is declared correctly.
 
-## Architecture (M1 — loopback)
+## Architecture
+
+The cloud `WebRTCProxyRobot` is a **pure controller** — it reaches a remote Mac
+daemon over a WebSocket signaling relay; it never embeds a Mac agent. (Tests/demo
+run the relay + daemon + controller as separate loops in one process — see
+`conftest.py` / `demo_loopback.py`.)
 
 ```
- Mac side (offerer)                         Cloud side (answerer)
+ Mac daemon (offerer)                       Cloud controller (answerer)
  CaptureAgent                               WebRTCProxyRobot  (Robot subclass)
   ├─ capture loop @ capture_fps              ├─ get_observation()  ← AlignmentBuffer
   │   ├─ joints+ts  ─ DataChannel state ───▶ │      (pairs by CAPTURE timestamp)
@@ -43,14 +48,15 @@ is declared correctly.
   pushes state/framemeta/video, applies actions, runs the **watchdog** (难点 C).
 - **`proxy_robot.py`** — `WebRTCProxyRobot` (sync `Robot` API) + `_ProxyEndpoint`
   (async answerer) + `_EventLoopThread` (sync↔async bridge).
-- **`signaling.py`** — `Signaling` protocol + in-process loopback pair + a
-  `WebSocketSignaling` client (real relay).
+- **`signaling.py`** — `Signaling` protocol + `WebSocketSignaling` client (real
+  relay) + an in-process loopback pair (used internally by direct endpoint tests).
 - **`signaling_server.py`** — WebSocket signaling **relay**: pairs a daemon
   (`role=robot`) with a controller (`role=controller`) by session id, buffering SDP
   for late joiners. Standalone: `python -m ...signaling_server --port 8765`.
 - **`mac_daemon.py`** — the persistent Mac-side daemon: connect → offer → serve one
   session → safe the arm on drop → loop. Standalone entrypoint with reconnect.
-- **`demo_loopback.py`** — runnable single-machine (in-process) demo.
+- **`demo_loopback.py`** — runnable single-machine demo (relay + synthetic daemon +
+  controller in one process): discovery, obs streaming, watchdog.
 - **`sim_remote.py`** — simulate the *remote* control plane on one machine: relay +
   daemon + controller as three loops over localhost, then run one RPC and print the
   result. `python -m ...sim_remote --rpc list_cameras|list_ports|find_port|observe|all`.
@@ -63,8 +69,8 @@ uv pip install --native-tls 'aiortc>=1.9.0,<2.0.0'   # or: uv sync --extra webrt
 
 ## Manual verification
 
-Run the self-contained loopback demo (synthetic Mac agent ↔ cloud proxy, one
-machine, driven through the **synchronous** Robot API):
+Run the self-contained demo (relay + synthetic daemon + controller in one process,
+driven through the **synchronous** Robot API):
 
 ```bash
 uv run python -m lerobot.robots.webrtc_proxy.demo_loopback
@@ -139,10 +145,7 @@ Tests (suites needing the transport skip automatically without aiortc/aiohttp):
 
 ```bash
 # NOTE: -p no:hydra_pytest works around an unrelated broken pytest plugin in this env.
-uv run pytest tests/robots/test_webrtc_proxy_alignment.py \
-              tests/robots/test_webrtc_proxy_loopback.py \
-              tests/robots/test_webrtc_proxy_control.py \
-              tests/robots/test_webrtc_proxy_daemon.py -p no:hydra_pytest -q
+uv run pytest tests/robots/test_webrtc_proxy_*.py -p no:hydra_pytest -q
 ```
 
 ## Known limitations (M1 — to fix in later milestones)

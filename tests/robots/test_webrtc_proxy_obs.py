@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""End-to-end loopback smoke tests for WebRTCProxyRobot (skipped without aiortc)."""
+"""obs / action / watchdog over the real controller<->daemon link (see conftest)."""
 
 import time
 
@@ -20,24 +20,17 @@ import numpy as np
 import pytest
 
 pytest.importorskip("aiortc", reason="WebRTCProxyRobot needs the lerobot[webrtc] extra (aiortc)")
+pytest.importorskip("aiohttp", reason="signaling needs aiohttp (lerobot[webrtc])")
 
-from lerobot.robots.webrtc_proxy import WebRTCProxyRobotConfig  # noqa: E402
-from lerobot.robots.webrtc_proxy.configuration_webrtc_proxy import WebRTCCameraSpec  # noqa: E402
+from lerobot.robots.webrtc_proxy.configuration_webrtc_proxy import (  # noqa: E402
+    WebRTCCameraSpec,
+    WebRTCProxyRobotConfig,
+)
 from lerobot.robots.webrtc_proxy.proxy_robot import WebRTCProxyRobot  # noqa: E402
 
 
-def _make_config() -> WebRTCProxyRobotConfig:
-    # Small frames keep the test fast.
-    return WebRTCProxyRobotConfig(
-        cameras={"front": WebRTCCameraSpec(height=48, width=64, fps=30)},
-        capture_fps=30,
-        action_timeout_s=0.3,
-        connect_timeout_s=15.0,
-    )
-
-
 def test_schema_available_before_connect():
-    robot = WebRTCProxyRobot(_make_config())
+    robot = WebRTCProxyRobot(WebRTCProxyRobotConfig(cameras={"front": WebRTCCameraSpec(48, 64, 30)}))
     assert not robot.is_connected
     assert robot.action_features == {f"{m}.pos": float for m in robot.motors}
     obs_ft = robot.observation_features
@@ -45,13 +38,17 @@ def test_schema_available_before_connect():
     assert obs_ft["shoulder_pan.pos"] is float
 
 
-def test_loopback_observation_roundtrip():
-    robot = WebRTCProxyRobot(_make_config())
-    robot.connect()
-    try:
+def test_connect_requires_ws_signaling():
+    robot = WebRTCProxyRobot(WebRTCProxyRobotConfig(cameras={"front": WebRTCCameraSpec(48, 64, 30)}))
+    with pytest.raises(ValueError):
+        robot.connect()  # no signaling_url
+
+
+def test_observation_roundtrip(webrtc_link):
+    with webrtc_link() as link:
+        robot = link.robot
         assert robot.is_connected
         obs = robot.get_observation()
-        # Schema matches observation_features.
         assert set(obs) == set(robot.observation_features)
         frame = obs["front"]
         assert isinstance(frame, np.ndarray)
@@ -59,31 +56,22 @@ def test_loopback_observation_roundtrip():
         assert frame.dtype == np.uint8
         for m in robot.motors:
             assert isinstance(obs[f"{m}.pos"], float)
-
-        # send_action returns the (clipped/echoed) action actually sent.
         sent = robot.send_action({"shoulder_pan.pos": 12.5})
         assert sent == {"shoulder_pan.pos": 12.5}
-    finally:
-        robot.disconnect()
-    assert not robot.is_connected
 
 
-def test_watchdog_safes_on_action_stall_then_clears():
-    robot = WebRTCProxyRobot(_make_config())
-    robot.connect()
-    try:
+def test_watchdog_safes_on_action_stall_then_clears(webrtc_link):
+    with webrtc_link(action_timeout_s=0.3) as link:
+        robot, agent = link.robot, link.agent
+        # Resume actions -> watchdog clears (it may already have fired during connect).
         robot.send_action({"shoulder_pan.pos": 0.0})
-        # Stop sending; watchdog must safe within ~action_timeout_s.
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline and not robot._agent.is_safed:
-            time.sleep(0.02)
-        assert robot._agent.is_safed, "watchdog did not engage after action stall"
-
-        # Resuming actions clears the safe state.
-        robot.send_action({"shoulder_pan.pos": 1.0})
         deadline = time.monotonic() + 1.0
-        while time.monotonic() < deadline and robot._agent.is_safed:
+        while time.monotonic() < deadline and agent.is_safed:
             time.sleep(0.02)
-        assert not robot._agent.is_safed, "watchdog did not clear after action resumed"
-    finally:
-        robot.disconnect()
+        assert not agent.is_safed
+
+        # Stop sending -> watchdog must safe within ~action_timeout_s.
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and not agent.is_safed:
+            time.sleep(0.02)
+        assert agent.is_safed, "watchdog did not engage after action stall"

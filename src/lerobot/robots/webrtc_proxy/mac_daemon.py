@@ -82,6 +82,7 @@ async def run_daemon(
     inventory: DeviceInventory | None = None,
     camera=None,
     stop: asyncio.Event | None = None,
+    on_agent=None,
 ) -> None:
     """Serve cloud sessions forever (until ``stop`` is set), one session at a time.
 
@@ -104,6 +105,8 @@ async def run_daemon(
             ice_servers=ice_servers,
             camera=camera,
         )
+        if on_agent is not None:
+            on_agent(agent)  # let a harness observe the live agent (watchdog/plan)
         try:
             await agent.run()  # blocks here until a controller answers the offer
             logger.info("daemon: session %s established", session_id)
