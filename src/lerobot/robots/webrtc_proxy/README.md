@@ -42,9 +42,14 @@ is declared correctly.
   pushes state/framemeta/video, applies actions, runs the **watchdog** (难点 C).
 - **`proxy_robot.py`** — `WebRTCProxyRobot` (sync `Robot` API) + `_ProxyEndpoint`
   (async answerer) + `_EventLoopThread` (sync↔async bridge).
-- **`signaling.py`** — `Signaling` protocol + in-process loopback pair (M3 adds a
-  WebSocket impl with the same interface).
-- **`demo_loopback.py`** — runnable single-machine demo.
+- **`signaling.py`** — `Signaling` protocol + in-process loopback pair + a
+  `WebSocketSignaling` client (real relay).
+- **`signaling_server.py`** — WebSocket signaling **relay**: pairs a daemon
+  (`role=robot`) with a controller (`role=controller`) by session id, buffering SDP
+  for late joiners. Standalone: `python -m ...signaling_server --port 8765`.
+- **`mac_daemon.py`** — the persistent Mac-side daemon: connect → offer → serve one
+  session → safe the arm on drop → loop. Standalone entrypoint with reconnect.
+- **`demo_loopback.py`** — runnable single-machine (in-process) demo.
 
 ## Install
 
@@ -85,13 +90,39 @@ robot.find_port_result()           # the port that disappeared == the motor bus
 cloud cannot share that stdin, so the sync point moves to the Mac side (vs. the
 blocking `input()` in `lerobot-find-port`).
 
-Tests (the loopback/control suites skip automatically without aiortc):
+### Real two-process link (Mac daemon ↔ cloud controller)
+
+The cloud runs `WebRTCProxyRobot`; the Mac runs a long-lived **daemon** that outlives
+any single cloud session. They meet on a WebSocket signaling relay. On one machine
+(same-host, no STUN needed — `ice_servers=[]`):
+
+```bash
+# 1) signaling relay (lives cloud-side in prod)
+python -m lerobot.robots.webrtc_proxy.signaling_server --port 8765
+# 2) Mac daemon (synthetic source in M3; real so_follower + cameras in M2)
+python -m lerobot.robots.webrtc_proxy.mac_daemon --signaling-url ws://127.0.0.1:8765/ws
+# 3) cloud controller
+python - <<'PY'
+from lerobot.robots.webrtc_proxy.configuration_webrtc_proxy import WebRTCProxyRobotConfig, WebRTCCameraSpec
+from lerobot.robots.webrtc_proxy.proxy_robot import WebRTCProxyRobot
+cfg = WebRTCProxyRobotConfig(cameras={"front": WebRTCCameraSpec(480, 640, 30)},
+                             signaling_url="ws://127.0.0.1:8765/ws")
+r = WebRTCProxyRobot(cfg); r.connect()
+print(r.get_observation().keys()); print(r.list_ports()); r.disconnect()
+PY
+```
+
+Across the public internet the only change is `ice_servers=[...]` (STUN/TURN, M4);
+the daemon registers from behind NAT, the relay never sees media.
+
+Tests (suites needing the transport skip automatically without aiortc/aiohttp):
 
 ```bash
 # NOTE: -p no:hydra_pytest works around an unrelated broken pytest plugin in this env.
 uv run pytest tests/robots/test_webrtc_proxy_alignment.py \
               tests/robots/test_webrtc_proxy_loopback.py \
-              tests/robots/test_webrtc_proxy_control.py -p no:hydra_pytest -q
+              tests/robots/test_webrtc_proxy_control.py \
+              tests/robots/test_webrtc_proxy_daemon.py -p no:hydra_pytest -q
 ```
 
 ## Known limitations (M1 — to fix in later milestones)
@@ -106,9 +137,13 @@ uv run pytest tests/robots/test_webrtc_proxy_alignment.py \
 - **Synthetic device inventory.** The control plane answers from `SyntheticInventory`;
   a real `LocalDeviceInventory` wrapping `lerobot-find-port` / `lerobot-find-cameras`
   lands with M2/M4 hardware bring-up.
-- **Loopback signaling only.** No STUN/TURN/NAT traversal; `iceServers=[]`. The
-  WebSocket signaling impl + STUN/TURN(coturn) config (M3-infra) need a real network
-  and aren't testable here; self-managed K8s (hostNetwork/announced IP) is M4.
+- **Same-host networking only (so far).** WebSocket signaling + the daemon work, but
+  with `ice_servers=[]` (host candidates) only same-host / same-LAN peers connect.
+  Real public-net NAT traversal needs STUN/TURN(coturn) urls in `ice_servers` and a
+  self-managed K8s media path (hostNetwork, announced/external IP) — that's M4 and
+  needs real infra, untested here.
+- **Daemon reconnect is per-session, single controller.** One `session_id` ↔ one
+  daemon ↔ one controller at a time. Multi-tenant routing / auth on the relay is later.
 - **send_action returns the optimistic goal** (no real clip/ack from the Mac yet). M2.
 - **Paradigm not yet chosen** (real-time per-frame vs intent + local autonomy). M5;
   affects what the action DataChannel actually carries.

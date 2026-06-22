@@ -94,11 +94,14 @@
 - **设备绑定原则**：物理 ID（port / camera index|serial）只存在 Mac 端 CaptureAgent，
   云端 config 只有逻辑名 + 分辨率；onboarding 由云端 UI 驱动、人在 Mac 旁确认拔插/选相机。
 
-### F10 — 信令/STUN/TURN 基础设施（设计 + stub，本机不可测）
-- **目标**：`Signaling` 的 WebSocket 实现（aiohttp，localhost 可测）+ RTCConfiguration 注入
-  STUN/TURN（coturn）的配置入口；trickle-ICE。**真跨公网 / coturn / hostNetwork 属 M4。**
-- **验收**：WebSocket 信令在 localhost 跑通 SDP 交换（与 loopback 等价）；STUN/TURN 为配置项。
-- **状态**：not_started（基础设施部分依赖真网络，本机仅设计/stub；优先级低于 M2 真硬件）
+### F10 — WebSocket 信令 + Mac daemon（同机两进程可测）
+- **目标**：`Signaling` 的 WebSocket 实现（aiohttp client）+ 信令 relay server（按 session/role
+  转发 SDP，缓冲晚到方）+ `mac_daemon.py` 常驻入口（连接→offer→服务一次 session→断连停力→重连循环）+
+  云端 `WebRTCProxyRobot` 支持 `signaling_url=ws://`（controller 模式，不起本地 agent）+
+  `ice_servers` 配置入口（[]=host-only；STUN/TURN urls 留给 M4）。
+- **验收**：同机三进程/三 loop（relay+daemon+cloud）经真 localhost WS 信令 + WebRTC host candidate
+  跑通 obs/control/action；daemon 在一次 session 结束后能继续服务下一次 session（活得比 session 久）。
+- **状态**：completed（localhost/同机两进程；真跨公网 STUN/TURN/coturn/K8s 属 M4）
 
 ---
 
@@ -106,6 +109,11 @@
 - Mac 本地相机指纹方案（resolve_cameras.py 路线，已否决，非标准）。
 - 真跨公网 coturn / K8s hostNetwork / announced IP（M4）。
 - paradigm 落地（M5）。
+
+## M4 待办（需真网络/真硬件，本机不可测）
+- STUN/TURN（coturn）：`ice_servers` 填真 url；NAT 穿透。
+- K8s：媒体 Pod hostNetwork、announced/external IP、信令 relay 普通 Deployment、coturn。
+- relay 多租户路由 + 鉴权（当前单 session 单 controller）。
 
 ## 不在 M1 范围（不要回头做）
 - 真实串口/相机（M2）、信令服务/STUN/TURN（M3）、K8s/coturn（M4）、paradigm 落地（M5）。

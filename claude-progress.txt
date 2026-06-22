@@ -1,28 +1,36 @@
 Date: 2026-06-22
 TaskStatus: completed
-Task scope: M1 回环链路 (F1-F7) + M3 控制面/设备发现 (F8-F9)。F10 信令/STUN/TURN 基础设施未做（需真网络）。
+Task scope: M1 回环 (F1-F7) + M3 控制面/设备发现 (F8-F9) + F10 WebSocket 信令 + Mac daemon。
+真跨公网 STUN/TURN/coturn/K8s 属 M4（需真网络，本机不可测）。
 
 Current summary:
-- M1 (F1-F7) completed：aiortc 回环链路打通，obs 按采集时间戳重组、send_action、看门狗。
-- M3 控制面 (F8-F9) completed：
-  - 新增 control DataChannel (ordered+reliable) + RPC (RpcRequest/RpcResponse)。
-  - control.py: DeviceInventory 协议 / SyntheticInventory / ControlServer(Mac) / ControlClient(cloud)。
-  - 设备发现 RPC：list_ports / list_cameras / find_port_begin+find_port_result（事件驱动两段式，
-    把 lerobot-find-port 的阻塞 input() 拆成 begin→人拔线→result）。
-  - 云端 WebRTCProxyRobot 暴露 list_ports()/list_cameras()/find_port_begin()/find_port_result()。
-- 决策：设备发现走云端控制面（标准做法），不并入 resolve_cameras.py 的 Mac 本地指纹方案（个人脚本，已否决）。
-- 测试：tests/robots/test_webrtc_proxy_{alignment,loopback,control}.py 共 12 passed
-  （需 `-p no:hydra_pytest` 绕开本环境无关的损坏 pytest 插件）。
-- demo_loopback 增加控制面发现演示段，已验证。
+- M1 (F1-F7) completed：aiortc 回环链路；obs 按采集时间戳重组、send_action、看门狗。
+- M3 控制面 (F8-F9) completed：control DataChannel + RPC；设备发现 list_ports/list_cameras/
+  find_port(begin→result 事件驱动)；物理 ID 只在 Mac，云端只有逻辑名。
+- F10 completed：真 Mac daemon ↔ 云端 controller。
+  - signaling.py 加 WebSocketSignaling client；signaling_server.py 信令 relay（按 session/role 转发 SDP，
+    缓冲晚到方，对端断开发 bye）。
+  - mac_daemon.py：常驻入口，连接→offer→服务一次 session→断连停力(force_safe_stop)→重连循环；
+    可 `python -m ...mac_daemon --signaling-url ws://...` 跑。
+  - WebRTCProxyRobot 支持 signaling_url=ws://（controller 模式，不起本地 agent）+ ice_servers 配置。
+  - CaptureAgent 加 connectionstatechange→closed 事件 + wait_closed()；ICE 可配。
+- 测试：tests/robots/test_webrtc_proxy_{alignment,loopback,control,daemon}.py 共 14 passed
+  （需 `-p no:hydra_pytest` 绕开本环境无关损坏插件）。daemon 测试用同机三 loop（relay+daemon+cloud）
+  走真 localhost WS 信令 + WebRTC host candidate，含「daemon 活过一次 session 再服务下一次」断连重连用例。
+- demo_loopback 保留同进程回环演示（控制面 + 看门狗）。
 
-Main gaps (后续里程碑):
-- F10 / M3-infra: WebSocket 信令(aiohttp, localhost 可测) + STUN/TURN(coturn) 配置入口；本机网络受限未做。
-- M2: 真 so_follower + 相机；真 LocalDeviceInventory(包 lerobot-find-port/find-cameras)；多相机；send_action 真 clip/ack。
-- M4: 自管 K8s (hostNetwork/announced IP/coturn)。
+架构要点（回答用户两问）:
+- WebRTCProxyRobot 在云端跑；Mac 必须跑常驻 daemon（mac_daemon.py，分支名 webrtc-daemon）。
+- 设备 port/camera ID 只在 Mac 端，云端经控制面 RPC 发现，不进云端 config。
+
+Main gaps (M4，需真网络/硬件):
+- STUN/TURN(coturn) 真 url + NAT 穿透；K8s hostNetwork/announced IP；relay 多租户+鉴权。
+- M2: 真 so_follower + 相机 + LocalDeviceInventory；多相机；send_action 真 clip/ack。
 - M5: paradigm 落地决策（影响 action DataChannel 载荷）。
 
-关键踩坑（已解决，见上一阶段）:
-- aiortc 对象须在 bg event-loop 线程内构造；iceServers=[] 禁 STUN（受限网络下默认 Google STUN 卡死）。
+关键踩坑（已解决）:
+- aiortc 对象须在 bg event-loop 线程内构造；iceServers=[] 用 host candidate（受限网络/同机），
+  默认 None 会走 Google STUN 卡死。
 
 Next steps:
-- 等产品方 paradigm 决策；其余按优先级 M2(真硬件) > M3-infra(信令) > M4。
+- 等产品方 paradigm 决策；按优先级 M2(真硬件) > M4(coturn/K8s)。

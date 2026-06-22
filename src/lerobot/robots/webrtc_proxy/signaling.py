@@ -32,12 +32,20 @@ from typing import Protocol
 from aiortc import RTCSessionDescription
 
 
+class SignalingClosed(Exception):
+    """Raised by ``recv`` when the peer left or the transport closed."""
+
+
 class Signaling(Protocol):
     """Minimal duplex SDP exchange used by both endpoints."""
+
+    async def open(self) -> None: ...
 
     async def send(self, description: RTCSessionDescription) -> None: ...
 
     async def recv(self) -> RTCSessionDescription: ...
+
+    async def close(self) -> None: ...
 
 
 class LoopbackSignaling:
@@ -47,11 +55,17 @@ class LoopbackSignaling:
         self._outbox = outbox
         self._inbox = inbox
 
+    async def open(self) -> None:
+        pass
+
     async def send(self, description: RTCSessionDescription) -> None:
         await self._outbox.put(description)
 
     async def recv(self) -> RTCSessionDescription:
         return await self._inbox.get()
+
+    async def close(self) -> None:
+        pass
 
 
 def loopback_signaling_pair() -> tuple[LoopbackSignaling, LoopbackSignaling]:
@@ -61,3 +75,48 @@ def loopback_signaling_pair() -> tuple[LoopbackSignaling, LoopbackSignaling]:
     offerer = LoopbackSignaling(outbox=a_to_b, inbox=b_to_a)
     answerer = LoopbackSignaling(outbox=b_to_a, inbox=a_to_b)
     return offerer, answerer
+
+
+class WebSocketSignaling:
+    """SDP exchange over a WebSocket relay (see ``signaling_server.py``).
+
+    Both the Mac daemon (``role="robot"``) and the cloud controller
+    (``role="controller"``) connect to the same relay URL with a shared
+    ``session`` id; the relay forwards each SDP between them (buffering until the
+    peer joins). Non-trickle ICE means just one offer + one answer cross the wire.
+    """
+
+    def __init__(self, base_url: str, session: str, role: str) -> None:
+        sep = "&" if "?" in base_url else "?"
+        self._url = f"{base_url}{sep}session={session}&role={role}"
+        self._client = None
+        self._ws = None
+
+    async def open(self) -> None:
+        import aiohttp
+
+        self._client = aiohttp.ClientSession()
+        self._ws = await self._client.ws_connect(self._url)
+
+    async def send(self, description: RTCSessionDescription) -> None:
+        await self._ws.send_json({"kind": "sdp", "type": description.type, "sdp": description.sdp})
+
+    async def recv(self) -> RTCSessionDescription:
+        import aiohttp
+
+        async for msg in self._ws:
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                data = msg.json()
+                if data.get("kind") == "sdp":
+                    return RTCSessionDescription(sdp=data["sdp"], type=data["type"])
+                if data.get("kind") == "bye":
+                    raise SignalingClosed("peer left the signaling session")
+            elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                break
+        raise SignalingClosed("signaling websocket closed")
+
+    async def close(self) -> None:
+        if self._ws is not None:
+            await self._ws.close()
+        if self._client is not None:
+            await self._client.close()
