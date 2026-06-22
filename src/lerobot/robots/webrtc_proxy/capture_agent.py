@@ -37,8 +37,10 @@ import numpy as np
 from aiortc import MediaStreamTrack, RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 from av import VideoFrame
 
+from .control import ControlServer, DeviceInventory, SyntheticInventory
 from .protocol import (
     CH_ACTION,
+    CH_CONTROL,
     CH_FRAMEMETA,
     CH_STATE,
     ORDERED_CHANNEL_KWARGS,
@@ -91,6 +93,7 @@ class CaptureAgent:
         capture_fps: int = 30,
         action_timeout_s: float = 0.5,
         on_safe_stop: Callable[[], None] | None = None,
+        inventory: DeviceInventory | None = None,
     ) -> None:
         self.signaling = signaling
         self.motors = list(motors)
@@ -108,6 +111,8 @@ class CaptureAgent:
         self._ch_state = None
         self._ch_framemeta = None
         self._ch_action = None
+        self._ch_control = None
+        self._control = ControlServer(inventory if inventory is not None else SyntheticInventory())
         self._seq = 0
         self._action_seq = 0  # last action seq applied (for telemetry)
         self._last_goal: dict[str, float] = {f"{m}.pos": 0.0 for m in self.motors}
@@ -123,6 +128,8 @@ class CaptureAgent:
         self._ch_framemeta = self.pc.createDataChannel(CH_FRAMEMETA, **ORDERED_CHANNEL_KWARGS)
         self._ch_action = self.pc.createDataChannel(CH_ACTION, **RT_CHANNEL_KWARGS)
         self._ch_action.on("message", self._on_action)
+        self._ch_control = self.pc.createDataChannel(CH_CONTROL, **ORDERED_CHANNEL_KWARGS)
+        self._control.attach(self._ch_control)
 
         self.pc.addTrack(_SyntheticCameraTrack(self._frame_q))
 

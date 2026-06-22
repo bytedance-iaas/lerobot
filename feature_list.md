@@ -70,6 +70,43 @@
 
 ---
 
+## M3 Features —— 控制面 / 设备开通（cloud-driven onboarding）
+
+> 决策（2026-06-22）：设备发现（串口 / 相机 ID）走**云端驱动的控制面 RPC**，不做
+> Mac 本地指纹方案（`resolve_cameras.py` 只是用户个人便利脚本，非标准做法，不并入产品）。
+> 拆成两半：**控制面（可回环测）** 与 **信令/STUN/TURN 基础设施（需真网络，本机不可测）**。
+
+### F8 — 控制 DataChannel + RPC（可回环测）
+- **目标**：新增 `control` DataChannel（ordered+reliable，区别于实时 state/action）；
+  其上跑 request/response RPC（`RpcRequest{id,method,params}` / `RpcResponse{id,ok,result,error}`）。
+  Mac 端 `ControlServer` 派发到 `DeviceInventory`；云端 `ControlClient` 按 id 配对 future。
+- **验收**：云端经控制面调一个 RPC，Mac 端处理并返回；按 id 正确配对、超时可控。
+- **状态**：completed
+
+### F9 — 设备发现 RPC（event-driven，可回环测）
+- **目标**：把 `lerobot-find-port` 的阻塞 `input()` 改成事件驱动两段式：
+  `find_port_begin`(快照 ports_before) → 人拔线 → `find_port_result`(差集出消失的口)。
+  外加 `list_ports` / `list_cameras`（枚举 + metadata，对应 `lerobot-find-cameras`）。
+  云端 `WebRTCProxyRobot` 暴露 `list_ports()/list_cameras()/find_port_begin()/find_port_result()`。
+- **验收**：回环下 `find_port_begin`→模拟拔线→`find_port_result` 返回正确串口；
+  `list_cameras` 返回带稳定标识（opencv index_or_path / realsense serial）的清单。
+- **状态**：completed（SyntheticInventory 验证；真 LocalDeviceInventory 待 M2/M4 硬件）
+- **设备绑定原则**：物理 ID（port / camera index|serial）只存在 Mac 端 CaptureAgent，
+  云端 config 只有逻辑名 + 分辨率；onboarding 由云端 UI 驱动、人在 Mac 旁确认拔插/选相机。
+
+### F10 — 信令/STUN/TURN 基础设施（设计 + stub，本机不可测）
+- **目标**：`Signaling` 的 WebSocket 实现（aiohttp，localhost 可测）+ RTCConfiguration 注入
+  STUN/TURN（coturn）的配置入口；trickle-ICE。**真跨公网 / coturn / hostNetwork 属 M4。**
+- **验收**：WebSocket 信令在 localhost 跑通 SDP 交换（与 loopback 等价）；STUN/TURN 为配置项。
+- **状态**：not_started（基础设施部分依赖真网络，本机仅设计/stub；优先级低于 M2 真硬件）
+
+---
+
+## 不在 M3 范围（不要回头做）
+- Mac 本地相机指纹方案（resolve_cameras.py 路线，已否决，非标准）。
+- 真跨公网 coturn / K8s hostNetwork / announced IP（M4）。
+- paradigm 落地（M5）。
+
 ## 不在 M1 范围（不要回头做）
 - 真实串口/相机（M2）、信令服务/STUN/TURN（M3）、K8s/coturn（M4）、paradigm 落地（M5）。
 - 已否决方案：socat 串口转发、usbip USB 透传、把 record/eval 挪回本地（见 context §6）。

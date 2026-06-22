@@ -44,6 +44,9 @@ from typing import Any
 CH_STATE = "state"
 CH_FRAMEMETA = "framemeta"
 CH_ACTION = "action"
+# Control plane: cloud-driven onboarding RPC (device discovery, calibrate, ...).
+# Ordered + reliable — these are one-shot commands, not the realtime control loop.
+CH_CONTROL = "control"
 
 # Video clock used when stamping sender-side frames. Not relied on for capture-time
 # recovery across the wire (see module docstring) — kept standard for sane RTP output.
@@ -103,3 +106,41 @@ class ActionMsg:
     def from_json(cls, raw: str) -> ActionMsg:
         d = json.loads(raw)
         return cls(t=float(d["t"]), seq=int(d["seq"]), goal={k: float(v) for k, v in d["goal"].items()})
+
+
+@dataclass(frozen=True)
+class RpcRequest:
+    """Control-plane request: cloud -> Mac. Sent on ``CH_CONTROL``."""
+
+    id: int  # client-assigned, echoed in the matching RpcResponse
+    method: str  # e.g. "list_ports", "find_port_begin", "list_cameras"
+    params: dict[str, Any]
+
+    def to_json(self) -> str:
+        return json.dumps({"id": self.id, "method": self.method, "params": self.params}, separators=(",", ":"))
+
+    @classmethod
+    def from_json(cls, raw: str) -> RpcRequest:
+        d = json.loads(raw)
+        return cls(id=int(d["id"]), method=str(d["method"]), params=dict(d.get("params") or {}))
+
+
+@dataclass(frozen=True)
+class RpcResponse:
+    """Control-plane response: Mac -> cloud. Sent on ``CH_CONTROL``."""
+
+    id: int
+    ok: bool
+    result: Any | None = None
+    error: str | None = None
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {"id": self.id, "ok": self.ok, "result": self.result, "error": self.error},
+            separators=(",", ":"),
+        )
+
+    @classmethod
+    def from_json(cls, raw: str) -> RpcResponse:
+        d = json.loads(raw)
+        return cls(id=int(d["id"]), ok=bool(d["ok"]), result=d.get("result"), error=d.get("error"))
