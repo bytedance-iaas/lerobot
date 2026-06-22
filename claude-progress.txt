@@ -33,6 +33,15 @@ Main gaps (M4，需真网络/硬件):
 - M2: 真 so_follower + 相机 + LocalDeviceInventory；多相机；send_action 真 clip/ack。
 - M5: paradigm 落地决策（影响 action DataChannel 载荷）。
 
+架构清理（应 review 意见）:
+- WebRTCProxyRobot 改为**纯云端 controller**：删掉 in-process loopback 分支（不再在云端类里起 Mac agent），
+  connect() 必须给 ws:// signaling_url。自包含测试/demo 改用「同进程 relay+daemon+controller 三 loop」
+  （tests/robots/conftest.py 的 webrtc_link fixture；demo_loopback.py 重写）。
+- send_action 早已实现（send_action→_ch_action→_on_action→_apply_action）；只有 _apply_action 真正驱动电机是 M2 stub。
+- 相机采集配置归属 Mac（index 永不下发）；云端只声明 obs 形状，get_observation 兜底 _fit_frame；
+  set_camera_plan 把期望尺寸推给 Mac（省带宽）。推流相机 open 改 native+resize 回退。
+- grab_camera 控制面 RPC 保留（onboarding 单帧预览，走 DataChannel，与连续 obs 的 media track 分离）。
+
 关键踩坑（已解决）:
 - aiortc 对象须在 bg event-loop 线程内构造；iceServers=[] 用 host candidate（受限网络/同机），
   默认 None 会走 Google STUN 卡死。
