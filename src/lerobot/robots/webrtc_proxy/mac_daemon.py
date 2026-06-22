@@ -81,6 +81,7 @@ async def run_daemon(
     ice_servers: list[str] | None = None,
     inventory: DeviceInventory | None = None,
     camera=None,
+    robot=None,
     stop: asyncio.Event | None = None,
     on_agent=None,
 ) -> None:
@@ -104,6 +105,7 @@ async def run_daemon(
             inventory=inventory if inventory is not None else SyntheticInventory(),
             ice_servers=ice_servers,
             camera=camera,
+            robot=robot,
         )
         if on_agent is not None:
             on_agent(agent)  # let a harness observe the live agent (watchdog/plan)

@@ -31,6 +31,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
 
 import numpy as np
@@ -118,6 +119,7 @@ class CaptureAgent:
         inventory: DeviceInventory | None = None,
         ice_servers: list[str] | None = None,
         camera=None,  # an opened lerobot Camera (read_latest); None => synthetic frames
+        robot=None,  # a connected lerobot Robot (so_follower) — drives joints+action+torque (M2)
     ) -> None:
         self.signaling = signaling
         self.motors = list(motors)
@@ -143,7 +145,14 @@ class CaptureAgent:
             on_camera_plan=self._apply_camera_plan,
         )
         self._camera = camera
+        self._robot = robot
         self._last_real_frame: np.ndarray | None = None
+        # All serial-bus access (read joints, send action, toggle torque) goes through
+        # ONE worker thread so the public-net event loop never blocks on serial and the
+        # bus is never touched concurrently. None when there is no real robot.
+        self._io: ThreadPoolExecutor | None = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="webrtc-robot-io") if robot is not None else None
+        )
         self._seq = 0
         self._action_seq = 0  # last action seq applied (for telemetry)
         self._last_goal: dict[str, float] = {f"{m}.pos": 0.0 for m in self.motors}
@@ -184,6 +193,10 @@ class CaptureAgent:
             raise RuntimeError(f"capture agent expected an SDP answer, got {type(answer)!r}")
         await self.pc.setRemoteDescription(answer)
 
+        if self._robot is not None and self._io is not None:
+            # New session: re-enable torque (a previous session's safe-stop may have cut it).
+            self._io.submit(self._robot_enable_torque)
+
         self._tasks = [
             asyncio.ensure_future(self._capture_loop()),
             asyncio.ensure_future(self._watchdog_loop()),
@@ -207,14 +220,29 @@ class CaptureAgent:
             t.cancel()
         await self.pc.close()
         await self.signaling.close()
+        if self._io is not None:
+            # Let a pending safe-stop (disable_torque) finish, then stop the io thread.
+            self._io.shutdown(wait=True)
 
-    # ----- capture (replace these 3 for real hardware in M2) ---------------
+    # ----- capture / actuation -------------------------------------------
     def _capture_sample(self, t: float, seq: int) -> tuple[dict[str, float], np.ndarray]:
         """One sample: joints + a camera frame.
 
-        Joints are still synthetic (no robot wired yet — that half of M2). The frame
-        is a real camera read when one is attached, else a seq-coloured synthetic frame.
+        With a real ``robot``, both come from a single ``robot.get_observation()`` (so
+        they share a capture instant). Else: a real camera if attached, otherwise a
+        synthetic seq-coloured frame; joints are a synthetic sinusoid.
         """
+        if self._robot is not None:
+            obs = self._robot.get_observation()
+            joints = {k: float(v) for k, v in obs.items() if k.endswith(".pos")}
+            frame = obs.get(self.cam_name)
+            if frame is not None:
+                self._last_real_frame = _fit_frame(frame, self.cam_h, self.cam_w)
+            img = self._last_real_frame
+            if img is None:
+                img = np.zeros((self.cam_h, self.cam_w, 3), dtype=np.uint8)
+            return joints, img
+
         joints = {f"{m}.pos": 30.0 * np.sin(t + i) for i, m in enumerate(self.motors)}
         if self._camera is not None:
             try:
@@ -231,9 +259,28 @@ class CaptureAgent:
         return joints, img
 
     def _apply_action(self, goal: dict[str, float]) -> dict[str, float]:
-        """Pretend to drive the arm. Real impl clips + calls robot.send_action (M2)."""
+        """Drive the arm (runs on the io thread). Returns the action actually sent."""
+        if self._robot is not None:
+            try:
+                return self._robot.send_action(goal)
+            except Exception:
+                logger.exception("CaptureAgent: robot.send_action failed")
+                return goal
         self._last_goal = dict(goal)
         return self._last_goal
+
+    def _robot_enable_torque(self) -> None:
+        try:
+            self._robot.bus.enable_torque()
+        except Exception:
+            logger.exception("CaptureAgent: enable_torque failed")
+
+    def _robot_disable_torque(self) -> None:
+        try:
+            self._robot.bus.disable_torque()
+            logger.warning("CaptureAgent: torque disabled (safe stop)")
+        except Exception:
+            logger.exception("CaptureAgent: disable_torque failed")
 
     def _apply_camera_plan(self, plan: dict) -> None:
         """Cloud told us its desired obs size — encode/resize frames to it (bandwidth)."""
@@ -243,19 +290,26 @@ class CaptureAgent:
             self.cam_w, self.cam_h = int(w), int(h)
 
     def _safe_stop(self) -> None:
-        """P0: called by the watchdog when actions stop arriving. Real impl cuts torque."""
+        """P0: watchdog fired (actions stopped). Cut torque so the arm goes limp."""
         logger.warning("WATCHDOG: no action for %.0fms -> SAFE STOP", self.action_timeout_s * 1e3)
+        if self._robot is not None and self._io is not None:
+            self._io.submit(self._robot_disable_torque)  # never touch the bus off the io thread
         if self._on_safe_stop is not None:
             self._on_safe_stop()
 
     # ----- loops -----------------------------------------------------------
     async def _capture_loop(self) -> None:
+        loop = asyncio.get_event_loop()
         next_t = time.monotonic()
         while not self._stop.is_set():
             t = time.monotonic()
             seq = self._seq
             self._seq += 1
-            joints, img = self._capture_sample(t, seq)
+            # Real serial reads run off-loop so public-net timing never blocks on the bus.
+            if self._io is not None:
+                joints, img = await loop.run_in_executor(self._io, self._capture_sample, t, seq)
+            else:
+                joints, img = self._capture_sample(t, seq)
 
             if self._ch_state is not None and self._ch_state.readyState == "open":
                 self._ch_state.send(StateMsg(t=t, seq=seq, joints=joints).to_json())
@@ -275,12 +329,18 @@ class CaptureAgent:
         except Exception:
             logger.exception("CaptureAgent: bad action message")
             return
-        self._last_action_t = time.monotonic()
+        self._last_action_t = time.monotonic()  # sync: keeps the watchdog honest
         self._action_seq = msg.seq
+        resumed = self._safed
         if self._safed:
             logger.info("WATCHDOG: action resumed (seq=%d) -> clearing safe state", msg.seq)
             self._safed = False
-        self._apply_action(msg.goal)
+        if self._io is not None:
+            if resumed:
+                self._io.submit(self._robot_enable_torque)  # safe-stop cut torque; bring it back
+            self._io.submit(self._apply_action, msg.goal)  # serial write off the event loop
+        else:
+            self._apply_action(msg.goal)
 
     async def _watchdog_loop(self) -> None:
         # Poll at ~4x the timeout so we catch a stall well within one window.

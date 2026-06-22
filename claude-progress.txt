@@ -28,9 +28,18 @@ Current summary:
 - WebRTCProxyRobot 在云端跑；Mac 必须跑常驻 daemon（mac_daemon.py，分支名 webrtc-daemon）。
 - 设备 port/camera ID 只在 Mac 端，云端经控制面 RPC 发现，不进云端 config。
 
+M2 完成（接真实 so_follower）:
+- CaptureAgent 接 robot=：关节+相机来自一次 robot.get_observation()；_apply_action→robot.send_action；
+  看门狗 _safe_stop→robot.bus.disable_torque() 切扭矩(P0)；session 起/动作恢复 enable_torque。
+  所有串口 IO 走单线程 ThreadPoolExecutor（不阻塞公网 loop + 总线不并发）。run_daemon 加 robot=。
+- examples/webrtc_remote_so100：mac_daemon_so100.py(真 SO100+run_daemon) + cloud_teleop_so100.py
+  (WebRTCProxyRobot + 复用 web_so100 jog 面板远程遥操) + README(onboarding+三件套)。
+  关键展示：WebRTCProxyRobot 是 drop-in Robot，现有 teleop/record 代码无改即可远程驱动真臂。
+- FakeRobot 测试通过（共 24 测试）；真硬件验证靠 example（需真臂）。
+
 Main gaps (M4，需真网络/硬件):
 - STUN/TURN(coturn) 真 url + NAT 穿透；K8s hostNetwork/announced IP；relay 多租户+鉴权。
-- M2: 真 so_follower + 相机 + LocalDeviceInventory；多相机；send_action 真 clip/ack。
+- 多相机（每路一 media track）；send_action 真 clip/ack（目前 robot.send_action 已返回实际下发值）。
 - M5: paradigm 落地决策（影响 action DataChannel 载荷）。
 
 架构清理（应 review 意见）:
