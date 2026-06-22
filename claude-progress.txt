@@ -1,0 +1,27 @@
+Date: 2026-06-22
+TaskStatus: completed
+Task scope: M1 — 最小可跑 aiortc 回环链路 (WebRTCProxyRobot)，见 feature_list.md F1-F7。
+
+Current summary:
+- M1 全部 feature (F1-F7) completed，单机回环链路打通并验证：
+  - demo: `uv run python -m lerobot.robots.webrtc_proxy.demo_loopback` 正常跑通+干净退出。
+  - 测试: tests/robots/test_webrtc_proxy_{alignment,loopback}.py 共 8 passed
+    （跑测试需加 `-p no:hydra_pytest` 绕开本环境一个无关的损坏 pytest 插件）。
+- 新增包: src/lerobot/robots/webrtc_proxy/
+  protocol / alignment / capture_agent / proxy_robot / signaling / configuration / demo_loopback / README。
+- 工厂注册: robots/utils.py 加 webrtc_proxy 分支；config 经 draccus 注册成功。
+- 依赖: pyproject 加可选 extra `webrtc` (aiortc>=1.9,<2)；venv 已装 aiortc 1.14。
+
+关键踩坑（已解决）:
+- aiortc objects/Event/Queue 必须在 bg event-loop 线程内构造（否则绑错 loop 死锁）。
+- aiortc iceServers=None 默认走 Google STUN，受限网络下 ICE gathering 卡死 →
+  回环用 RTCConfiguration(iceServers=[]) 禁 STUN。
+
+Main gaps (留给后续里程碑，非阻塞):
+- M2: 接真实 so_follower + 相机；多相机=每路一 track；send_action 真实 clip/ack。
+- M3: WebSocket 信令 + STUN/TURN；framemeta 1:1 弹出在丢帧链路会 de-sync，需 RTP ext/像素内嵌 seq。
+- M4: 自管 K8s (hostNetwork/announced IP/coturn)。
+- M5: paradigm 落地决策（intent+本地自主 vs 实时遥操作）。
+
+Next steps:
+- 等产品方确认 paradigm（影响 action DataChannel 载荷）后再推进 M2/M5。
