@@ -1,0 +1,141 @@
+# Copyright 2026 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Simulate the *remote* control plane on one machine.
+
+Spins up the relay + Mac daemon + cloud controller as three independent event
+loops in this single process — they talk only over localhost sockets, exactly as a
+real cloud pod and a real Mac daemon would over the public internet (only the IP
+differs). Then it runs one control-plane RPC from the controller and prints what
+came back "from the Mac".
+
+    python -m lerobot.robots.webrtc_proxy.sim_remote --rpc list_cameras
+    python -m lerobot.robots.webrtc_proxy.sim_remote --rpc list_ports
+    python -m lerobot.robots.webrtc_proxy.sim_remote --rpc find_port
+    python -m lerobot.robots.webrtc_proxy.sim_remote --rpc observe
+    python -m lerobot.robots.webrtc_proxy.sim_remote --rpc all
+
+Default uses synthetic devices (no hardware needed). ``--real-devices`` makes the
+daemon enumerate this machine's actual ports/cameras via ``LocalDeviceInventory``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import logging
+import threading
+import time
+
+from .configuration_webrtc_proxy import WebRTCCameraSpec, WebRTCProxyRobotConfig
+from .control import DeviceInventory, LocalDeviceInventory, SyntheticInventory
+from .mac_daemon import run_daemon
+from .proxy_robot import WebRTCProxyRobot
+from .signaling_server import start_relay
+
+logger = logging.getLogger(__name__)
+
+# Example synthetic devices (ids mirror real output: opencv index / realsense serial).
+_SIM_PORTS = ["/dev/tty.usbmodem-bus-A", "/dev/tty.usbmodem-bus-B"]
+_SIM_CAMERAS = [
+    {"type": "opencv", "id": 0, "name": "FaceTime HD Camera", "width": 1280, "height": 720, "fps": 30.0},
+    {"type": "opencv", "id": 1, "name": "Logitech C920", "width": 640, "height": 480, "fps": 30.0},
+]
+
+
+def _spawn_loop() -> asyncio.AbstractEventLoop:
+    loop = asyncio.new_event_loop()
+    threading.Thread(target=lambda: (asyncio.set_event_loop(loop), loop.run_forever()), daemon=True).start()
+    return loop
+
+
+def _run_rpc(robot: WebRTCProxyRobot, rpc: str, inventory: DeviceInventory) -> None:
+    if rpc in ("list_ports", "all"):
+        print("REMOTE list_ports():", robot.list_ports())
+    if rpc in ("list_cameras", "all"):
+        print("REMOTE list_cameras():")
+        for cam in robot.list_cameras():
+            print("  ", cam)
+    if rpc in ("observe", "all"):
+        obs = robot.get_observation()
+        frame = obs[robot.cam_name]
+        print(f"REMOTE get_observation(): {sorted(k for k in obs if k.endswith('.pos'))}")
+        print(f"  {robot.cam_name}: {frame.shape} {frame.dtype}")
+    if rpc in ("find_port", "all"):
+        before = robot.find_port_begin()
+        print("REMOTE find_port_begin():", before)
+        if isinstance(inventory, SyntheticInventory):
+            inventory.simulate_unplug(before[-1])  # headless: auto "unplug" the last port
+            print(f"  (simulated unplug of {before[-1]})")
+        else:
+            input("  Unplug the motor-bus USB on this machine, then press Enter... ")
+        print("REMOTE find_port_result():", robot.find_port_result())
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Simulate a remote control-plane RPC on one machine")
+    parser.add_argument(
+        "--rpc",
+        default="list_cameras",
+        choices=["list_ports", "list_cameras", "find_port", "observe", "all"],
+    )
+    parser.add_argument("--real-devices", action="store_true", help="enumerate this machine's real devices")
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+
+    inventory: DeviceInventory = (
+        LocalDeviceInventory()
+        if args.real_devices
+        else SyntheticInventory(ports=list(_SIM_PORTS), cameras=[dict(c) for c in _SIM_CAMERAS])
+    )
+
+    # cloud: signaling relay
+    relay_loop = _spawn_loop()
+    _, port = asyncio.run_coroutine_threadsafe(start_relay("127.0.0.1", 0), relay_loop).result(timeout=5)
+    url = f"ws://127.0.0.1:{port}/ws"
+
+    # Mac: daemon
+    daemon_loop = _spawn_loop()
+    daemon_fut = asyncio.run_coroutine_threadsafe(
+        run_daemon(url, "sim", cam_name="front", cam_height=48, cam_width=64, capture_fps=30,
+                   ice_servers=[], inventory=inventory),
+        daemon_loop,
+    )
+    time.sleep(0.5)  # let the daemon connect + buffer its offer
+
+    # cloud: controller
+    robot = WebRTCProxyRobot(
+        WebRTCProxyRobotConfig(
+            cameras={"front": WebRTCCameraSpec(height=48, width=64, fps=30)},
+            signaling_url=url,
+            session_id="sim",
+            ice_servers=[],
+            connect_timeout_s=20.0,
+        )
+    )
+    print(f"controller connecting to {url} ...")
+    robot.connect()
+    try:
+        _run_rpc(robot, args.rpc, inventory)
+    finally:
+        robot.disconnect()
+        daemon_fut.cancel()
+        time.sleep(0.2)
+        daemon_loop.call_soon_threadsafe(daemon_loop.stop)
+        relay_loop.call_soon_threadsafe(relay_loop.stop)
+    print("done")
+
+
+if __name__ == "__main__":
+    main()
