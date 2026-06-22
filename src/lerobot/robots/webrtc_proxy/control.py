@@ -138,14 +138,16 @@ class LocalDeviceInventory:
         return find_available_ports()
 
     def list_cameras(self) -> list[dict[str, Any]]:
-        from lerobot.scripts.lerobot_find_cameras import (
-            find_all_opencv_cameras,
-            find_all_realsense_cameras,
-        )
-
-        # Each dict already carries a stable id ('id' = opencv index_or_path / realsense serial).
-        # Probing is noisy at the C level (see _silence_native_stderr) — hush it.
+        # Keep the import *inside* the hush: importing it loads cv2 (libavdevice), whose
+        # objc duplicate-class warning vs. av also goes to C-level stderr — along with
+        # OpenCV's index-scan noise. One-shot onboarding call, so the brief redirect is fine.
         with _silence_native_stderr():
+            from lerobot.scripts.lerobot_find_cameras import (
+                find_all_opencv_cameras,
+                find_all_realsense_cameras,
+            )
+
+            # Each dict carries a stable id ('id' = opencv index_or_path / realsense serial).
             return [*find_all_opencv_cameras(), *find_all_realsense_cameras()]
 
 
