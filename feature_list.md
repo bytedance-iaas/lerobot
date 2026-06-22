@@ -107,6 +107,24 @@
 
 ---
 
+## M2 Features —— 接真实 so_follower（完成）
+
+### F11 — CaptureAgent 接真实 Robot
+- **目标**：CaptureAgent 接受 `robot`（连接好的 lerobot Robot，如 SO100Follower）：
+  关节+相机经一次 `robot.get_observation()` 取（同采集时刻，利于对齐）；`_apply_action` 调
+  `robot.send_action`；看门狗 `_safe_stop` 调 `robot.bus.disable_torque()` 切扭矩（P0）；
+  session 开始/动作恢复时 `enable_torque`。所有串口访问走**单线程 executor**（不阻塞公网 event loop、
+  且总线不并发访问）。run_daemon 加 `robot=` 透传。
+- **验收**：回环（FakeRobot）下 obs 关节来自 robot、action 到达 robot、断流后 watchdog 切扭矩；
+  真实硬件经 examples/webrtc_remote_so100 跑通（需真臂，本机不可全测）。
+- **状态**：completed（FakeRobot 24 测试通过；真硬件验证靠 example）
+
+### F12 — examples/webrtc_remote_so100
+- **目标**：端到端示例：Mac 端 `mac_daemon_so100.py`（真 SO100Follower + run_daemon），
+  云端 `cloud_teleop_so100.py`（WebRTCProxyRobot + 复用 web_so100 jog 面板远程遥操作），README。
+- **验收**：示例 import/symbol 全解析；文档含 onboarding(find-port/find-cameras)+三件套启动步骤。
+- **状态**：completed
+
 ## 不在 M3 范围（不要回头做）
 - Mac 本地相机指纹方案（resolve_cameras.py 路线，已否决，非标准）。
 - 真跨公网 coturn / K8s hostNetwork / announced IP（M4）。
