@@ -90,6 +90,12 @@ robot.find_port_result()           # the port that disappeared == the motor bus
 cloud cannot share that stdin, so the sync point moves to the Mac side (vs. the
 blocking `input()` in `lerobot-find-port`).
 
+By default the daemon answers from `SyntheticInventory` (fake devices). Start it
+with `--real-devices` to enumerate the Mac's **actual** ports + cameras via
+`LocalDeviceInventory` (wraps lerobot's `find_available_ports` / `find_cameras`),
+so the calls above return the same ids the stock `lerobot-find-port` /
+`lerobot-find-cameras` CLIs would.
+
 ### Real two-process link (Mac daemon ↔ cloud controller)
 
 The cloud runs `WebRTCProxyRobot`; the Mac runs a long-lived **daemon** that outlives
@@ -99,7 +105,8 @@ any single cloud session. They meet on a WebSocket signaling relay. On one machi
 ```bash
 # 1) signaling relay (lives cloud-side in prod)
 python -m lerobot.robots.webrtc_proxy.signaling_server --port 8765
-# 2) Mac daemon (synthetic source in M3; real so_follower + cameras in M2)
+# 2) Mac daemon (synthetic source in M3; real so_follower + cameras in M2).
+#    add --real-devices to enumerate the Mac's actual ports/cameras for find_port.
 python -m lerobot.robots.webrtc_proxy.mac_daemon --signaling-url ws://127.0.0.1:8765/ws
 # 3) cloud controller
 python - <<'PY'
@@ -134,9 +141,11 @@ uv run pytest tests/robots/test_webrtc_proxy_alignment.py \
 - **Single camera.** M1 transports one media track. Multi-camera = one track each. (M2)
 - **Synthetic source.** `CaptureAgent._capture_sample` / `_apply_action` /
   `_safe_stop` are stubs; M2 wires them to a real `so_follower` + cameras.
-- **Synthetic device inventory.** The control plane answers from `SyntheticInventory`;
-  a real `LocalDeviceInventory` wrapping `lerobot-find-port` / `lerobot-find-cameras`
-  lands with M2/M4 hardware bring-up.
+- **Device inventory: real but read-only.** `--real-devices` enumerates the Mac's
+  actual ports + cameras (`LocalDeviceInventory`), so cloud-driven `find_port` /
+  `list_cameras` return real ids. Default stays `SyntheticInventory`. Persisting the
+  chosen port/camera→role mapping into a daemon config (and using it to open the bus)
+  is M2.
 - **Same-host networking only (so far).** WebSocket signaling + the daemon work, but
   with `ice_servers=[]` (host candidates) only same-host / same-LAN peers connect.
   Real public-net NAT traversal needs STUN/TURN(coturn) urls in `ice_servers` and a
