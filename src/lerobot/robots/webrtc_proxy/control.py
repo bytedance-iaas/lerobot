@@ -93,6 +93,33 @@ class SyntheticInventory:
             self._ports.remove(port)
 
 
+class LocalDeviceInventory:
+    """Real Mac-side inventory: enumerates the actual serial ports + cameras.
+
+    Wraps lerobot's own discovery so it sees exactly what the stock
+    ``lerobot-find-port`` / ``lerobot-find-cameras`` CLIs see. Imports are lazy so
+    ``control.py`` still loads without the hardware/camera extras; a missing extra
+    surfaces as a control-RPC error to the cloud rather than an import failure.
+
+    Note: ``list_cameras`` probes camera indices (opens each briefly), so it is a
+    one-shot onboarding call, not something to poll.
+    """
+
+    def list_ports(self) -> list[str]:
+        from lerobot.scripts.lerobot_find_port import find_available_ports
+
+        return find_available_ports()
+
+    def list_cameras(self) -> list[dict[str, Any]]:
+        from lerobot.scripts.lerobot_find_cameras import (
+            find_all_opencv_cameras,
+            find_all_realsense_cameras,
+        )
+
+        # Each dict already carries a stable id ('id' = opencv index_or_path / realsense serial).
+        return [*find_all_opencv_cameras(), *find_all_realsense_cameras()]
+
+
 class ControlServer:
     """Mac side: receives RpcRequests on the control channel and answers them.
 
