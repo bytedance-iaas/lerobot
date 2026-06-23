@@ -212,8 +212,13 @@ The **media path is the constraint**, not the CPU:
   inject its URLs into `ice_servers` on both peers (`RTCConfiguration`).
 - **Media framework choice.** `aiortc` (current) gives decoded `ndarray` frames straight
   into the LeRobot pipeline — perfect for the adapter, but single-connection / weak at
-  scale. For many concurrent users, move the media plane to **LiveKit / mediasoup** (SFU)
-  and demote aiortc to the "stream → LeRobot obs" adapter.
+  scale and lacking announced-IP / fixed-port for cloud NAT. For many concurrent users
+  or container deployment, move the media plane to **LiveKit / mediasoup** (SFU). The
+  transport is pluggable (`transport.py` `Transport` interface; pick via
+  `transport_backend`): `AiortcTransport` is the default; `transport_livekit.py` is an
+  **experimental, untested** `LiveKitTransport` scaffold. LiveKit is the chosen SFU
+  because it handles signaling + TURN + scale AND has a Python SDK to pull frames into
+  LeRobot; the scaffold needs verifying against a real LiveKit server (see its docstring).
 
 Scaling note: one controller pod per active session (stateful, holds a PeerConnection +
 the bg loop). Autoscale on session count; sessions are sticky to their pod for their

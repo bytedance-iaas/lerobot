@@ -67,6 +67,8 @@ class _ProxyEndpoint:
         cam_name: str,
         ice_servers: list[str] | None = None,
         transport_backend: str = "aiortc",
+        livekit_url: str | None = None,
+        livekit_token: str | None = None,
         transport: Transport | None = None,
     ) -> None:
         self.buffer = buffer
@@ -81,6 +83,8 @@ class _ProxyEndpoint:
             role="subscriber",
             channels={CH_STATE: False, CH_ACTION: False, CH_CONTROL: True},  # reliability set by publisher
             ice_servers=ice_servers,
+            livekit_url=livekit_url,
+            livekit_token=livekit_token,
         )
         self.connected = self._transport.connected
         self._transport.channel(CH_STATE).on_message(self._on_state)
@@ -216,6 +220,8 @@ class WebRTCProxyRobot(Robot):
                 self.cam_name,
                 ice_servers=self.config.ice_servers,
                 transport_backend=self.config.transport_backend,
+                livekit_url=self.config.livekit_url,
+                livekit_token=self.config.livekit_token,
             )
             # Pure controller: reach the remote Mac daemon over the signaling relay.
             self._ws_sig = WebSocketSignaling(

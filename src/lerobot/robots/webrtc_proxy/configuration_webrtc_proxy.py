@@ -84,3 +84,6 @@ class WebRTCProxyRobotConfig(RobotConfig):
     # Transport backend: "aiortc" (default, self-contained P2P) | "livekit" (SFU; both
     # the controller and the Mac daemon must use the same backend).
     transport_backend: str = "aiortc"
+    # Required when transport_backend == "livekit": the LiveKit server URL + a JWT.
+    livekit_url: str | None = None
+    livekit_token: str | None = None
