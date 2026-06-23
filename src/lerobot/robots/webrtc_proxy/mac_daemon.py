@@ -36,6 +36,7 @@ import argparse
 import asyncio
 import contextlib
 import logging
+import os
 
 from .capture_agent import CaptureAgent
 from .configuration_webrtc_proxy import SO100_MOTORS
@@ -177,16 +178,60 @@ def main() -> None:
     parser.add_argument("--reliable-action", action="store_true", help="override: reliable action channel")
     parser.add_argument("--auth-token", default=None, help="shared token for the signaling relay")
     parser.add_argument("--transport", choices=["aiortc", "livekit"], default="aiortc", help="transport backend")
-    parser.add_argument("--livekit-url", default=None, help="LiveKit server URL (when --transport livekit)")
-    parser.add_argument("--livekit-token", default=None, help="LiveKit JWT (when --transport livekit)")
+    parser.add_argument(
+        "--livekit-url",
+        default=os.environ.get("LIVEKIT_URL"),
+        help="LiveKit server URL (when --transport livekit; default $LIVEKIT_URL)",
+    )
+    parser.add_argument(
+        "--livekit-token",
+        default=None,
+        help="pre-signed LiveKit JWT; omit to self-sign from --livekit-api-key/secret",
+    )
+    parser.add_argument(
+        "--livekit-api-key",
+        default=os.environ.get("LIVEKIT_API_KEY"),
+        help="LiveKit API key for self-signing a token (default $LIVEKIT_API_KEY)",
+    )
+    parser.add_argument(
+        "--livekit-api-secret",
+        default=os.environ.get("LIVEKIT_API_SECRET"),
+        help="LiveKit API secret for self-signing a token (default $LIVEKIT_API_SECRET)",
+    )
+    parser.add_argument(
+        "--livekit-identity", default="robot", help="this daemon's LiveKit participant identity"
+    )
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    # force=True: the livekit SDK configures the root logger on import, which would make a
+    # plain basicConfig a no-op (hiding our INFO logs). Reset so daemon INFO lines show.
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s", force=True)
 
     # Per-backend required args (livekit does its own signaling; aiortc needs the relay).
-    if args.transport == "aiortc" and not args.signaling_url:
-        parser.error("--signaling-url is required for --transport aiortc")
-    if args.transport == "livekit" and (not args.livekit_url or not args.livekit_token):
-        parser.error("--livekit-url and --livekit-token are required for --transport livekit")
+    livekit_token = args.livekit_token
+    if args.transport == "aiortc":
+        if not args.signaling_url:
+            parser.error("--signaling-url is required for --transport aiortc")
+    else:  # livekit: need a URL and a token (pre-signed, or self-signed from api key/secret)
+        if not args.livekit_url:
+            parser.error("--livekit-url (or $LIVEKIT_URL) is required for --transport livekit")
+        if not livekit_token:
+            if not args.livekit_api_key or not args.livekit_api_secret:
+                parser.error(
+                    "--transport livekit needs --livekit-token, or --livekit-api-key + "
+                    "--livekit-api-secret (or $LIVEKIT_API_KEY/$LIVEKIT_API_SECRET) to self-sign"
+                )
+            from .transport_livekit import make_livekit_token
+
+            # The LiveKit room is the session id; both ends must use the same one.
+            livekit_token = make_livekit_token(
+                api_key=args.livekit_api_key,
+                api_secret=args.livekit_api_secret,
+                identity=args.livekit_identity,
+                room=args.session,
+            )
+            logger.info(
+                "self-signed LiveKit token (identity=%s, room=%s)", args.livekit_identity, args.session
+            )
 
     # record needs complete, ordered obs AND actions (no lost transitions); realtime loops
     # (teleop/eval) want freshness. Explicit flags override the profile.
@@ -219,7 +264,7 @@ def main() -> None:
                 signaling_token=args.auth_token,
                 transport_backend=args.transport,
                 livekit_url=args.livekit_url,
-                livekit_token=args.livekit_token,
+                livekit_token=livekit_token,
             )
         )
     except KeyboardInterrupt:
