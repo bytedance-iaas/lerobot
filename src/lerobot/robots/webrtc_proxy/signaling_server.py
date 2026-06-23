@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import secrets
 import socket
 from collections import defaultdict
@@ -129,10 +130,11 @@ async def start_relay(
 def main() -> None:
     parser = argparse.ArgumentParser(description="WebRTCProxyRobot WebSocket signaling relay")
     parser.add_argument("--host", default="0.0.0.0")  # noqa: S104 (server binds all ifaces by design)
-    parser.add_argument("--port", type=int, default=8765)
+    # FaaS web-app runtimes inject the listen port via $PORT; fall back to 8765 locally.
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8765")))
     parser.add_argument(
         "--auth-token",
-        default=None,
+        default=os.environ.get("SIGNALING_AUTH_TOKEN"),
         help="shared token every peer must present (Authorization: Bearer ...). Public relays should set it.",
     )
     args = parser.parse_args()
