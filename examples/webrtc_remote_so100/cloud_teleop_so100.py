@@ -170,6 +170,11 @@ def main() -> None:
     )
     parser.add_argument("--signaling-url", default=SIGNALING_URL, help="WS relay URL (aiortc)")
     parser.add_argument(
+        "--auth-token",
+        default=os.environ.get("SIGNALING_AUTH_TOKEN"),
+        help="shared token for an authed signaling relay (aiortc; default $SIGNALING_AUTH_TOKEN)",
+    )
+    parser.add_argument(
         "--livekit-url", default=os.environ.get("LIVEKIT_URL"), help="LiveKit URL (default $LIVEKIT_URL)"
     )
     parser.add_argument(
@@ -209,6 +214,7 @@ def main() -> None:
         WebRTCProxyRobotConfig(
             cameras={"front": WebRTCCameraSpec(height=HEIGHT, width=WIDTH, fps=FPS)},
             signaling_url=args.signaling_url,
+            signaling_token=args.auth_token,
             session_id=SESSION_ID,
             capture_fps=FPS,
             action_timeout_s=0.5,
