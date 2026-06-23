@@ -197,7 +197,7 @@ class WebRTCProxyRobot(Robot):
         self._loop: _EventLoopThread | None = None
         self._endpoint: _ProxyEndpoint | None = None
         self._ws_sig: WebSocketSignaling | None = None
-        self._last_frame: np.ndarray | None = None
+        self._last_obs: RobotObservation | None = None  # last coherent obs (held on camera lag)
         self._last_obs_seq = -1  # seq of the most recent obs returned (action provenance)
         self._connected = False
 
@@ -269,32 +269,32 @@ class WebRTCProxyRobot(Robot):
     def _wait_first_obs(self, timeout: float) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            aligned = self._buffer.assemble()
-            if aligned is not None and aligned.frame is not None:
-                self._last_frame = aligned.frame
-                return
+            if self._buffer.assemble(max_skew_s=self.config.pair_tolerance_s) is not None:
+                return  # a coherent state+frame pair is available
             time.sleep(0.02)
         raise TimeoutError("WebRTCProxyRobot: no aligned observation within connect_timeout_s")
 
     def get_observation(self) -> RobotObservation:
         if not self._connected:
             raise RuntimeError("WebRTCProxyRobot not connected")
-        aligned = self._buffer.assemble()
-        if aligned is None:
-            raise RuntimeError("no observation available yet")
-        self._last_obs_seq = aligned.seq_state  # actions sent next are derived from this obs
-        frame = aligned.frame if aligned.frame is not None else self._last_frame
-        if frame is not None:
-            self._last_frame = frame
-        if aligned.skew_ms is not None and aligned.skew_ms > self.config.pair_tolerance_s * 1e3:
-            logger.warning("state<->frame skew %.0fms exceeds tolerance", aligned.skew_ms)
-        obs: RobotObservation = dict(aligned.joints)
-        # Enforce the declared obs shape regardless of what the Mac sent — so the dataset/
-        # policy schema holds even before the camera plan lands or if the daemon drifts.
-        if frame is not None:
-            frame = _fit_frame(frame, self.cam_spec.height, self.cam_spec.width)
-        obs[self.cam_name] = frame
-        return obs
+        # Only accept a state+frame pair captured within the skew tolerance — never
+        # emit fresh joints against a stale frame. Normal jitter falls back to the
+        # previous (still-coherent) tick inside assemble().
+        aligned = self._buffer.assemble(max_skew_s=self.config.pair_tolerance_s)
+        if aligned is not None:
+            self._last_obs_seq = aligned.seq_state  # actions sent next derive from this obs
+            obs: RobotObservation = dict(aligned.joints)
+            # Enforce the declared obs shape regardless of what the Mac sent.
+            obs[self.cam_name] = _fit_frame(aligned.frame, self.cam_spec.height, self.cam_spec.width)
+            self._last_obs = obs
+            return dict(obs)
+        # No coherent pair this tick (camera lag/stall): hold the last coherent obs
+        # rather than fabricate a mismatched one. Raise only if we never had one.
+        if self._last_obs is not None:
+            logger.warning("no state/frame pair within %.0fms; holding last coherent obs",
+                           self.config.pair_tolerance_s * 1e3)
+            return dict(self._last_obs)
+        raise RuntimeError("no coherent observation within skew tolerance yet")
 
     def send_action(self, action: RobotAction) -> RobotAction:
         if not self._connected or self._endpoint is None or self._loop is None:
