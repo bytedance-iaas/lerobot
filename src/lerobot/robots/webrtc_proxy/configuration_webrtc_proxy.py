@@ -76,6 +76,8 @@ class WebRTCProxyRobotConfig(RobotConfig):
     signaling_url: str | None = None
     # Session id pairing this controller with its Mac daemon on the relay.
     session_id: str = "default"
+    # Shared token presented to the (public) signaling relay. See signaling_server.py.
+    signaling_token: str | None = None
     # ICE servers for the controller's peer connection. Empty => host candidates only
     # (loopback / same-host two-process). M4 injects STUN/TURN for real public-net peers.
     ice_servers: list[str] = field(default_factory=list)
