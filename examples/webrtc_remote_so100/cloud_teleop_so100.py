@@ -14,33 +14,159 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Cloud side: teleoperate a remote SO-100 over WebRTC.
+"""Cloud side: a minimal proof that WebRTCProxyRobot drives a REMOTE arm.
 
-The whole point of WebRTCProxyRobot: it is a drop-in lerobot ``Robot``, so existing
-teleop/record/policy code drives the remote arm *as if it were local*. Here we reuse
-the ``web_so100`` jog panel unchanged — its ``get_action()`` flows through the proxy,
-across the public net, to the Mac daemon and the real motors; obs (joints + camera)
-flow back over the WebRTC media + data channels.
+WebRTCProxyRobot is a drop-in lerobot ``Robot``: ``get_observation()`` returns the
+remote arm's joints + camera (over WebRTC) and ``send_action()`` moves the remote
+motors. Self-contained (no extra teleoperator dependency), two control front-ends:
 
-    Run after the relay and the Mac daemon are up (see README):
-        uv run python examples/webrtc_remote_so100/cloud_teleop_so100.py
-    then open http://localhost:8080 and jog the remote arm.
+- ``--mode web`` (default): serves ``panel.html`` from the stdlib HTTP server —
+  a **live camera view** (MJPEG) + per-joint jog buttons + joint readout.
+- ``--mode console``: keyboard jog in the terminal (1..6 select, +/- jog, q quit).
+
+Either way it's the same plain ``send_action`` / ``get_observation`` loop. Seeing the
+remote camera move when you press a button is the end-to-end proof the link works.
+
+    Run after the relay + Mac daemon are up (see README):
+        uv run python examples/webrtc_remote_so100/cloud_teleop_so100.py            # web
+        uv run python examples/webrtc_remote_so100/cloud_teleop_so100.py --mode console
 """
 
+import argparse
+import io
+import json
+import logging
+import sys
+import threading
 import time
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+import numpy as np
+from PIL import Image
 
 from lerobot.robots.webrtc_proxy.configuration_webrtc_proxy import WebRTCCameraSpec, WebRTCProxyRobotConfig
 from lerobot.robots.webrtc_proxy.proxy_robot import WebRTCProxyRobot
-from lerobot.teleoperators.web_so100 import WebSO100Teleop, WebSO100TeleopConfig
 
 SIGNALING_URL = "ws://127.0.0.1:8765/ws"
 SESSION_ID = "so100"
 FPS, WIDTH, HEIGHT = 30, 640, 480
+WEB_PORT = 8088
+JOG_DEG = 3.0
+
+_PANEL_HTML = (Path(__file__).parent / "panel.html").read_text(encoding="utf-8")
+
+# Shared state: the control loop (single writer) touches the robot; the web handlers /
+# console reader only read frames/joints and nudge targets.
+_targets: dict[str, float] = {}
+_latest_frame: dict[str, np.ndarray | None] = {"img": None}
+_latest_joints: dict[str, float] = {}
+_motors: list[str] = []
+_sel = {"i": 0}
+_running = True
+
+
+# ---- web front-end --------------------------------------------------------
+class _Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):  # noqa: ANN002 - quiet
+        pass
+
+    def do_GET(self):  # noqa: N802
+        path = urlparse(self.path)
+        if path.path == "/":
+            self._bytes("text/html; charset=utf-8", _PANEL_HTML.encode())
+        elif path.path == "/config":
+            self._json({"motors": _motors, "step": JOG_DEG})
+        elif path.path == "/state":
+            self._json({m: round(float(v), 2) for m, v in _latest_joints.items()})
+        elif path.path == "/stream":
+            self._stream()
+        elif path.path == "/jog":
+            q = parse_qs(path.query)
+            key = f"{q.get('motor', [''])[0]}.pos"
+            if key in _targets:
+                _targets[key] += float(q.get("delta", ["0"])[0])
+            self._json({"ok": True})
+        else:
+            self.send_error(HTTPStatus.NOT_FOUND)
+
+    def _bytes(self, content_type: str, body: bytes):
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, obj):
+        self._bytes("application/json", json.dumps(obj).encode())
+
+    def _stream(self):
+        # MJPEG: the remote camera frames, live in the browser <img>.
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self.end_headers()
+        try:
+            while _running:
+                img = _latest_frame["img"]
+                if img is None:
+                    time.sleep(0.05)
+                    continue
+                buf = io.BytesIO()
+                Image.fromarray(img).save(buf, format="JPEG", quality=70)
+                data = buf.getvalue()
+                self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n")
+                self.wfile.write(f"Content-Length: {len(data)}\r\n\r\n".encode())
+                self.wfile.write(data)
+                self.wfile.write(b"\r\n")
+                time.sleep(1 / 15)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+
+# ---- console front-end ----------------------------------------------------
+def _console_reader() -> None:
+    global _running
+    print("\ncommands: " + "  ".join(f"{i + 1}={m}" for i, m in enumerate(_motors)))
+    print("          +/- jog selected joint   q quit\n")
+    for line in sys.stdin:
+        cmd = line.strip().lower()
+        if cmd == "q":
+            _running = False
+            break
+        if cmd.isdigit() and 1 <= int(cmd) <= len(_motors):
+            _sel["i"] = int(cmd) - 1
+        elif cmd in ("+", "="):
+            _targets[f"{_motors[_sel['i']]}.pos"] += JOG_DEG
+        elif cmd == "-":
+            _targets[f"{_motors[_sel['i']]}.pos"] -= JOG_DEG
+        sel = _motors[_sel["i"]]
+        print(f"  -> {sel} target = {_targets[f'{sel}.pos']:.1f} deg")
+
+
+# ---- shared control loop --------------------------------------------------
+def _control_loop(robot: WebRTCProxyRobot) -> None:
+    """Stream the absolute target every tick (arm tracks it AND the Mac watchdog never
+    safe-stops), and refresh the latest obs (joints + camera) for the front-end."""
+    try:
+        while _running:
+            robot.send_action(dict(_targets))  # action -> WebRTC -> Mac motors
+            o = robot.get_observation()  # joints + camera <- WebRTC <- Mac
+            _latest_frame["img"] = o["front"]
+            _latest_joints.update({m: float(o[f"{m}.pos"]) for m in _motors})
+            time.sleep(1 / FPS)
+    except KeyboardInterrupt:
+        pass
 
 
 def main() -> None:
-    # The proxy declares the obs schema (must match the Mac robot's): 6 SO-100 motors
-    # + one camera "front". The physical port/index live on the Mac, never here.
+    global _running
+    parser = argparse.ArgumentParser(description="Cloud-side teleop for a remote SO-100 over WebRTC")
+    parser.add_argument("--mode", choices=["web", "console"], default="web")
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
     robot = WebRTCProxyRobot(
         WebRTCProxyRobotConfig(
             cameras={"front": WebRTCCameraSpec(height=HEIGHT, width=WIDTH, fps=FPS)},
@@ -50,21 +176,25 @@ def main() -> None:
             action_timeout_s=0.5,
         )
     )
-    robot.connect()  # reaches the Mac daemon over the relay
+    robot.connect()
+    _motors[:] = robot.motors
+    obs = robot.get_observation()
+    _targets.update({f"{m}.pos": float(obs[f"{m}.pos"]) for m in _motors})  # hold current pose
 
-    teleop = WebSO100Teleop(WebSO100TeleopConfig(host="0.0.0.0", port=8080))  # noqa: S104
-    teleop.connect()
-    teleop.attach_robot(robot)  # seed jog targets from the remote arm's current pose
+    server = None
+    if args.mode == "web":
+        server = ThreadingHTTPServer(("0.0.0.0", WEB_PORT), _Handler)  # noqa: S104
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        print(f"\n  open http://localhost:{WEB_PORT}  — live remote camera + jog buttons. Ctrl-C to stop.\n")
+    else:
+        threading.Thread(target=_console_reader, daemon=True).start()
 
-    print("\nTeleoperating the REMOTE SO-100. Open http://localhost:8080 to jog it. Ctrl-C to stop.\n")
     try:
-        while True:
-            robot.send_action(teleop.get_action())  # action -> WebRTC -> Mac motors
-            time.sleep(1 / FPS)
-    except KeyboardInterrupt:
-        pass
+        _control_loop(robot)
     finally:
-        teleop.disconnect()
+        _running = False
+        if server is not None:
+            server.shutdown()
         robot.disconnect()
 
 
