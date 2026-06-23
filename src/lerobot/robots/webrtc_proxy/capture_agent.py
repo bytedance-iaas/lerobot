@@ -240,7 +240,9 @@ class CaptureAgent:
                 img = np.zeros((self.cam_h, self.cam_w, 3), dtype=np.uint8)
             return joints, img
 
-        joints = {f"{m}.pos": 30.0 * np.sin(t + i) for i, m in enumerate(self.motors)}
+        # Synthetic arm: hold the last commanded pose, so a jog visibly moves the joints
+        # (lets you test the full loop without real hardware). Camera stays live below.
+        joints = dict(self._last_goal)
         if self._camera is not None:
             try:
                 img = _fit_frame(self._camera.read_latest(max_age_ms=1000), self.cam_h, self.cam_w)
