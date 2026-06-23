@@ -37,7 +37,6 @@ import contextlib
 import logging
 import threading
 import time
-from collections import deque
 from functools import cached_property
 
 import numpy as np
@@ -50,14 +49,22 @@ from .alignment import AlignmentBuffer
 from .capture_agent import _fit_frame
 from .configuration_webrtc_proxy import WebRTCProxyRobotConfig
 from .control import ControlClient
-from .protocol import CH_ACTION, CH_CONTROL, CH_FRAMEMETA, CH_STATE, ActionMsg, FrameMetaMsg, StateMsg
+from .protocol import (
+    CH_ACTION,
+    CH_CONTROL,
+    CH_STATE,
+    VIDEO_CLOCK_RATE,
+    VIDEO_PTS_PER_SEQ,
+    ActionMsg,
+    StateMsg,
+)
 from .signaling import Signaling, WebSocketSignaling
 
 logger = logging.getLogger(__name__)
 
 
 class _ProxyEndpoint:
-    """Async answerer: receives state/framemeta/action channels + a video track."""
+    """Async answerer: receives state/action/control channels + a video track."""
 
     def __init__(self, buffer: AlignmentBuffer, cam_name: str, ice_servers: list[str] | None = None) -> None:
         self.buffer = buffer
@@ -66,8 +73,6 @@ class _ProxyEndpoint:
         ice = [RTCIceServer(urls=u) for u in (ice_servers or [])]
         self.pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=ice))
         self._ch_action = None
-        # ordered framemeta acts as the frame<->capture-time index (popped 1:1 per frame).
-        self._framemeta: deque[FrameMetaMsg] = deque(maxlen=256)
         self.connected = asyncio.Event()
         self._action_seq = 0
         # Closed-loop feedback reported by the Mac on the state stream (telemetry).
@@ -81,8 +86,6 @@ class _ProxyEndpoint:
         def _on_channel(channel):  # noqa: ANN001
             if channel.label == CH_STATE:
                 channel.on("message", self._on_state)
-            elif channel.label == CH_FRAMEMETA:
-                channel.on("message", self._on_framemeta)
             elif channel.label == CH_ACTION:
                 self._ch_action = channel
             elif channel.label == CH_CONTROL:
@@ -104,16 +107,10 @@ class _ProxyEndpoint:
         except Exception:
             logger.exception("proxy: bad state message")
             return
-        self.buffer.add_state(msg.t, msg.joints, msg.seq)
+        self.buffer.add_state(msg.seq, msg.t, msg.joints)
         if msg.applied_seq > self.last_applied_seq:
             self.last_applied_seq = msg.applied_seq
             self.last_applied_t = msg.applied_t
-
-    def _on_framemeta(self, raw: str) -> None:
-        try:
-            self._framemeta.append(FrameMetaMsg.from_json(raw))
-        except Exception:
-            logger.exception("proxy: bad framemeta message")
 
     async def _consume(self, track) -> None:  # noqa: ANN001
         while True:
@@ -122,12 +119,15 @@ class _ProxyEndpoint:
             except Exception:
                 logger.info("proxy: video track ended")
                 return
-            # Pop the matching capture timestamp (ordered, 1:1 on a lossless link).
-            if not self._framemeta:
-                continue  # early frame before its metadata; drop (startup only)
-            meta = self._framemeta.popleft()
+            # Recover the capture seq carried in pts (round-trips through VP8). A dropped
+            # frame just leaves a gap in seq — no cascade. (Relative to the first received
+            # frame; see DESIGN.md §5.1.)
+            # seconds = pts * time_base; seq = seconds * clock / step. (time_base is
+            # normalized in case the receiver reports a different one than the sender.)
+            seconds = float(frame.pts) * float(frame.time_base)
+            seq = round(seconds * VIDEO_CLOCK_RATE / VIDEO_PTS_PER_SEQ)
             img = frame.to_ndarray(format="rgb24")
-            self.buffer.add_frame(meta.t, img)
+            self.buffer.add_frame(seq, img)
 
     async def run(self, signaling: Signaling) -> None:
         await signaling.open()
@@ -193,7 +193,7 @@ class WebRTCProxyRobot(Robot):
         self.cam_name, self.cam_spec = next(iter(config.cameras.items()))
         self.motors = list(config.motors)
 
-        self._buffer = AlignmentBuffer(pair_tolerance_s=config.pair_tolerance_s)
+        self._buffer = AlignmentBuffer()
         self._loop: _EventLoopThread | None = None
         self._endpoint: _ProxyEndpoint | None = None
         self._ws_sig: WebSocketSignaling | None = None
@@ -269,32 +269,30 @@ class WebRTCProxyRobot(Robot):
     def _wait_first_obs(self, timeout: float) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if self._buffer.assemble(max_skew_s=self.config.pair_tolerance_s) is not None:
-                return  # a coherent state+frame pair is available
+            if self._buffer.assemble() is not None:
+                return  # a state+frame pair (same seq) is available
             time.sleep(0.02)
         raise TimeoutError("WebRTCProxyRobot: no aligned observation within connect_timeout_s")
 
     def get_observation(self) -> RobotObservation:
         if not self._connected:
             raise RuntimeError("WebRTCProxyRobot not connected")
-        # Only accept a state+frame pair captured within the skew tolerance — never
-        # emit fresh joints against a stale frame. Normal jitter falls back to the
-        # previous (still-coherent) tick inside assemble().
-        aligned = self._buffer.assemble(max_skew_s=self.config.pair_tolerance_s)
+        # The freshest seq present on both the state and frame sides — an exact pair from
+        # one capture instant. A dropped frame/state just means that seq is skipped.
+        aligned = self._buffer.assemble()
         if aligned is not None:
-            self._last_obs_seq = aligned.seq_state  # actions sent next derive from this obs
+            self._last_obs_seq = aligned.seq  # actions sent next derive from this obs
             obs: RobotObservation = dict(aligned.joints)
             # Enforce the declared obs shape regardless of what the Mac sent.
             obs[self.cam_name] = _fit_frame(aligned.frame, self.cam_spec.height, self.cam_spec.width)
             self._last_obs = obs
             return dict(obs)
-        # No coherent pair this tick (camera lag/stall): hold the last coherent obs
-        # rather than fabricate a mismatched one. Raise only if we never had one.
+        # No complete pair yet (camera lag/stall): hold the last good obs rather than
+        # fabricate one. Raise only if we never had one.
         if self._last_obs is not None:
-            logger.warning("no state/frame pair within %.0fms; holding last coherent obs",
-                           self.config.pair_tolerance_s * 1e3)
+            logger.warning("no state+frame pair yet; holding last obs")
             return dict(self._last_obs)
-        raise RuntimeError("no coherent observation within skew tolerance yet")
+        raise RuntimeError("no observation available yet")
 
     def send_action(self, action: RobotAction) -> RobotAction:
         if not self._connected or self._endpoint is None or self._loop is None:

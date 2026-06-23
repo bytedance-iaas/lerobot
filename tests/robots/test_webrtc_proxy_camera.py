@@ -62,8 +62,8 @@ def test_get_observation_enforces_declared_shape():
         WebRTCProxyRobotConfig(cameras={"front": WebRTCCameraSpec(height=48, width=64, fps=30)})
     )
     robot._connected = True  # bypass the link; exercise get_observation directly
-    robot._buffer.add_frame(1.0, np.full((100, 200, 3), 77, np.uint8))
-    robot._buffer.add_state(1.0, {f"{m}.pos": 0.0 for m in robot.motors}, seq=0)
+    robot._buffer.add_frame(seq=0, frame=np.full((100, 200, 3), 77, np.uint8))
+    robot._buffer.add_state(seq=0, t=1.0, joints={f"{m}.pos": 0.0 for m in robot.motors})
     obs = robot.get_observation()
     assert obs["front"].shape == (48, 64, 3)
     robot._connected = False

@@ -14,22 +14,20 @@
 
 """Wire protocol shared by the Mac-side capture agent and the cloud-side proxy.
 
-Three logical DataChannels plus one video media track connect the two ends:
+Two real-time DataChannels + one control DataChannel + one video media track:
 
     label        dir          reliability                payload
     -----------  -----------  -------------------------  ---------------------------
-    state        Mac -> cloud unreliable (rt)            StateMsg: joints + capture ts
-    framemeta    Mac -> cloud ordered/reliable           FrameMetaMsg: {seq, t} per frame
-    action       cloud -> Mac unreliable (rt)            ActionMsg: goal joints + seq
-    <video>      Mac -> cloud media track (H.264/VP8)    one camera, pixels only
+    state        Mac -> cloud unreliable (rt)            StateMsg: joints + capture ts + seq
+    action       cloud -> Mac unreliable (rt)            ActionMsg: goal joints + seq + obs_seq
+    control      both         ordered/reliable           onboarding RPC (device discovery, plan)
+    <video>      Mac -> cloud media track (H.264/VP8)    one camera; seq carried in pts
 
-Why ``framemeta`` is its own *ordered* channel: a decoded ``av.VideoFrame`` carries
-no application-level capture timestamp that survives RTP re-stamping, so the Mac
-sends a parallel ``{seq, t}`` record per emitted frame. The cloud pops one framemeta
-per received frame to tag it with its Mac-side ``time.monotonic()`` capture time.
-This 1:1 ordered pop is a *prototype* simplification valid only on a lossless link
-(loopback). Production must carry ``seq`` in an RTP header extension or in-pixel —
-see ``README.md`` "Known limitations".
+The frame's capture **seq** rides its ``pts`` (``pts = seq * VIDEO_PTS_PER_SEQ``); the
+cloud recovers ``seq = round(pts / VIDEO_PTS_PER_SEQ)`` and pairs each frame to the
+StateMsg with the same seq (both are produced by one ``robot.get_observation()``, so
+they share a seq). A dropped frame just leaves a gap in seq — no cascade. See
+``DESIGN.md`` §5.1 for the re-basing caveat and the RTP-header-extension end state.
 
 All timestamps are the Mac's ``time.monotonic()`` seconds (a single clock — the
 cloud only ever *compares* them, never interprets them as wall time)."""
@@ -42,19 +40,25 @@ from typing import Any
 
 # DataChannel labels (must match on both ends).
 CH_STATE = "state"
-CH_FRAMEMETA = "framemeta"
 CH_ACTION = "action"
 # Control plane: cloud-driven onboarding RPC (device discovery, calibrate, ...).
 # Ordered + reliable — these are one-shot commands, not the realtime control loop.
 CH_CONTROL = "control"
 
-# Video clock used when stamping sender-side frames. Not relied on for capture-time
-# recovery across the wire (see module docstring) — kept standard for sane RTP output.
+# The capture seq is carried in each frame's pts: pts = seq * VIDEO_PTS_PER_SEQ at a
+# 90 kHz clock. The cloud recovers seq = round(pts / VIDEO_PTS_PER_SEQ) and pairs the
+# frame to the state with the same seq. pts survives VP8/H.264; a dropped frame just
+# leaves a gap in seq (no cascade), unlike an ordered 1:1 side channel.
+# Caveat: the receiver re-bases the *first received* frame to pts=0, so seq is recovered
+# relative to the first received frame. The daemon resets seq to 0 per session, so as long
+# as the first frame lands (true at session start) relative == absolute. Production should
+# carry an absolute seq in an RTP header extension to be robust to initial-frame loss.
 VIDEO_CLOCK_RATE = 90_000
+VIDEO_PTS_PER_SEQ = 3_000  # 1/30 s per seq at 90 kHz; round(pts/this) recovers seq
 
 # Unreliable, real-time DataChannel options for state/action (drop, don't retransmit).
 RT_CHANNEL_KWARGS: dict[str, Any] = {"ordered": False, "maxRetransmits": 0}
-# framemeta must arrive in order and not be dropped (it is the frame<->time index).
+# Control commands must arrive in order and not be dropped.
 ORDERED_CHANNEL_KWARGS: dict[str, Any] = {"ordered": True}
 
 
@@ -83,22 +87,6 @@ class StateMsg:
             applied_seq=int(d.get("applied_seq", -1)),
             applied_t=float(d.get("applied_t", 0.0)),
         )
-
-
-@dataclass(frozen=True)
-class FrameMetaMsg:
-    """Capture metadata for one video frame. Sent on ``CH_FRAMEMETA`` (ordered)."""
-
-    t: float  # capture time.monotonic() seconds of this frame
-    seq: int  # capture sequence number
-
-    def to_json(self) -> str:
-        return json.dumps(asdict(self), separators=(",", ":"))
-
-    @classmethod
-    def from_json(cls, raw: str) -> FrameMetaMsg:
-        d = json.loads(raw)
-        return cls(t=float(d["t"]), seq=int(d["seq"]))
 
 
 @dataclass(frozen=True)
