@@ -84,6 +84,7 @@ def webrtc_link():
         robot=None,
         reliable_state=False,
         reliable_action=False,
+        token=None,
         motors=None,
         cam_name: str = "front",
         height: int = 48,
@@ -93,7 +94,7 @@ def webrtc_link():
         connect_timeout_s: float = 20.0,
     ):
         relay_lt = _LoopThread()
-        runner, port = relay_lt.submit(start_relay("127.0.0.1", 0)).result(timeout=5)
+        runner, port = relay_lt.submit(start_relay("127.0.0.1", 0, auth_token=token)).result(timeout=5)
         url = f"ws://127.0.0.1:{port}/ws"
 
         agent_box: dict = {}
@@ -114,6 +115,7 @@ def webrtc_link():
                 robot=robot,
                 reliable_state=reliable_state,
                 reliable_action=reliable_action,
+                signaling_token=token,
                 on_agent=lambda a: agent_box.__setitem__("agent", a),
             )
         )
@@ -127,6 +129,7 @@ def webrtc_link():
             capture_fps=fps,
             action_timeout_s=action_timeout_s,
             connect_timeout_s=connect_timeout_s,
+            signaling_token=token,
         )
         if motors is not None:
             cfg_kwargs["motors"] = list(motors)

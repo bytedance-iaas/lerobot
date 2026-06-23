@@ -266,11 +266,15 @@ K8s pods**.
 5. Session ends or drops → relay `bye` to the survivor → daemon **safes the arm**, resets,
    loops for the next session (it outlives any one session).
 
-## 12. Security & multi-tenancy `[planned]`
+## 12. Security & multi-tenancy
 
-- **AuthN/Z at signaling** (FaaS `$connect`): a session token binds a user to a
-  `session_id` and to *their* daemon; reject mismatched pairings. One daemon ↔ one
-  controller per `session_id` (no cross-tenant routing today).
+- **Shared token** `[done]` — `signaling_server --auth-token <str>`; every peer presents
+  it (`Authorization: Bearer …`, constant-time compared) or is rejected (401) before
+  pairing. Gates the door against scanners. **Limitation:** one token for everyone — it
+  does NOT isolate sessions/tenants (anyone holding it can join any `session_id`).
+- **Per-session signed token** `[planned]` (FaaS `$connect`): a short-lived JWT binds a
+  user to a `session_id` and role; reject mismatched pairings. This is what stops
+  cross-tenant hijacking; the shared token is only the first gate.
 - **DTLS-SRTP** encrypts media/data end-to-end for free (WebRTC mandatory).
 - **TURN credentials** are short-lived, per-session (TURN REST).
 - **Daemon identity:** the Mac daemon authenticates to the relay; a stolen `session_id`

@@ -248,7 +248,10 @@ class WebRTCProxyRobot(Robot):
             self._endpoint = _ProxyEndpoint(self._buffer, self.cam_name, ice_servers=self.config.ice_servers)
             # Pure controller: reach the remote Mac daemon over the signaling relay.
             self._ws_sig = WebSocketSignaling(
-                self.config.signaling_url, self.config.session_id, role="controller"
+                self.config.signaling_url,
+                self.config.session_id,
+                role="controller",
+                token=self.config.signaling_token,
             )
             await self._endpoint.run(self._ws_sig)
             await self._endpoint.connected.wait()
