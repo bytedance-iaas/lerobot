@@ -87,14 +87,15 @@ because the requirements genuinely differ:
 
 | | teleop | eval (policy) | record (dataset) |
 |---|---|---|---|
-| **state** | unreliable — freshest wins | unreliable — freshest obs → action | **reliable** — never lose an obs / gap the trajectory |
-| **action** | unreliable — stale cmd useless | unreliable | tradeoff: reliable = faithful execution; unreliable = responsive |
+| **state** | unreliable — freshest wins | unreliable — freshest obs → action | **reliable** — never lose an obs |
+| **action** | unreliable — stale cmd useless | unreliable | **reliable** — never lose a transition's action |
 
 Realtime closed loops (teleop/eval) prize **freshness**: a lost packet on a *reliable*
 channel head-of-line-blocks until retransmitted, delivering a stale sample late — worse
-than dropping it and waiting 33 ms for the next. Recording prizes **completeness** on the
-obs (`state`) side so the dataset has no holes. Either way, total disconnect is still
-caught by the watchdog (§7), and absolute actions self-correct after a drop.
+than dropping it and waiting 33 ms for the next. Recording prizes **completeness**: both
+state and action are reliable so the dataset has no missing obs or actions. Either way,
+total disconnect is still caught by the watchdog (§7), and absolute actions self-correct
+after a drop.
 
 Note (current limitation): channels are created by the Mac daemon (the offerer), so the
 profile is set **daemon-side** today. Controller-driven selection per session (push the
@@ -114,33 +115,23 @@ is incomplete (its frame or state hasn't arrived / was dropped) it falls back to
 previous complete seq, or holds the last obs on a stall — never a fresh-joints /
 stale-frame mismatch.
 
-### 5.1 How a frame gets its capture timestamp — the hard sub-problem
+### 5.1 How a frame carries its capture seq
 
-A decoded video frame arrives **naked**: its RTP `pts` is re-stamped, so it carries
-neither the Mac's monotonic `t` nor the capture `seq`. We must re-attach identity.
-Options (this is the main open hardening item):
+A decoded video frame arrives **naked**: its RTP `pts` is re-stamped, so it carries no
+application-level `seq`. We encode the seq into the frame's `pts`:
+`pts = seq * VIDEO_PTS_PER_SEQ`, and the cloud recovers
+`seq = round(pts · time_base · clock / VIDEO_PTS_PER_SEQ)`. pts survives VP8/H.264; the
+cloud then pairs `frame.seq == state.seq`. A dropped frame just skips a seq — no cascade.
 
-1. **`framemeta` side-channel** `[removed]` — a reliable, ordered DataChannel carrying
-   `{seq, t}` per frame, popped 1:1 by order. **Broke on media-frame loss**: framemeta
-   (reliable) kept all entries, the track dropped frames → every subsequent frame got the
-   wrong timestamp, cascading. Valid only on a lossless link. Replaced by (2).
-2. **Encode `seq` in the frame `pts`** `[done]` — `pts = seq * VIDEO_PTS_PER_SEQ`;
-   recover `seq = round(pts·time_base·clock / STEP)`. pts survives VP8 cleanly; the cloud
-   pairs `frame.seq == state.seq`. A dropped frame just skips a seq — **no cascade**.
-   **Caveat:** the receiver re-bases the *first received* frame to `pts=0`, so seq is
-   relative to the first received frame; the daemon resets seq to 0 per session, so as
-   long as the first frame lands (true at session start) relative == absolute. Initial
-   frame loss shifts the offset — fix with (3).
-3. **RTP header extension (abs-capture-time / custom `seq`)** `[ideal]` — frame
-   self-describes; no re-basing, no side channel, no pixel touch. **Blocked by** limited
-   custom-header-extension support in aiortc.
-4. **Pixel-embedded seq** `[rejected]` — robust through codec but pollutes the recorded
-   image (unless cropped). Not for a dataset product.
+**Caveat:** the receiver re-bases the *first received* frame to `pts=0`, so seq is
+recovered relative to the first received frame. The daemon resets seq to 0 per session,
+so as long as the first frame lands (true at session start) relative == absolute; loss
+of the *initial* frame would shift the offset.
 
-**Current state:** seq-keyed pairing via (2) — `framemeta` removed, `AlignmentBuffer`
-matches by seq. Move the carrier to (3) when the media stack allows (kills the
-re-basing caveat). Nearest-t pairing would only be needed if camera and joints were ever
-decoupled into independent different-rate streams (they aren't — one get_observation).
+**End state:** carry an absolute seq in an **RTP header extension** (frame
+self-describes, no re-basing) once the media stack supports custom header extensions —
+aiortc's support is limited today. (Pixel-embedding a seq is rejected: it pollutes the
+recorded image.)
 
 ## 6. Control loop & RTT — the paradigm decision `[planned, M5]`
 
@@ -292,14 +283,14 @@ K8s pods**.
 | M1 | Loopback transport (channels, alignment, watchdog) | `[done]` |
 | M2 | Real `so_follower` (joints/action/torque) + SO-100 example | `[done]` |
 | M3 | WS signaling + Mac daemon + control plane (discovery, plan, grab) | `[done]` (same-host) |
-| — | Provenance + applied feedback; skew-drop; seq carrier investigation | `[done]` / `[partial]` |
+| — | Seq-based obs pairing (pts carrier); provenance + applied feedback; configurable channel reliability | `[done]` |
 | M4 | Public-net: coturn, K8s media (hostNetwork/announced IP), FaaS signaling, auth | `[planned]` |
 | M5 | Paradigm: real-time vs intent+local-autonomy; SFU for scale | `[planned]` |
 
 ## 14. Open questions
 
-1. **Frame-seq carrier** (§5.1): RTP header extension vs pts-with-anchor vs keep
-   framemeta-by-seq. Gating: aiortc header-extension support / SFU choice.
+1. **Frame-seq carrier** (§5.1): move from pts (re-basing caveat) to an RTP header
+   extension for an absolute seq. Gating: aiortc header-extension support / SFU choice.
 2. **Paradigm** (§6): real-time per-frame vs intent + local autonomy — gates the action
    channel design.
 3. **Media plane at scale**: aiortc-per-session vs LiveKit/mediasoup SFU.

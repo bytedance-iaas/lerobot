@@ -63,7 +63,7 @@ VIDEO_PTS_PER_SEQ = 3_000  # 1/30 s per seq at 90 kHz; round(pts/this) recovers 
 # realtime `state`/`action` channels are CONFIGURABLE per use case (see DESIGN.md §4):
 #   - teleop / eval (closed loop): UNRELIABLE — freshest sample wins, drops self-correct,
 #     no head-of-line blocking.
-#   - record (dataset): RELIABLE state so no obs is lost; action per fidelity vs latency.
+#   - record (dataset): RELIABLE state AND action — no obs or action lost from a transition.
 # A lost packet on a reliable channel head-of-line-blocks until retransmitted (trades
 # freshness for completeness). Total disconnect is covered by the Mac watchdog either way.
 RELIABLE_KWARGS: dict[str, Any] = {"ordered": True}  # reliable + ordered (SCTP default)
