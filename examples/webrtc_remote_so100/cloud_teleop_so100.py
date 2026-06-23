@@ -36,6 +36,7 @@ import argparse
 import io
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -168,13 +169,41 @@ def main() -> None:
         "--transport", choices=["aiortc", "livekit"], default="aiortc", help="transport backend"
     )
     parser.add_argument("--signaling-url", default=SIGNALING_URL, help="WS relay URL (aiortc)")
-    parser.add_argument("--livekit-url", default=None, help="LiveKit server URL (livekit)")
-    parser.add_argument("--livekit-token", default=None, help="LiveKit JWT for the controller (livekit)")
+    parser.add_argument(
+        "--livekit-url", default=os.environ.get("LIVEKIT_URL"), help="LiveKit URL (default $LIVEKIT_URL)"
+    )
+    parser.add_argument(
+        "--livekit-token", default=None, help="pre-signed JWT; omit to self-sign from api key/secret"
+    )
+    parser.add_argument(
+        "--livekit-api-key", default=os.environ.get("LIVEKIT_API_KEY"), help="default $LIVEKIT_API_KEY"
+    )
+    parser.add_argument(
+        "--livekit-api-secret", default=os.environ.get("LIVEKIT_API_SECRET"), help="$LIVEKIT_API_SECRET"
+    )
+    parser.add_argument("--livekit-identity", default="controller", help="this controller's LiveKit identity")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
-    if args.transport == "livekit" and (not args.livekit_url or not args.livekit_token):
-        parser.error("--livekit-url and --livekit-token are required for --transport livekit")
+    livekit_token = args.livekit_token
+    if args.transport == "livekit":
+        if not args.livekit_url:
+            parser.error("--livekit-url (or $LIVEKIT_URL) is required for --transport livekit")
+        if not livekit_token:
+            if not args.livekit_api_key or not args.livekit_api_secret:
+                parser.error(
+                    "--transport livekit needs --livekit-token, or --livekit-api-key + "
+                    "--livekit-api-secret (or $LIVEKIT_API_KEY/$LIVEKIT_API_SECRET) to self-sign"
+                )
+            from lerobot.robots.webrtc_proxy.transport_livekit import make_livekit_token
+
+            # Room == session id; must match the daemon's. (cloud_teleop uses SESSION_ID.)
+            livekit_token = make_livekit_token(
+                api_key=args.livekit_api_key,
+                api_secret=args.livekit_api_secret,
+                identity=args.livekit_identity,
+                room=SESSION_ID,
+            )
 
     robot = WebRTCProxyRobot(
         WebRTCProxyRobotConfig(
@@ -185,7 +214,7 @@ def main() -> None:
             action_timeout_s=0.5,
             transport_backend=args.transport,
             livekit_url=args.livekit_url,
-            livekit_token=args.livekit_token,
+            livekit_token=livekit_token,
         )
     )
     robot.connect()

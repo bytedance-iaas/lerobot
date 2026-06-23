@@ -160,22 +160,26 @@ inbound path. Verified end-to-end against a local `livekit-server --dev` and Liv
 Cloud. Install the extra: `uv sync --extra webrtc-livekit`.
 
 Both ends must use `--transport livekit` (an aiortc peer and a LiveKit room don't
-interoperate). The daemon needs no `--signaling-url` (LiveKit does its own signaling);
-pass the server URL + a JWT (room name = `--session`) to each side:
+interoperate). The daemon needs no `--signaling-url` (LiveKit does its own signaling).
+Each process **self-signs its own token** from a shared API key/secret — set the
+LiveKit env vars once and you never paste a JWT (the room is `--session`; identities
+default to `robot` / `controller`):
 
 ```bash
-# local dev server (key/secret default to devkey/secret); sign tokens with livekit-api
+# local dev server (key/secret default to devkey/secret)
 livekit-server --dev
+export LIVEKIT_URL=ws://127.0.0.1:7880 LIVEKIT_API_KEY=devkey LIVEKIT_API_SECRET=secret
 
-# Mac daemon (publisher)
+# Mac daemon (publisher) — self-signs identity=robot from the env
 uv run python -m lerobot.robots.webrtc_proxy.mac_daemon --session so100 \
-    --transport livekit --livekit-url ws://127.0.0.1:7880 --livekit-token "$ROBOT_JWT" \
-    --real-camera 0   # or synthetic if omitted
+    --transport livekit --real-camera 0   # drop --real-camera for synthetic frames
 
-# cloud controller (subscriber)
-uv run python examples/webrtc_remote_so100/cloud_teleop_so100.py \
-    --transport livekit --livekit-url ws://127.0.0.1:7880 --livekit-token "$CONTROLLER_JWT"
+# cloud controller (subscriber) — self-signs identity=controller
+uv run python examples/webrtc_remote_so100/cloud_teleop_so100.py --transport livekit
 ```
+
+For production, don't ship the API secret to the Mac — pass a pre-signed, scoped token
+with `--livekit-token` (minted by a cloud token server) instead of the key/secret.
 
 The opt-in e2e test runs the same two-process path:
 
