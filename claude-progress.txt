@@ -1,59 +1,61 @@
-Date: 2026-06-22
-TaskStatus: completed
-Task scope: M1 回环 (F1-F7) + M3 控制面/设备发现 (F8-F9) + F10 WebSocket 信令 + Mac daemon。
-真跨公网 STUN/TURN/coturn/K8s 属 M4（需真网络，本机不可测）。
+Date: 2026-06-23
+TaskStatus: not_completed
+Task scope: WebRTCProxyRobot (云端 Robot 代理 + Mac daemon, WebRTC 桥)。当前活跃子任务:
+  让 LiveKit 传输 backend 在 LiveKit Cloud 上端到端跑通(aiortc backend 已全部完成并测过)。
 
-Current summary:
-- M1 (F1-F7) completed：aiortc 回环链路；obs 按采集时间戳重组、send_action、看门狗。
-- M3 控制面 (F8-F9) completed：control DataChannel + RPC；设备发现 list_ports/list_cameras/
-  find_port(begin→result 事件驱动)；物理 ID 只在 Mac，云端只有逻辑名。
-  - 新增 LocalDeviceInventory（包 lerobot find_available_ports / find_*_cameras），
-    mac_daemon `--real-devices` 开关枚举真实串口/相机；真串口经控制面回环已验证。
-  - 真相机推流：CaptureAgent 接 camera(read_latest) + _fit_frame 归一到声明尺寸；
-    mac_daemon `--real-camera <index|/dev/videoN>` 开 OpenCVCamera 推流（daemon 持有相机生命周期，跨 session 复用）。
-    回环用 FakeCamera 验证帧颜色穿过 VP8 编解码到云端（18 passed）。关节/send_action 仍是合成，属 M2。
-- F10 completed：真 Mac daemon ↔ 云端 controller。
-  - signaling.py 加 WebSocketSignaling client；signaling_server.py 信令 relay（按 session/role 转发 SDP，
-    缓冲晚到方，对端断开发 bye）。
-  - mac_daemon.py：常驻入口，连接→offer→服务一次 session→断连停力(force_safe_stop)→重连循环；
-    可 `python -m ...mac_daemon --signaling-url ws://...` 跑。
-  - WebRTCProxyRobot 支持 signaling_url=ws://（controller 模式，不起本地 agent）+ ice_servers 配置。
-  - CaptureAgent 加 connectionstatechange→closed 事件 + wait_closed()；ICE 可配。
-- 测试：tests/robots/test_webrtc_proxy_{alignment,loopback,control,daemon}.py 共 14 passed
-  （需 `-p no:hydra_pytest` 绕开本环境无关损坏插件）。daemon 测试用同机三 loop（relay+daemon+cloud）
-  走真 localhost WS 信令 + WebRTC host candidate，含「daemon 活过一次 session 再服务下一次」断连重连用例。
-- demo_loopback 保留同进程回环演示（控制面 + 看门狗）。
+== 已完成(全部已 commit,见 git log) ==
+- M1 回环 → M3 信令/daemon/控制面 → M2 真 so_follower(关节/动作/看门狗切扭矩)→ provenance/applied 反馈
+  → 可配置 channel 可靠性(record=可靠, teleop/eval=不可靠)→ shared-token 鉴权 → 传输层抽象。
+- 传输层已抽成 `transport.py` 的 `Transport` 接口(命名 data channel + 带 seq 的视频流)。
+  默认 `AiortcTransport`(WebRTC P2P)。`make_transport(backend,...)` 工厂 + `transport_backend` 配置项
+  ("aiortc"|"livekit");daemon `--transport`。CaptureAgent/_ProxyEndpoint 只依赖接口。
+- 帧↔state 改为按 **seq 精确配对**(aiortc 里 seq 藏在帧 pts;AlignmentBuffer 是 seq-keyed 字典)。
+- aiortc 路径:**34 个测试全过**(tests/robots/test_webrtc_proxy_*.py,跑测试加 `-p no:hydra_pytest`)。
+- 示例 examples/webrtc_remote_so100/:mac_daemon_so100.py(真 SO100)+ cloud_teleop_so100.py
+  (web UI 看实时相机+jog / --mode console)+ panel.html。合成 daemon 现在“跟随指令”(jog 可见)。
+- 文档:src/lerobot/robots/webrtc_proxy/{README.md, DESIGN.md}(DESIGN 有 K8s/FaaS/coturn/LiveKit 部署)。
 
-架构要点（回答用户两问）:
-- WebRTCProxyRobot 在云端跑；Mac 必须跑常驻 daemon（mac_daemon.py，分支名 webrtc-daemon）。
-- 设备 port/camera ID 只在 Mac 端，云端经控制面 RPC 发现，不进云端 config。
+== 当前卡点:LiveKit backend 端到端 ==
+环境验证 OK:沙箱能连 LiveKit Cloud;JWT 有效;livekit Python SDK 可用(已装)。
+项目:LiveKit Cloud project "lerobot",URL = wss://lerobot-zt6uc2pv.livekit.cloud,room 用 "so100"。
+JWT 在对话历史里(robot/controller 两个身份,24h);⚠️ API secret 已泄漏到对话,建议测完去
+  控制台 API keys 重建 key 轮换。重新签 token:用 livekit-api 的 AccessToken,room="so100"。
 
-M2 完成（接真实 so_follower）:
-- CaptureAgent 接 robot=：关节+相机来自一次 robot.get_observation()；_apply_action→robot.send_action；
-  看门狗 _safe_stop→robot.bus.disable_torque() 切扭矩(P0)；session 起/动作恢复 enable_torque。
-  所有串口 IO 走单线程 ThreadPoolExecutor（不阻塞公网 loop + 总线不并发）。run_daemon 加 robot=。
-- examples/webrtc_remote_so100：mac_daemon_so100.py(真 SO100+run_daemon) + cloud_teleop_so100.py
-  (WebRTCProxyRobot + 复用 web_so100 jog 面板远程遥操) + README(onboarding+三件套)。
-  关键展示：WebRTCProxyRobot 是 drop-in Robot，现有 teleop/record 代码无改即可远程驱动真臂。
-- FakeRobot 测试通过（共 24 测试）；真硬件验证靠 example（需真臂）。
+已查明的 SDK 事实(重要,别重新踩):
+1. 帧的 seq **不能** 靠帧本身带:LiveKit 会重写 frame timestamp_us(实测发 0,1000,2000.. 收到的是
+   它自己的时钟 1043...);FrameMetadata 是固定 proto。→ 已改成:发布端每帧在 reliable data topic
+   "_seq" 上发一条 {seq},订阅端 FIFO 1:1 弹出配对(transport_livekit.py 已实现)。帧用 RGB24 直传。
+2. SDK 字段实测:DataPacket(data,kind,participant,topic);VideoFrameEvent(frame,timestamp_us,rotation,
+   metadata);capture_frame(frame,*,timestamp_us,rotation,metadata);publish_data(payload,*,reliable,
+   destination_identities,topic);VideoBufferType 有 RGB24/RGBA/I420...;VideoFrame.convert(type)。
+3. **一个进程里开两个 LiveKit Room、跑在两个 event loop 会冲突**(livekit FFI client 绑单 loop)→
+   必须把 daemon 和 controller 当**两个独立进程**测(真实部署本来就是两进程,无所谓)。
 
-Main gaps (M4，需真网络/硬件):
-- STUN/TURN(coturn) 真 url + NAT 穿透；K8s hostNetwork/announced IP；relay 多租户+鉴权。
-- 多相机（每路一 media track）；send_action 真 clip/ack（目前 robot.send_action 已返回实际下发值）。
-- M5: paradigm 落地决策（影响 action DataChannel 载荷）。
+当前现象(daemon 作为独立子进程跑):
+- daemon 端(publisher)正常(日志有 WATCHDOG 触发,无 "engine is closed");
+- controller 端(subscriber,主进程)join 上了 room,但 get_observation() **TimeoutError**
+  —— assemble() 一直拿不到“同 seq 的 state+frame”对。
 
-架构清理（应 review 意见）:
-- WebRTCProxyRobot 改为**纯云端 controller**：删掉 in-process loopback 分支（不再在云端类里起 Mac agent），
-  connect() 必须给 ws:// signaling_url。自包含测试/demo 改用「同进程 relay+daemon+controller 三 loop」
-  （tests/robots/conftest.py 的 webrtc_link fixture；demo_loopback.py 重写）。
-- send_action 早已实现（send_action→_ch_action→_on_action→_apply_action）；只有 _apply_action 真正驱动电机是 M2 stub。
-- 相机采集配置归属 Mac（index 永不下发）；云端只声明 obs 形状，get_observation 兜底 _fit_frame；
-  set_camera_plan 把期望尺寸推给 Mac（省带宽）。推流相机 open 改 native+resize 回退。
-- grab_camera 控制面 RPC 保留（onboarding 单帧预览，走 DataChannel，与连续 obs 的 media track 分离）。
+== 下一步(从这里继续) ==
+1. 给 controller 加诊断:连接(或超时后)打印
+   robot._buffer._states / _frames 的 key 集合、robot._endpoint._transport._seq_queue 长度、
+   transport.connected 状态。判断到底是 state 没来、frame 没来、还是 seq 没来导致配不上。
+2. 高度怀疑点:
+   a) 订阅端没收到 video track → 需要 Room 连接时 auto_subscribe(确认 livekit 默认是否自动订阅;
+      可能要 RoomOptions(auto_subscribe=True))。track_subscribed 回调有没有触发。
+   b) data 没收到 → 确认 publish_data 的 destination(默认广播应可达)、topic 路由
+      (transport_livekit `_on_data` 按 topic 分发到 channel / "_seq" 队列)。
+   c) FIFO 配对:_seq data 与 video frame 跨流到达,首帧前 seq 没来会丢帧;state(seq) 与 frame(seq)
+      要有交集 assemble 才返回。可能要放宽:若拿不到精确 seq,临时给帧打“最新 state 的 seq”凑一对验证链路通。
+3. 复现命令(daemon 独立子进程 + controller 主进程):见对话里最后一条 bash(export LK_URL/LK_ROBOT/
+   LK_CTRL;后台跑 `python -m lerobot.robots.webrtc_proxy.mac_daemon --transport livekit --livekit-url $LK_URL
+   --livekit-token $LK_ROBOT --signaling-url ws://unused --session so100`;前台跑 controller 用 LK_CTRL)。
+4. 跑通后:把 transport_livekit 的 `# VERIFY`/wip 注释清掉,补一个最小集成测试(需 livekit 服务,默认 skip),
+   给 cloud_teleop_so100.py 加 --transport/--livekit-url/--livekit-token 参数,更新 DESIGN/README,正式 commit。
 
-关键踩坑（已解决）:
-- aiortc 对象须在 bg event-loop 线程内构造；iceServers=[] 用 host candidate（受限网络/同机），
-  默认 None 会走 Google STUN 卡死。
-
-Next steps:
-- 等产品方 paradigm 决策；按优先级 M2(真硬件) > M4(coturn/K8s)。
+== 注意 ==
+- aiortc 默认不受影响,别为了 LiveKit 改坏 aiortc 路径(改完务必再跑 34 个测试)。
+- LiveKit 是可选 backend(extra: webrtc-livekit);保持隔离,import 都是 guarded。
+- 提交社区以 aiortc 为默认(轻、CI 可测);LiveKit 作为实验可选项。
+- mac_daemon `--signaling-url` 目前 required;LiveKit 时传 dummy `ws://unused`(transport 忽略它)。
+  可顺手改成 livekit 时不强制要 signaling-url。
