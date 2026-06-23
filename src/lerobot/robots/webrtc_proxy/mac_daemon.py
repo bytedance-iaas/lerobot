@@ -99,7 +99,12 @@ async def run_daemon(
     motors = list(motors or SO100_MOTORS)
     stop = stop or asyncio.Event()
     while not stop.is_set():
-        sig = WebSocketSignaling(signaling_url, session_id, role="robot", token=signaling_token)
+        # livekit does its own signaling (url+token); only aiortc needs the WS relay.
+        sig = (
+            None
+            if transport_backend == "livekit"
+            else WebSocketSignaling(signaling_url, session_id, role="robot", token=signaling_token)
+        )
         agent = CaptureAgent(
             signaling=sig,
             motors=motors,
@@ -140,7 +145,9 @@ async def run_daemon(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="WebRTCProxyRobot Mac-side daemon")
-    parser.add_argument("--signaling-url", required=True, help="ws://host:port/ws")
+    parser.add_argument(
+        "--signaling-url", default=None, help="ws://host:port/ws (required for --transport aiortc)"
+    )
     parser.add_argument("--session", default="default")
     parser.add_argument("--camera-name", default="front")
     parser.add_argument("--width", type=int, default=640)
@@ -174,6 +181,12 @@ def main() -> None:
     parser.add_argument("--livekit-token", default=None, help="LiveKit JWT (when --transport livekit)")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
+    # Per-backend required args (livekit does its own signaling; aiortc needs the relay).
+    if args.transport == "aiortc" and not args.signaling_url:
+        parser.error("--signaling-url is required for --transport aiortc")
+    if args.transport == "livekit" and (not args.livekit_url or not args.livekit_token):
+        parser.error("--livekit-url and --livekit-token are required for --transport livekit")
 
     # record needs complete, ordered obs AND actions (no lost transitions); realtime loops
     # (teleop/eval) want freshness. Explicit flags override the profile.

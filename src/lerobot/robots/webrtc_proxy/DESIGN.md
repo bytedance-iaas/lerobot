@@ -210,15 +210,35 @@ The **media path is the constraint**, not the CPU:
   P2P fails — **mandatory in production**, it relays media and eats bandwidth. Deploy
   coturn on `hostNetwork`/dedicated nodes with a public IP and an open relay port range;
   inject its URLs into `ice_servers` on both peers (`RTCConfiguration`).
-- **Media framework choice.** `aiortc` (current) gives decoded `ndarray` frames straight
-  into the LeRobot pipeline — perfect for the adapter, but single-connection / weak at
-  scale and lacking announced-IP / fixed-port for cloud NAT. For many concurrent users
-  or container deployment, move the media plane to **LiveKit / mediasoup** (SFU). The
-  transport is pluggable (`transport.py` `Transport` interface; pick via
-  `transport_backend`): `AiortcTransport` is the default; `transport_livekit.py` is an
-  **experimental, untested** `LiveKitTransport` scaffold. LiveKit is the chosen SFU
-  because it handles signaling + TURN + scale AND has a Python SDK to pull frames into
-  LeRobot; the scaffold needs verifying against a real LiveKit server (see its docstring).
+- **Media framework choice.** `aiortc` (current default) gives decoded `ndarray` frames
+  straight into the LeRobot pipeline — perfect for the adapter, but single-connection /
+  weak at scale and lacking announced-IP / fixed-port for cloud NAT. For many concurrent
+  users or container deployment, move the media plane to **LiveKit / mediasoup** (SFU).
+  The transport is pluggable (`transport.py` `Transport` interface; pick via
+  `transport_backend`): `AiortcTransport` is the default; `transport_livekit.py` is a
+  working (experimental, optional) `LiveKitTransport`. LiveKit is the chosen SFU because
+  it handles signaling + TURN + scale AND has a Python SDK to pull frames into LeRobot.
+  It is **verified end-to-end** against both a local `livekit-server --dev` and LiveKit
+  Cloud (obs + action + control round-trip with fresh aligned observations); see the
+  opt-in `tests/robots/test_webrtc_proxy_livekit.py`.
+
+### 11.1.1 NAT / restrictive-egress reachability `[why SFU, not P2P]`
+
+The two ends often sit in asymmetric network conditions; this drives the backend choice:
+
+- **aiortc P2P** needs both peers to obtain a usable ICE candidate (host/srflx/relay).
+  It has **no support for routing media through an HTTP forward proxy**. So if one side
+  can only egress via a corporate `HTTP(S)_PROXY` (no direct UDP/TCP out), aiortc P2P
+  effectively cannot connect, regardless of TURN.
+- **LiveKit (SFU)** has **both** peers *dial outward* to a public SFU — neither needs an
+  inbound path. This cleanly solves the **NAT side** (outbound + SFU-side TURN). For a
+  **proxy-only side**, the split is:
+  - *signaling* (wss:443) traverses the HTTP proxy fine (it is just HTTPS/CONNECT);
+  - *media* still needs the WebRTC client to tunnel ICE/TURN (TURN/TLS:443) through that
+    proxy, which libwebrtc supports only partially and the Python SDK does not expose.
+    Typical failure shape there: **room connects, no track/data flows** — verify on the
+    real proxied host, and if media won't traverse, run a coturn the proxy can `CONNECT`
+    to, or place the controller where it has direct egress (the usual cloud deployment).
 
 Scaling note: one controller pod per active session (stateful, holds a PeerConnection +
 the bg loop). Autoscale on session count; sessions are sticky to their pod for their

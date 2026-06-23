@@ -151,6 +151,42 @@ Tests (suites needing the transport skip automatically without aiortc/aiohttp):
 uv run pytest tests/robots/test_webrtc_proxy_*.py -p no:hydra_pytest -q
 ```
 
+## LiveKit backend (experimental, optional)
+
+`aiortc` (default) is P2P and self-contained. The pluggable transport also has a
+**LiveKit (SFU)** backend for cross-public-internet / NAT / scale: both ends dial
+*outward* to a LiveKit server (LiveKit Cloud or self-hosted), so neither needs an
+inbound path. Verified end-to-end against a local `livekit-server --dev` and LiveKit
+Cloud. Install the extra: `uv sync --extra webrtc-livekit`.
+
+Both ends must use `--transport livekit` (an aiortc peer and a LiveKit room don't
+interoperate). The daemon needs no `--signaling-url` (LiveKit does its own signaling);
+pass the server URL + a JWT (room name = `--session`) to each side:
+
+```bash
+# local dev server (key/secret default to devkey/secret); sign tokens with livekit-api
+livekit-server --dev
+
+# Mac daemon (publisher)
+uv run python -m lerobot.robots.webrtc_proxy.mac_daemon --session so100 \
+    --transport livekit --livekit-url ws://127.0.0.1:7880 --livekit-token "$ROBOT_JWT" \
+    --real-camera 0   # or synthetic if omitted
+
+# cloud controller (subscriber)
+uv run python examples/webrtc_remote_so100/cloud_teleop_so100.py \
+    --transport livekit --livekit-url ws://127.0.0.1:7880 --livekit-token "$CONTROLLER_JWT"
+```
+
+The opt-in e2e test runs the same two-process path:
+
+```bash
+LEROBOT_LIVEKIT_URL=ws://127.0.0.1:7880 \
+    LEROBOT_LIVEKIT_API_KEY=devkey LEROBOT_LIVEKIT_API_SECRET=secret \
+    uv run pytest tests/robots/test_webrtc_proxy_livekit.py -p no:hydra_pytest -q
+```
+
+NAT / restrictive-egress reachability (why SFU, not P2P) is covered in `DESIGN.md` §11.1.1.
+
 ## Known limitations (M1 — to fix in later milestones)
 
 - **Frame seq rides `pts`, recovered relative to the first received frame.** Robust to
