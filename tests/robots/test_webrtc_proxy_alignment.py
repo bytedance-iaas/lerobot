@@ -68,6 +68,25 @@ def test_assemble_uses_newest_state():
     assert aligned.skew_ms == 0.0
 
 
+def test_assemble_drops_pair_beyond_skew():
+    buf = AlignmentBuffer()
+    buf.add_frame(1.0, _frame(1))
+    buf.add_state(t=10.0, joints={"a.pos": 0.0}, seq=5)  # nearest frame is 9s away
+    assert buf.assemble() is not None  # no-arg: best-effort, returns the mismatched pair
+    assert buf.assemble(max_skew_s=0.1) is None  # enforced: too skewed -> dropped
+
+
+def test_assemble_returns_freshest_within_skew():
+    buf = AlignmentBuffer()
+    buf.add_frame(1.0, _frame(1))
+    buf.add_state(t=1.0, joints={"a.pos": 1.0}, seq=0)
+    buf.add_state(t=1.05, joints={"a.pos": 2.0}, seq=1)  # frame t=1.0 -> skew 50ms, ok
+    assert buf.assemble(max_skew_s=0.1).seq_state == 1  # freshest coherent
+
+    buf.add_state(t=5.0, joints={"a.pos": 3.0}, seq=2)  # frame t=1.0 -> skew 4s, too far
+    assert buf.assemble(max_skew_s=0.1).seq_state == 1  # drops seq 2, holds freshest coherent
+
+
 def test_history_is_bounded():
     buf = AlignmentBuffer(maxlen=2)
     for i in range(5):

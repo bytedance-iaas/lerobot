@@ -86,20 +86,30 @@ class AlignmentBuffer:
                     best_dt, best = dt, (ft, fv)
         return best if best is not None else (None, None)
 
-    def assemble(self) -> AlignedObs | None:
-        """Pair the newest state with its nearest frame. None if no state yet."""
+    def assemble(self, max_skew_s: float | None = None) -> AlignedObs | None:
+        """Pair a state with its nearest frame, freshest first.
+
+        ``max_skew_s=None`` (default): newest state + its nearest frame, whatever the
+        skew (best-effort; used for telemetry / the no-frame-yet startup check).
+
+        ``max_skew_s`` set: return the *freshest* state whose nearest frame is within
+        the skew, or ``None`` if none is. This drops temporally-mismatched pairs (e.g.
+        a fresh joint reading against a stale frame when the camera lags/stalls), while
+        tolerating the normal case where the matching frame arrives a beat late — it
+        just falls back to the previous, still-coherent tick.
+        """
         with self._lock:
             if not self._states:
                 return None
-            t_state, joints, seq = self._states[-1]
-            t_frame, frame = self._nearest_frame_locked(t_state)
-            return AlignedObs(
-                t_state=t_state,
-                joints=dict(joints),
-                frame=frame,
-                t_frame=t_frame,
-                seq_state=seq,
-            )
+            if max_skew_s is None:
+                t_state, joints, seq = self._states[-1]
+                t_frame, frame = self._nearest_frame_locked(t_state)
+                return AlignedObs(t_state, dict(joints), frame, t_frame, seq)
+            for t_state, joints, seq in reversed(self._states):
+                t_frame, frame = self._nearest_frame_locked(t_state)
+                if frame is not None and abs(t_state - t_frame) <= max_skew_s:
+                    return AlignedObs(t_state, dict(joints), frame, t_frame, seq)
+            return None
 
     def has_state(self) -> bool:
         with self._lock:
