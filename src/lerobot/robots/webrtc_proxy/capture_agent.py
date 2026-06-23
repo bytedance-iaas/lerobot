@@ -48,13 +48,12 @@ from .control import ControlServer, DeviceInventory, SyntheticInventory
 from .protocol import (
     CH_ACTION,
     CH_CONTROL,
-    CH_FRAMEMETA,
     CH_STATE,
     ORDERED_CHANNEL_KWARGS,
     RT_CHANNEL_KWARGS,
     VIDEO_CLOCK_RATE,
+    VIDEO_PTS_PER_SEQ,
     ActionMsg,
-    FrameMetaMsg,
     StateMsg,
 )
 from .signaling import Signaling
@@ -87,18 +86,15 @@ class _SyntheticCameraTrack(MediaStreamTrack):
 
     kind = "video"
 
-    def __init__(self, queue: asyncio.Queue[np.ndarray]) -> None:
+    def __init__(self, queue: asyncio.Queue[tuple[int, np.ndarray]]) -> None:
         super().__init__()
         self._queue = queue
-        self._t0: float | None = None
 
     async def recv(self) -> VideoFrame:
-        img = await self._queue.get()
-        now = time.monotonic()
-        if self._t0 is None:
-            self._t0 = now
+        seq, img = await self._queue.get()
         frame = VideoFrame.from_ndarray(img, format="rgb24")
-        frame.pts = int((now - self._t0) * VIDEO_CLOCK_RATE)
+        # Carry the capture seq in pts so the cloud can pair this frame to its state.
+        frame.pts = seq * VIDEO_PTS_PER_SEQ
         frame.time_base = Fraction(1, VIDEO_CLOCK_RATE)
         return frame
 
@@ -135,9 +131,8 @@ class CaptureAgent:
         # M4 passes STUN/TURN urls here for real public-net peers.
         ice = [RTCIceServer(urls=u) for u in self._ice_servers]
         self.pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=ice))
-        self._frame_q: asyncio.Queue[np.ndarray] = asyncio.Queue(maxsize=2)
+        self._frame_q: asyncio.Queue[tuple[int, np.ndarray]] = asyncio.Queue(maxsize=2)
         self._ch_state = None
-        self._ch_framemeta = None
         self._ch_action = None
         self._ch_control = None
         self._control = ControlServer(
@@ -179,7 +174,6 @@ class CaptureAgent:
 
         await self.signaling.open()
         self._ch_state = self.pc.createDataChannel(CH_STATE, **RT_CHANNEL_KWARGS)
-        self._ch_framemeta = self.pc.createDataChannel(CH_FRAMEMETA, **ORDERED_CHANNEL_KWARGS)
         self._ch_action = self.pc.createDataChannel(CH_ACTION, **RT_CHANNEL_KWARGS)
         self._ch_action.on("message", self._on_action)
         self._ch_control = self.pc.createDataChannel(CH_CONTROL, **ORDERED_CHANNEL_KWARGS)
@@ -324,12 +318,11 @@ class CaptureAgent:
                         applied_t=self._last_action_t,
                     ).to_json()
                 )
-            if self._ch_framemeta is not None and self._ch_framemeta.readyState == "open":
-                self._ch_framemeta.send(FrameMetaMsg(t=t, seq=seq).to_json())
-            # Drop the oldest pending frame rather than block the capture clock.
+            # The frame carries its seq in pts (set by the track). Drop the oldest
+            # pending frame rather than block the capture clock.
             if self._frame_q.full():
                 _ = self._frame_q.get_nowait()
-            self._frame_q.put_nowait(img)
+            self._frame_q.put_nowait((seq, img))
 
             next_t += self.period
             await asyncio.sleep(max(0.0, next_t - time.monotonic()))

@@ -83,12 +83,14 @@ would be unsafe over a lossy channel.
 
 Camera (media track) and joints (state channel) traverse the net with **independent
 jitter/loss**. Pairing by *arrival* time would let jitter corrupt temporal ordering of
-a dataset. So **every sample carries a Mac-side capture timestamp**, and the cloud
-`AlignmentBuffer` pairs by *capture* time — jitter becomes latency, never mispairing.
+a dataset. Joints and the camera frame of one cycle come from a single
+`robot.get_observation()` on the Mac, so they **share a capture seq**; the cloud
+`AlignmentBuffer` pairs `frame.seq == state.seq` — exact, and robust to loss (a dropped
+frame/state just skips that seq).
 
-`get_observation` only emits a state+frame pair within a skew tolerance (the freshest
-coherent pair; normal jitter falls back to the previous coherent tick). On camera
-lag/stall it holds the last coherent obs rather than fabricate a fresh-joints /
+`get_observation` returns the freshest seq present on **both** sides. If the newest seq
+is incomplete (its frame or state hasn't arrived / was dropped) it falls back to the
+previous complete seq, or holds the last obs on a stall — never a fresh-joints /
 stale-frame mismatch.
 
 ### 5.1 How a frame gets its capture timestamp — the hard sub-problem
@@ -97,28 +99,27 @@ A decoded video frame arrives **naked**: its RTP `pts` is re-stamped, so it carr
 neither the Mac's monotonic `t` nor the capture `seq`. We must re-attach identity.
 Options (this is the main open hardening item):
 
-1. **`framemeta` side-channel (current M1)** `[done]` — a reliable, ordered DataChannel
-   carrying `{seq, t}` per frame; the cloud pops one per received frame (1:1 by order).
-   **Breaks on media-frame loss**: framemeta (reliable) keeps all entries, the track
-   drops frames → every subsequent frame gets the wrong timestamp, cascading. Valid
-   only on a lossless link (loopback/LAN).
-2. **Encode `seq` in the frame `pts`** `[candidate]` — set `pts = seq * STEP`; recover
-   `seq = round(pts / STEP)`. Verified: pts survives VP8 cleanly. **Caveat:** the
-   receiver re-bases the *first received* frame to `pts=0`, so pts yields the *relative*
-   index from the first received frame; absolute `seq` needs one anchor (correlate the
-   first frame with the state stream, or a session-start handshake). Robust to
-   mid-stream loss for ordering once anchored. No side channel, no pixel pollution.
+1. **`framemeta` side-channel** `[removed]` — a reliable, ordered DataChannel carrying
+   `{seq, t}` per frame, popped 1:1 by order. **Broke on media-frame loss**: framemeta
+   (reliable) kept all entries, the track dropped frames → every subsequent frame got the
+   wrong timestamp, cascading. Valid only on a lossless link. Replaced by (2).
+2. **Encode `seq` in the frame `pts`** `[done]` — `pts = seq * VIDEO_PTS_PER_SEQ`;
+   recover `seq = round(pts·time_base·clock / STEP)`. pts survives VP8 cleanly; the cloud
+   pairs `frame.seq == state.seq`. A dropped frame just skips a seq — **no cascade**.
+   **Caveat:** the receiver re-bases the *first received* frame to `pts=0`, so seq is
+   relative to the first received frame; the daemon resets seq to 0 per session, so as
+   long as the first frame lands (true at session start) relative == absolute. Initial
+   frame loss shifts the offset — fix with (3).
 3. **RTP header extension (abs-capture-time / custom `seq`)** `[ideal]` — frame
    self-describes; no re-basing, no side channel, no pixel touch. **Blocked by** limited
    custom-header-extension support in aiortc.
 4. **Pixel-embedded seq** `[rejected]` — robust through codec but pollutes the recorded
    image (unless cropped). Not for a dataset product.
 
-**Recommendation:** move to seq-keyed pairing (frame.seq == state.seq, exact, since in
-the M2 design joints+camera come from one `robot.get_observation()` and share a seq),
-carried by (3) where the media stack allows, else (2) with a state-stream anchor. Then
-`framemeta` is removed and the `AlignmentBuffer` matches by seq, not nearest-t. Nearest-t
-remains only if camera and joints are ever decoupled into different-rate streams.
+**Current state:** seq-keyed pairing via (2) — `framemeta` removed, `AlignmentBuffer`
+matches by seq. Move the carrier to (3) when the media stack allows (kills the
+re-basing caveat). Nearest-t pairing would only be needed if camera and joints were ever
+decoupled into independent different-rate streams (they aren't — one get_observation).
 
 ## 6. Control loop & RTT — the paradigm decision `[planned, M5]`
 
