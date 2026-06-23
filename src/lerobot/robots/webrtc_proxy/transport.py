@@ -49,22 +49,24 @@ def make_transport(
     role: str,
     channels: dict[str, bool],
     ice_servers: list[str] | None = None,
+    livekit_url: str | None = None,
+    livekit_token: str | None = None,
 ) -> "Transport":
     """Build a transport for ``backend`` ("aiortc" | "livekit").
 
     Both ends of a session MUST use the same backend (an aiortc P2P peer and a LiveKit
-    room don't interoperate). "aiortc" is the default, self-contained backend; "livekit"
-    is a documented extension point (implement ``LiveKitTransport(Transport)`` and wire
-    it here) for cross-public-net / SFU scale.
+    room don't interoperate). "aiortc" is the default, self-contained backend. "livekit"
+    (EXPERIMENTAL scaffold, see ``transport_livekit.py``) routes via a LiveKit SFU and
+    needs ``livekit_url`` + ``livekit_token``.
     """
     if backend == "aiortc":
         return AiortcTransport(role=role, channels=channels, ice_servers=ice_servers)
     if backend == "livekit":
-        raise NotImplementedError(
-            "transport_backend='livekit' is not implemented yet — implement "
-            "LiveKitTransport(Transport) (join room, publish/subscribe track, data msgs) "
-            "and wire it into make_transport(). See DESIGN.md §11."
-        )
+        if not livekit_url or not livekit_token:
+            raise ValueError("transport_backend='livekit' requires livekit_url and livekit_token")
+        from .transport_livekit import LiveKitTransport
+
+        return LiveKitTransport(role=role, channels=channels, url=livekit_url, token=livekit_token)
     raise ValueError(f"unknown transport backend {backend!r} (expected 'aiortc' or 'livekit')")
 
 

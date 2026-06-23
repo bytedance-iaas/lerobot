@@ -81,6 +81,8 @@ class CaptureAgent:
         reliable_state: bool = False,  # True for record (no lost obs); False for teleop/eval (fresh)
         reliable_action: bool = False,
         transport_backend: str = "aiortc",  # "aiortc" (default) | "livekit"
+        livekit_url: str | None = None,
+        livekit_token: str | None = None,
         transport: Transport | None = None,  # explicit transport overrides the backend
     ) -> None:
         self.signaling = signaling
@@ -99,6 +101,8 @@ class CaptureAgent:
             role="publisher",
             channels={CH_STATE: reliable_state, CH_ACTION: reliable_action, CH_CONTROL: True},
             ice_servers=ice_servers,
+            livekit_url=livekit_url,
+            livekit_token=livekit_token,
         )
         self.closed = self._transport.closed  # set when the link drops
         self._transport.channel(CH_ACTION).on_message(self._on_action)
