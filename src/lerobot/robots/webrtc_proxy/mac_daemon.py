@@ -82,6 +82,8 @@ async def run_daemon(
     inventory: DeviceInventory | None = None,
     camera=None,
     robot=None,
+    reliable_state: bool = False,
+    reliable_action: bool = False,
     stop: asyncio.Event | None = None,
     on_agent=None,
 ) -> None:
@@ -106,6 +108,8 @@ async def run_daemon(
             ice_servers=ice_servers,
             camera=camera,
             robot=robot,
+            reliable_state=reliable_state,
+            reliable_action=reliable_action,
         )
         if on_agent is not None:
             on_agent(agent)  # let a harness observe the live agent (watchdog/plan)
@@ -149,8 +153,21 @@ def main() -> None:
         default=None,
         help="open this opencv camera (index e.g. 0, or /dev/videoN) and stream it instead of synthetic frames",
     )
+    parser.add_argument(
+        "--profile",
+        choices=["teleop", "eval", "record"],
+        default="teleop",
+        help="channel reliability profile: teleop/eval => unreliable (fresh); record => reliable state",
+    )
+    parser.add_argument("--reliable-state", action="store_true", help="override: reliable state channel")
+    parser.add_argument("--reliable-action", action="store_true", help="override: reliable action channel")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
+    # record needs complete obs (reliable state); realtime loops want freshness. Explicit
+    # flags override the profile.
+    reliable_state = args.reliable_state or args.profile == "record"
+    reliable_action = args.reliable_action
 
     inventory: DeviceInventory = LocalDeviceInventory() if args.real_devices else SyntheticInventory()
     logger.info("daemon device inventory: %s", type(inventory).__name__)
@@ -173,6 +190,8 @@ def main() -> None:
                 ice_servers=args.ice_server,
                 inventory=inventory,
                 camera=camera,
+                reliable_state=reliable_state,
+                reliable_action=reliable_action,
             )
         )
     except KeyboardInterrupt:

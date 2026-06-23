@@ -82,6 +82,8 @@ def webrtc_link():
         inventory=None,
         camera=None,
         robot=None,
+        reliable_state=False,
+        reliable_action=False,
         motors=None,
         cam_name: str = "front",
         height: int = 48,
@@ -110,6 +112,8 @@ def webrtc_link():
                 inventory=inventory,
                 camera=camera,
                 robot=robot,
+                reliable_state=reliable_state,
+                reliable_action=reliable_action,
                 on_agent=lambda a: agent_box.__setitem__("agent", a),
             )
         )
