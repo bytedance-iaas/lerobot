@@ -135,6 +135,12 @@
 - K8s：媒体 Pod hostNetwork、announced/external IP、信令 relay 普通 Deployment、coturn。
 - relay 多租户路由 + 鉴权（当前单 session 单 controller）。
 
+> **决策（2026-06-23，relay 策略）**：aiortc 定位为**纯 UDP 直连**（host + 可选 STUN srflx），
+> **不自建 TURN/coturn**；直连/STUN 打不通（对称 NAT / UDP 被封 / 只能走 http_proxy）即放弃，
+> 改用 **LiveKit backend 做 relay**（SFU 自带 signaling+TURN+扩展，已端到端验证）。
+> 因此上面 M4 的 `coturn` 与 `K8s hostNetwork/announced IP` 两项**作废**（它们本就只为给
+> aiortc P2P 兜底中继）。仍保留：aiortc 的可选 STUN、relay 多租户路由+鉴权。细节见 DESIGN §11.1。
+
 ## 不在 M1 范围（不要回头做）
 - 真实串口/相机（M2）、信令服务/STUN/TURN（M3）、K8s/coturn（M4）、paradigm 落地（M5）。
 - 已否决方案：socat 串口转发、usbip USB 透传、把 record/eval 挪回本地（见 context §6）。
