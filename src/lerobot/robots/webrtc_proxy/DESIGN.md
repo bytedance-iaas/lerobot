@@ -68,7 +68,7 @@ WebRTC gives us two kinds of pipe; we use both deliberately (`protocol.py`):
 
 | Carrier | Payload | Reliability | Why |
 |---|---|---|---|
-| **media track** (RTP/UDP) | camera frames (VP8/H.264) | lossy, no retransmit | uncompressed 30 Hz ≈ 220 Mbps — must encode; loss tolerated |
+| **media track** (RTP/UDP) | camera frames (VP8/H.264) | lossy, no retransmit | raw 640×480×3@30 ≈ 220 Mbps (why we must encode, never raw on a DataChannel); the *encoded* track is ≈1–5 Mbps, adaptive |
 | DataChannel `state` | joints + capture `t`,`seq` + applied feedback | **configurable** (default unreliable) | see profiles below |
 | DataChannel `action` | goal joints + `seq` + `obs_seq` | **configurable** (default unreliable) | see profiles below |
 | DataChannel `control` | onboarding RPC (find_port, list_cameras, grab, plan) | **reliable, ordered** (always) | one-shot commands must arrive |
