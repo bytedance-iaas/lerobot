@@ -50,7 +50,7 @@ from .configuration_webrtc_proxy import WebRTCProxyRobotConfig
 from .control import ControlClient
 from .protocol import CH_ACTION, CH_CONTROL, CH_STATE, ActionMsg, StateMsg
 from .signaling import Signaling, WebSocketSignaling
-from .transport import AiortcTransport, Transport
+from .transport import Transport, make_transport
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +66,7 @@ class _ProxyEndpoint:
         buffer: AlignmentBuffer,
         cam_name: str,
         ice_servers: list[str] | None = None,
+        transport_backend: str = "aiortc",
         transport: Transport | None = None,
     ) -> None:
         self.buffer = buffer
@@ -75,7 +76,8 @@ class _ProxyEndpoint:
         self.last_applied_seq = -1
         self.last_applied_t = 0.0
         self._control = ControlClient()
-        self._transport = transport or AiortcTransport(
+        self._transport = transport or make_transport(
+            transport_backend,
             role="subscriber",
             channels={CH_STATE: False, CH_ACTION: False, CH_CONTROL: True},  # reliability set by publisher
             ice_servers=ice_servers,
@@ -209,7 +211,12 @@ class WebRTCProxyRobot(Robot):
         # asyncio.Queue must be constructed *on the loop thread* so it binds to the
         # right running loop. Building them in the caller thread silently deadlocks.
         async def _bringup() -> None:
-            self._endpoint = _ProxyEndpoint(self._buffer, self.cam_name, ice_servers=self.config.ice_servers)
+            self._endpoint = _ProxyEndpoint(
+                self._buffer,
+                self.cam_name,
+                ice_servers=self.config.ice_servers,
+                transport_backend=self.config.transport_backend,
+            )
             # Pure controller: reach the remote Mac daemon over the signaling relay.
             self._ws_sig = WebSocketSignaling(
                 self.config.signaling_url,

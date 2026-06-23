@@ -36,7 +36,7 @@ import numpy as np
 from .control import ControlServer, DeviceInventory, SyntheticInventory
 from .protocol import CH_ACTION, CH_CONTROL, CH_STATE, ActionMsg, StateMsg
 from .signaling import Signaling
-from .transport import AiortcTransport, Transport
+from .transport import Transport, make_transport
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +80,8 @@ class CaptureAgent:
         robot=None,  # a connected lerobot Robot (so_follower) — drives joints+action+torque (M2)
         reliable_state: bool = False,  # True for record (no lost obs); False for teleop/eval (fresh)
         reliable_action: bool = False,
-        transport: Transport | None = None,  # default: AiortcTransport (WebRTC P2P)
+        transport_backend: str = "aiortc",  # "aiortc" (default) | "livekit"
+        transport: Transport | None = None,  # explicit transport overrides the backend
     ) -> None:
         self.signaling = signaling
         self.motors = list(motors)
@@ -93,7 +94,8 @@ class CaptureAgent:
 
         # The transport offers + sends video, exposes the data channels. The publisher
         # (Mac) sets channel reliability; control is always reliable.
-        self._transport = transport or AiortcTransport(
+        self._transport = transport or make_transport(
+            transport_backend,
             role="publisher",
             channels={CH_STATE: reliable_state, CH_ACTION: reliable_action, CH_CONTROL: True},
             ice_servers=ice_servers,

@@ -43,6 +43,31 @@ from .signaling import Signaling
 logger = logging.getLogger(__name__)
 
 
+def make_transport(
+    backend: str,
+    *,
+    role: str,
+    channels: dict[str, bool],
+    ice_servers: list[str] | None = None,
+) -> "Transport":
+    """Build a transport for ``backend`` ("aiortc" | "livekit").
+
+    Both ends of a session MUST use the same backend (an aiortc P2P peer and a LiveKit
+    room don't interoperate). "aiortc" is the default, self-contained backend; "livekit"
+    is a documented extension point (implement ``LiveKitTransport(Transport)`` and wire
+    it here) for cross-public-net / SFU scale.
+    """
+    if backend == "aiortc":
+        return AiortcTransport(role=role, channels=channels, ice_servers=ice_servers)
+    if backend == "livekit":
+        raise NotImplementedError(
+            "transport_backend='livekit' is not implemented yet — implement "
+            "LiveKitTransport(Transport) (join room, publish/subscribe track, data msgs) "
+            "and wire it into make_transport(). See DESIGN.md §11."
+        )
+    raise ValueError(f"unknown transport backend {backend!r} (expected 'aiortc' or 'livekit')")
+
+
 class Channel(ABC):
     """A named message pipe. ``send`` is best-effort (drops if not open)."""
 
