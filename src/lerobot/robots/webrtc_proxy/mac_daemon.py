@@ -84,6 +84,7 @@ async def run_daemon(
     robot=None,
     reliable_state: bool = False,
     reliable_action: bool = False,
+    signaling_token: str | None = None,
     stop: asyncio.Event | None = None,
     on_agent=None,
 ) -> None:
@@ -95,7 +96,7 @@ async def run_daemon(
     motors = list(motors or SO100_MOTORS)
     stop = stop or asyncio.Event()
     while not stop.is_set():
-        sig = WebSocketSignaling(signaling_url, session_id, role="robot")
+        sig = WebSocketSignaling(signaling_url, session_id, role="robot", token=signaling_token)
         agent = CaptureAgent(
             signaling=sig,
             motors=motors,
@@ -161,6 +162,7 @@ def main() -> None:
     )
     parser.add_argument("--reliable-state", action="store_true", help="override: reliable state channel")
     parser.add_argument("--reliable-action", action="store_true", help="override: reliable action channel")
+    parser.add_argument("--auth-token", default=None, help="shared token for the signaling relay")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
@@ -192,6 +194,7 @@ def main() -> None:
                 camera=camera,
                 reliable_state=reliable_state,
                 reliable_action=reliable_action,
+                signaling_token=args.auth_token,
             )
         )
     except KeyboardInterrupt:
