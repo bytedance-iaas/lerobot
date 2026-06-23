@@ -2,9 +2,11 @@
 
 Drive a real SO-100 that's plugged into a **Mac**, from a **cloud** process, over
 WebRTC. The cloud runs the control logic; the arm + camera stay on the user's
-machine. The cloud `WebRTCProxyRobot` is a drop-in lerobot `Robot`, so the existing
-[`web_so100`](../../src/lerobot/teleoperators/web_so100/) jog panel teleoperates the
-remote arm unchanged.
+machine. The cloud `WebRTCProxyRobot` is a drop-in lerobot `Robot` — `get_observation()`
+returns the remote arm's joints + camera and `send_action()` moves the remote motors,
+so any standard `send_action`/`get_observation` control loop drives it. This example
+keeps it self-contained: a tiny inline keyboard jog (no extra teleoperator dependency)
+that proves the link end-to-end.
 
 Implementation: [`src/lerobot/robots/webrtc_proxy`](../../src/lerobot/robots/webrtc_proxy/).
 
@@ -12,7 +14,7 @@ Implementation: [`src/lerobot/robots/webrtc_proxy`](../../src/lerobot/robots/web
  Mac (arm + camera)                    Cloud
  mac_daemon_so100.py                   signaling relay  +  cloud_teleop_so100.py
    SO100Follower ──┐                        │                 WebRTCProxyRobot
-   (bus + camera)  ├── WebRTC ──────────────┴──────────────── + web_so100 jog panel
+   (bus + camera)  ├── WebRTC ──────────────┴──────────────── + keyboard jog loop
    watchdog (P0) ──┘   media track (camera) + DataChannels (joints/action/control)
 ```
 
@@ -37,10 +39,18 @@ uv run python -m lerobot.robots.webrtc_proxy.signaling_server --port 8765
 # (Mac) serve the real arm; safes the arm if the cloud drops
 uv run python examples/webrtc_remote_so100/mac_daemon_so100.py
 
-# (cloud) teleoperate it through the web jog panel
+# (cloud) drive it — web UI with a LIVE camera view (default)
 uv run python examples/webrtc_remote_so100/cloud_teleop_so100.py
-# -> open http://localhost:8080 and jog the REMOTE SO-100
+# -> open http://localhost:8088  (live remote camera + per-joint jog buttons)
+
+# ...or a terminal keyboard jog instead:
+uv run python examples/webrtc_remote_so100/cloud_teleop_so100.py --mode console
+# -> type (then Enter):  1..6 select joint   +/- jog selected   q quit
 ```
+
+The web panel (`panel.html`, served by the stdlib HTTP server) shows the remote
+camera as a live MJPEG stream — pressing a jog button and watching the remote view
+move is the end-to-end proof the WebRTC link works.
 
 Same machine for a quick test (`ws://127.0.0.1:8765/ws`, `ICE_SERVERS=[]`). Real
 cloud↔Mac across the public internet: point `SIGNALING_URL` at the relay's public
@@ -48,10 +58,10 @@ address and add STUN/TURN urls to `ICE_SERVERS` (coturn) for NAT traversal.
 
 ## What this demonstrates
 
-- **Drop-in Robot.** `cloud_teleop_so100.py` uses `WebRTCProxyRobot` with the stock
-  `web_so100` teleop and the standard `send_action` / `get_observation` loop — no
-  WebRTC-specific control code. Swap the teleop for `lerobot-record` to record a
-  remote dataset, or a policy to run inference in the cloud.
+- **Drop-in Robot.** `cloud_teleop_so100.py` is a plain `send_action` /
+  `get_observation` loop over `WebRTCProxyRobot` — no WebRTC-specific control code, and
+  no special teleoperator. Swap the inline jog for `lerobot-record` to record a remote
+  dataset, or a policy to run inference in the cloud.
 - **IDs stay Mac-local.** The cloud config declares only the logical schema (6 motors
   + camera `front` at a resolution); the serial port and camera index live on the Mac.
 - **P0 safety.** If the action stream stalls (network drop, cloud crash), the Mac-side
