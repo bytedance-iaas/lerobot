@@ -14,15 +14,13 @@
 
 """Mac-side capture agent (the *offerer*).
 
-In M1 this produces a *synthetic* robot: it does not touch a serial bus or camera.
-It runs the capture clock, pushes proprioceptive state + per-frame metadata over
-DataChannels, streams a synthetic camera over the media track, receives actions,
-and runs the P0 safety watchdog. Swapping the synthetic source for a real
-``so_follower`` + cameras is M2 and only touches ``_capture_sample`` /
-``_apply_action`` / ``_safe_stop``.
+Without a real ``robot`` it produces a *synthetic* source (no serial bus / camera).
+It runs the capture clock, pushes proprioceptive state over the state DataChannel,
+streams the camera over the media track (each frame's capture seq carried in its
+pts), receives actions, answers control-plane RPCs, and runs the P0 safety watchdog.
 
-The agent owns the WebRTC offer: it creates the three DataChannels and adds the
-video track, then hands its SDP to the signaling channel.
+The agent owns the WebRTC offer: it creates the state/action/control DataChannels and
+adds the video track, then hands its SDP to the signaling channel.
 """
 
 from __future__ import annotations
@@ -80,8 +78,8 @@ def _fit_frame(img: np.ndarray, height: int, width: int) -> np.ndarray:
 class _SyntheticCameraTrack(MediaStreamTrack):
     """Outbound video track fed by the capture loop via an asyncio queue.
 
-    Pixels only — the capture timestamp travels on the ``framemeta`` channel, so we
-    just need a sane monotonically-increasing pts here.
+    The capture seq is encoded into each frame's pts (``pts = seq * VIDEO_PTS_PER_SEQ``)
+    so the cloud can pair the frame to the state with the same seq.
     """
 
     kind = "video"
