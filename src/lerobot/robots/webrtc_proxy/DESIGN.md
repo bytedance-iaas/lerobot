@@ -198,47 +198,59 @@ What runs in K8s is **whatever consumes `WebRTCProxyRobot`** — a record job, a
 inference server, or a teleop-session backend pod. Each session = one controller pod ↔
 one Mac daemon.
 
-The **media path is the constraint**, not the CPU:
+**Decision (relay strategy).** The two backends have a clean, non-overlapping division
+of labour and we do **not** build a TURN relay for aiortc:
 
-- **UDP, large dynamic port range.** Put the media-terminating pod on
-  `hostNetwork: true` (or a node with a routable IP) so RTP/UDP isn't mangled by
-  Service/NAT port mapping.
-- **ICE must advertise the node's public/external IP**, not the pod's cluster IP. The
-  classic failure: signaling connects, SDP exchanges, but **media never flows** — almost
-  always a mis-set announced/external IP.
-- **STUN** (cheap, self-host) for hole-punching; **TURN (coturn)** as the fallback when
-  P2P fails — **mandatory in production**, it relays media and eats bandwidth. Deploy
-  coturn on `hostNetwork`/dedicated nodes with a public IP and an open relay port range;
-  inject its URLs into `ice_servers` on both peers (`RTCConfiguration`).
-- **Media framework choice.** `aiortc` (current default) gives decoded `ndarray` frames
-  straight into the LeRobot pipeline — perfect for the adapter, but single-connection /
-  weak at scale and lacking announced-IP / fixed-port for cloud NAT. For many concurrent
-  users or container deployment, move the media plane to **LiveKit / mediasoup** (SFU).
+- **aiortc = direct UDP P2P only.** Host candidates, plus *optional* STUN (`ice_servers`)
+  to get a server-reflexive candidate through ordinary cone NATs (STUN is stateless and
+  can use a free public server, so it costs nothing). If a direct/STUN path can't be
+  formed (symmetric NAT, UDP blocked, HTTP-proxy-only egress), aiortc **gives up** — we
+  deliberately do *not* self-host coturn to relay it.
+- **Need a relay → switch to the LiveKit backend.** LiveKit's SFU already bundles
+  signaling + TURN + scale and is tested; duplicating that with coturn+aiortc is wasted
+  effort and the heaviest, most error-prone ops (public IP, port ranges, credential
+  rotation, bandwidth). So "relay" is a *backend choice*, not extra aiortc infra.
+
+This deletes the original M4 coturn / `hostNetwork` / announced-IP burden: those existed
+only to make aiortc P2P relay across hard NATs. With relay delegated to LiveKit, the
+aiortc deployment stays simple (host + optional STUN), and hard-network cases use
+`transport_backend="livekit"`.
+
+The **media path is still the constraint** for whichever backend you pick:
+
+- **aiortc:** UDP P2P. A controller pod that must terminate aiortc media needs a routable
+  path (e.g. `hostNetwork`/node IP) and correctly **announced external IP** — the classic
+  failure is "signaling connects, SDP exchanges, but media never flows" from a wrong
+  announced IP. This is exactly the complexity that pushes anything non-trivial to LiveKit.
+- **LiveKit:** both peers dial *outward* to the SFU; no inbound path / announced IP / port
+  range to manage on our side. `aiortc` (default) gives decoded `ndarray` frames straight
+  into the LeRobot pipeline — great for the adapter, but single-connection / weak at scale.
   The transport is pluggable (`transport.py` `Transport` interface; pick via
   `transport_backend`): `AiortcTransport` is the default; `transport_livekit.py` is a
-  working (experimental, optional) `LiveKitTransport`. LiveKit is the chosen SFU because
-  it handles signaling + TURN + scale AND has a Python SDK to pull frames into LeRobot.
-  It is **verified end-to-end** against both a local `livekit-server --dev` and LiveKit
-  Cloud (obs + action + control round-trip with fresh aligned observations); see the
-  opt-in `tests/robots/test_webrtc_proxy_livekit.py`.
+  working (experimental, optional) `LiveKitTransport`, the chosen SFU because it handles
+  signaling + TURN + scale AND has a Python SDK to pull frames into LeRobot. It is
+  **verified end-to-end** against both a local `livekit-server --dev` and LiveKit Cloud
+  (obs + action + control round-trip with fresh aligned observations); see the opt-in
+  `tests/robots/test_webrtc_proxy_livekit.py`.
 
 ### 11.1.1 NAT / restrictive-egress reachability `[why SFU, not P2P]`
 
 The two ends often sit in asymmetric network conditions; this drives the backend choice:
 
-- **aiortc P2P** needs both peers to obtain a usable ICE candidate (host/srflx/relay).
-  It has **no support for routing media through an HTTP forward proxy**. So if one side
-  can only egress via a corporate `HTTP(S)_PROXY` (no direct UDP/TCP out), aiortc P2P
-  effectively cannot connect, regardless of TURN.
-- **LiveKit (SFU)** has **both** peers *dial outward* to a public SFU — neither needs an
-  inbound path. This cleanly solves the **NAT side** (outbound + SFU-side TURN). For a
-  **proxy-only side**, the split is:
+- **aiortc P2P = direct UDP only.** Host candidates + optional STUN (srflx); it forms a
+  path only when one is directly reachable. It has **no TURN relay we operate** and **no
+  support for routing media through an HTTP forward proxy**. So symmetric NAT, UDP-blocked,
+  or `HTTP(S)_PROXY`-only egress → aiortc simply can't connect. That is by design: the
+  answer is not "add coturn", it is "use the LiveKit backend".
+- **LiveKit (SFU) = the relay.** **Both** peers *dial outward* to the SFU — neither needs
+  an inbound path — so it covers the **NAT side** cleanly (outbound + SFU-side TURN). For a
+  **proxy-only side**:
   - *signaling* (wss:443) traverses the HTTP proxy fine (it is just HTTPS/CONNECT);
   - *media* still needs the WebRTC client to tunnel ICE/TURN (TURN/TLS:443) through that
     proxy, which libwebrtc supports only partially and the Python SDK does not expose.
-    Typical failure shape there: **room connects, no track/data flows** — verify on the
-    real proxied host, and if media won't traverse, run a coturn the proxy can `CONNECT`
-    to, or place the controller where it has direct egress (the usual cloud deployment).
+    Typical failure shape: **room connects, no track/data flows** — verify on the real
+    proxied host; if media won't traverse, place the controller where it has direct egress
+    (the usual cloud deployment, which is the normal topology anyway).
 
 Scaling note: one controller pod per active session (stateful, holds a PeerConnection +
 the bg loop). Autoscale on session count; sessions are sticky to their pod for their
