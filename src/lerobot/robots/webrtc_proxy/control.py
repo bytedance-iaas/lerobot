@@ -223,9 +223,9 @@ class ControlServer:
         self._channel = None
         self._ports_before: list[str] | None = None
 
-    def attach(self, channel) -> None:  # noqa: ANN001 (aiortc RTCDataChannel)
+    def attach(self, channel) -> None:  # noqa: ANN001 (transport Channel)
         self._channel = channel
-        channel.on("message", self._on_message)
+        channel.on_message(self._on_message)
 
     def _on_message(self, raw: str) -> None:
         try:
@@ -238,7 +238,7 @@ class ControlServer:
             resp = RpcResponse(id=req.id, ok=True, result=result)
         except Exception as e:  # report failures back to the cloud, don't crash the loop
             resp = RpcResponse(id=req.id, ok=False, error=f"{type(e).__name__}: {e}")
-        if self._channel is not None and self._channel.readyState == "open":
+        if self._channel is not None and self._channel.is_open:
             self._channel.send(resp.to_json())
 
     def _dispatch(self, req: RpcRequest) -> Any:
@@ -279,9 +279,9 @@ class ControlClient:
         self._next_id = 0
         self._pending: dict[int, asyncio.Future] = {}
 
-    def attach(self, channel) -> None:  # noqa: ANN001
+    def attach(self, channel) -> None:  # noqa: ANN001 (transport Channel)
         self._channel = channel
-        channel.on("message", self._on_message)
+        channel.on_message(self._on_message)
 
     def _on_message(self, raw: str) -> None:
         try:
@@ -298,7 +298,7 @@ class ControlClient:
             fut.set_exception(RuntimeError(resp.error or "control RPC failed"))
 
     async def call(self, method: str, params: dict[str, Any] | None = None, timeout: float = 10.0) -> Any:
-        if self._channel is None or self._channel.readyState != "open":
+        if self._channel is None or not self._channel.is_open:
             raise RuntimeError("control channel not open")
         self._next_id += 1
         req = RpcRequest(id=self._next_id, method=method, params=params or {})

@@ -27,19 +27,24 @@ def test_channel_kwargs_helper():
     assert channel_kwargs(False) == UNRELIABLE_KWARGS == {"ordered": False, "maxRetransmits": 0}
 
 
+def _ch(agent, label):
+    # the underlying aiortc RTCDataChannel behind the transport's Channel handle
+    return agent._transport._channels[label]._ch
+
+
 def test_default_realtime_unreliable_state_action(webrtc_link):
     # teleop/eval default: fresh, drop-on-loss.
     with webrtc_link() as link:
         a = link.agent
-        assert a._ch_state.ordered is False and a._ch_state.maxRetransmits == 0
-        assert a._ch_action.ordered is False and a._ch_action.maxRetransmits == 0
-        assert a._ch_control.ordered is True  # control always reliable+ordered
+        assert _ch(a, "state").ordered is False and _ch(a, "state").maxRetransmits == 0
+        assert _ch(a, "action").ordered is False and _ch(a, "action").maxRetransmits == 0
+        assert _ch(a, "control").ordered is True  # control always reliable+ordered
 
 
 def test_record_profile_reliable_state_and_action(webrtc_link):
     # record: both state and action reliable so no obs/action is lost from a transition.
     with webrtc_link(reliable_state=True, reliable_action=True) as link:
         a = link.agent
-        assert a._ch_state.ordered is True
-        assert a._ch_action.ordered is True
-        assert a._ch_control.ordered is True
+        assert _ch(a, "state").ordered is True
+        assert _ch(a, "action").ordered is True
+        assert _ch(a, "control").ordered is True

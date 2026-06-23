@@ -43,8 +43,12 @@ run the relay + daemon + controller as separate loops in one process — see
 - **`alignment.py`** — `AlignmentBuffer`: thread-safe pairing of state↔frame by capture
   **seq** (难点 A; joints+frame share a seq, the frame's seq rides its pts). A dropped
   frame/state just skips that seq — no cascade. See `DESIGN.md` §5.1.
+- **`transport.py`** — pluggable transport: the `Transport` interface (named data
+  channels + a seq-tagged video stream) + `AiortcTransport` (default WebRTC P2P). The
+  proxy logic is transport-agnostic, so a different backend (e.g. a LiveKit SFU for
+  cross-public-net / scale) can implement `Transport` without touching the rest.
 - **`capture_agent.py`** — Mac endpoint. Owns the capture clock, pushes state + video
-  (seq in pts), applies actions, runs the **watchdog** (难点 C).
+  (seq in pts) via the transport, applies actions, runs the **watchdog** (难点 C).
 - **`proxy_robot.py`** — `WebRTCProxyRobot` (sync `Robot` API) + `_ProxyEndpoint`
   (async answerer) + `_EventLoopThread` (sync↔async bridge).
 - **`signaling.py`** — `Signaling` protocol + `WebSocketSignaling` client (real
