@@ -133,6 +133,11 @@ webrtc = [
     "aiohttp>=3.9.0,<4.0.0",  # WebSocket signaling client + relay server
     "lerobot[av-dep]",
 ]
+# Optional alternative transport backend (SFU; cross-public-net / scale). EXPERIMENTAL.
+webrtc-livekit = [
+    "lerobot[webrtc]",
+    "livekit>=0.18.0,<2.0.0",
+]
 # ── User-facing composite extras (map to CLI scripts) ─────
 # lerobot-record, lerobot-replay, lerobot-calibrate, lerobot-teleoperate, etc.
 core_scripts = ["lerobot[dataset]", "lerobot[hardware]", "lerobot[viz]"]

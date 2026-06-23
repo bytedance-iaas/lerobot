@@ -86,6 +86,8 @@ async def run_daemon(
     reliable_action: bool = False,
     signaling_token: str | None = None,
     transport_backend: str = "aiortc",
+    livekit_url: str | None = None,
+    livekit_token: str | None = None,
     stop: asyncio.Event | None = None,
     on_agent=None,
 ) -> None:
@@ -113,6 +115,8 @@ async def run_daemon(
             reliable_state=reliable_state,
             reliable_action=reliable_action,
             transport_backend=transport_backend,
+            livekit_url=livekit_url,
+            livekit_token=livekit_token,
         )
         if on_agent is not None:
             on_agent(agent)  # let a harness observe the live agent (watchdog/plan)
@@ -166,6 +170,8 @@ def main() -> None:
     parser.add_argument("--reliable-action", action="store_true", help="override: reliable action channel")
     parser.add_argument("--auth-token", default=None, help="shared token for the signaling relay")
     parser.add_argument("--transport", choices=["aiortc", "livekit"], default="aiortc", help="transport backend")
+    parser.add_argument("--livekit-url", default=None, help="LiveKit server URL (when --transport livekit)")
+    parser.add_argument("--livekit-token", default=None, help="LiveKit JWT (when --transport livekit)")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
@@ -199,6 +205,8 @@ def main() -> None:
                 reliable_action=reliable_action,
                 signaling_token=args.auth_token,
                 transport_backend=args.transport,
+                livekit_url=args.livekit_url,
+                livekit_token=args.livekit_token,
             )
         )
     except KeyboardInterrupt:
