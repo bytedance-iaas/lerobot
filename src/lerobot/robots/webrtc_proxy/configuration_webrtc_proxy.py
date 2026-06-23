@@ -81,3 +81,6 @@ class WebRTCProxyRobotConfig(RobotConfig):
     # ICE servers for the controller's peer connection. Empty => host candidates only
     # (loopback / same-host two-process). M4 injects STUN/TURN for real public-net peers.
     ice_servers: list[str] = field(default_factory=list)
+    # Transport backend: "aiortc" (default, self-contained P2P) | "livekit" (SFU; both
+    # the controller and the Mac daemon must use the same backend).
+    transport_backend: str = "aiortc"
