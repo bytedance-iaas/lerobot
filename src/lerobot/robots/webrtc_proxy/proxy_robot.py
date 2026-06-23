@@ -70,6 +70,9 @@ class _ProxyEndpoint:
         self._framemeta: deque[FrameMetaMsg] = deque(maxlen=256)
         self.connected = asyncio.Event()
         self._action_seq = 0
+        # Closed-loop feedback reported by the Mac on the state stream (telemetry).
+        self.last_applied_seq = -1
+        self.last_applied_t = 0.0
         self._control = ControlClient()
         self._register()
 
@@ -102,6 +105,9 @@ class _ProxyEndpoint:
             logger.exception("proxy: bad state message")
             return
         self.buffer.add_state(msg.t, msg.joints, msg.seq)
+        if msg.applied_seq > self.last_applied_seq:
+            self.last_applied_seq = msg.applied_seq
+            self.last_applied_t = msg.applied_t
 
     def _on_framemeta(self, raw: str) -> None:
         try:
@@ -132,11 +138,13 @@ class _ProxyEndpoint:
         await self.pc.setLocalDescription(await self.pc.createAnswer())
         await signaling.send(self.pc.localDescription)
 
-    async def send_action(self, goal: dict[str, float]) -> dict[str, float]:
+    async def send_action(self, goal: dict[str, float], obs_seq: int = -1) -> dict[str, float]:
         if self._ch_action is None or self._ch_action.readyState != "open":
             raise RuntimeError("action channel not open")
         self._action_seq += 1
-        self._ch_action.send(ActionMsg(t=time.monotonic(), seq=self._action_seq, goal=goal).to_json())
+        self._ch_action.send(
+            ActionMsg(t=time.monotonic(), seq=self._action_seq, goal=goal, obs_seq=obs_seq).to_json()
+        )
         return goal
 
     async def control_call(self, method: str, params: dict | None = None, timeout: float = 10.0):
@@ -190,6 +198,7 @@ class WebRTCProxyRobot(Robot):
         self._endpoint: _ProxyEndpoint | None = None
         self._ws_sig: WebSocketSignaling | None = None
         self._last_frame: np.ndarray | None = None
+        self._last_obs_seq = -1  # seq of the most recent obs returned (action provenance)
         self._connected = False
 
     # ----- schema (callable whether connected or not) ----------------------
@@ -273,6 +282,7 @@ class WebRTCProxyRobot(Robot):
         aligned = self._buffer.assemble()
         if aligned is None:
             raise RuntimeError("no observation available yet")
+        self._last_obs_seq = aligned.seq_state  # actions sent next are derived from this obs
         frame = aligned.frame if aligned.frame is not None else self._last_frame
         if frame is not None:
             self._last_frame = frame
@@ -290,7 +300,7 @@ class WebRTCProxyRobot(Robot):
         if not self._connected or self._endpoint is None or self._loop is None:
             raise RuntimeError("WebRTCProxyRobot not connected")
         goal = {k: float(v) for k, v in action.items() if k.endswith(".pos")}
-        return self._loop.run(self._endpoint.send_action(goal), timeout=2.0)
+        return self._loop.run(self._endpoint.send_action(goal, self._last_obs_seq), timeout=2.0)
 
     # ----- control plane: cloud-driven device onboarding (M3) ---------------
     # These reach the *Mac's* OS over the control channel; port/camera IDs never

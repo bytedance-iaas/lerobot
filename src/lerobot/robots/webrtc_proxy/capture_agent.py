@@ -155,6 +155,7 @@ class CaptureAgent:
         )
         self._seq = 0
         self._action_seq = 0  # last action seq applied (for telemetry)
+        self._last_obs_seq_seen = -1  # provenance of the last action (which obs it came from)
         self._last_goal: dict[str, float] = {f"{m}.pos": 0.0 for m in self.motors}
         self._last_action_t = time.monotonic()
         self._safed = False
@@ -312,7 +313,17 @@ class CaptureAgent:
                 joints, img = self._capture_sample(t, seq)
 
             if self._ch_state is not None and self._ch_state.readyState == "open":
-                self._ch_state.send(StateMsg(t=t, seq=seq, joints=joints).to_json())
+                # Piggyback the last applied action (seq + time) so the cloud can
+                # confirm landing and measure round-trip without an extra channel.
+                self._ch_state.send(
+                    StateMsg(
+                        t=t,
+                        seq=seq,
+                        joints=joints,
+                        applied_seq=self._action_seq,
+                        applied_t=self._last_action_t,
+                    ).to_json()
+                )
             if self._ch_framemeta is not None and self._ch_framemeta.readyState == "open":
                 self._ch_framemeta.send(FrameMetaMsg(t=t, seq=seq).to_json())
             # Drop the oldest pending frame rather than block the capture clock.
@@ -331,6 +342,7 @@ class CaptureAgent:
             return
         self._last_action_t = time.monotonic()  # sync: keeps the watchdog honest
         self._action_seq = msg.seq
+        self._last_obs_seq_seen = msg.obs_seq
         resumed = self._safed
         if self._safed:
             logger.info("WATCHDOG: action resumed (seq=%d) -> clearing safe state", msg.seq)
