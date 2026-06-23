@@ -66,7 +66,7 @@ class CaptureAgent:
 
     def __init__(
         self,
-        signaling: Signaling,
+        signaling: Signaling | None,  # None for livekit (it does its own signaling)
         motors: list[str],
         cam_name: str,
         cam_height: int,
@@ -163,7 +163,8 @@ class CaptureAgent:
         for t in self._tasks:
             t.cancel()
         await self._transport.close()
-        await self.signaling.close()
+        if self.signaling is not None:
+            await self.signaling.close()
         if self._io is not None:
             # Let a pending safe-stop (disable_torque) finish, then stop the io thread.
             self._io.shutdown(wait=True)
