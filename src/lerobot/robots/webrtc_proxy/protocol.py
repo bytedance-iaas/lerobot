@@ -18,10 +18,13 @@ Two real-time DataChannels + one control DataChannel + one video media track:
 
     label        dir          reliability                payload
     -----------  -----------  -------------------------  ---------------------------
-    state        Mac -> cloud unreliable (rt)            StateMsg: joints + capture ts + seq
-    action       cloud -> Mac unreliable (rt)            ActionMsg: goal joints + seq + obs_seq
-    control      both         ordered/reliable           onboarding RPC (device discovery, plan)
+    state        Mac -> cloud configurable (rt default)  StateMsg: joints + capture ts + seq
+    action       cloud -> Mac configurable (rt default)  ActionMsg: goal joints + seq + obs_seq
+    control      both         reliable + ordered         onboarding RPC (device discovery, plan)
     <video>      Mac -> cloud media track (H.264/VP8)    one camera; seq carried in pts
+
+state/action reliability is per-use-case (teleop/eval: unreliable & fresh; record:
+reliable state). control is always reliable+ordered.
 
 The frame's capture **seq** rides its ``pts`` (``pts = seq * VIDEO_PTS_PER_SEQ``); the
 cloud recovers ``seq = round(pts / VIDEO_PTS_PER_SEQ)`` and pairs each frame to the
@@ -56,10 +59,19 @@ CH_CONTROL = "control"
 VIDEO_CLOCK_RATE = 90_000
 VIDEO_PTS_PER_SEQ = 3_000  # 1/30 s per seq at 90 kHz; round(pts/this) recovers seq
 
-# Unreliable, real-time DataChannel options for state/action (drop, don't retransmit).
-RT_CHANNEL_KWARGS: dict[str, Any] = {"ordered": False, "maxRetransmits": 0}
-# Control commands must arrive in order and not be dropped.
-ORDERED_CHANNEL_KWARGS: dict[str, Any] = {"ordered": True}
+# DataChannel reliability. The `control` channel is ALWAYS reliable+ordered. The
+# realtime `state`/`action` channels are CONFIGURABLE per use case (see DESIGN.md §4):
+#   - teleop / eval (closed loop): UNRELIABLE — freshest sample wins, drops self-correct,
+#     no head-of-line blocking.
+#   - record (dataset): RELIABLE state so no obs is lost; action per fidelity vs latency.
+# A lost packet on a reliable channel head-of-line-blocks until retransmitted (trades
+# freshness for completeness). Total disconnect is covered by the Mac watchdog either way.
+RELIABLE_KWARGS: dict[str, Any] = {"ordered": True}  # reliable + ordered (SCTP default)
+UNRELIABLE_KWARGS: dict[str, Any] = {"ordered": False, "maxRetransmits": 0}  # drop, no retransmit
+
+
+def channel_kwargs(reliable: bool) -> dict[str, Any]:
+    return RELIABLE_KWARGS if reliable else UNRELIABLE_KWARGS
 
 
 @dataclass(frozen=True)
