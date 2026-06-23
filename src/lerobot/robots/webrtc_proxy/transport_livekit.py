@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import deque
 from collections.abc import Callable
 
 import numpy as np
@@ -48,6 +49,12 @@ import numpy as np
 from .transport import Channel, Transport
 
 logger = logging.getLogger(__name__)
+
+# LiveKit re-stamps frame timestamps and FrameMetadata is a fixed proto, so the capture
+# seq can't ride the frame. We send one tiny reliable data message per frame on this
+# internal topic and pop it FIFO 1:1 with received frames (same model as the old aiortc
+# framemeta; valid while frames aren't dropped — fine on a low-loss SFU link).
+_SEQ_TOPIC = "_seq"
 
 
 class _LiveKitChannel(Channel):
@@ -109,6 +116,7 @@ class LiveKitTransport(Transport):
         self._channels = {label: _LiveKitChannel(self, label, reliable) for label, reliable in channels.items()}
         self._frame_cb: Callable[[int, np.ndarray], None] | None = None
         self._video_source = None  # created lazily on first send_frame (needs frame dims)
+        self._seq_queue: deque[int] = deque(maxlen=256)  # subscriber: seq per pending frame
         self._register()
 
     def _register(self) -> None:
@@ -125,8 +133,14 @@ class LiveKitTransport(Transport):
             self.closed.set()
 
         @self.room.on("data_received")
-        def _on_data(packet) -> None:  # rtc.DataPacket  # VERIFY: field names below
-            ch = self._channels.get(getattr(packet, "topic", ""))
+        def _on_data(packet) -> None:  # rtc.DataPacket(data, kind, participant, topic)
+            if packet.topic == _SEQ_TOPIC:
+                try:
+                    self._seq_queue.append(int(packet.data.decode("utf-8")))
+                except Exception:
+                    logger.exception("livekit: bad seq message")
+                return
+            ch = self._channels.get(packet.topic)
             if ch is not None:
                 ch._dispatch(packet.data)
 
@@ -141,13 +155,13 @@ class LiveKitTransport(Transport):
         rtc = self._rtc
         stream = rtc.VideoStream(track)
         async for event in stream:  # event.frame: rtc.VideoFrame
-            frame = event.frame
-            # VERIFY: recover the capture seq stamped at publish time.
-            seq = int(round(getattr(event, "timestamp_us", 0) / 1000.0))
-            rgba = frame.convert(rtc.VideoBufferType.RGBA)
-            arr = np.frombuffer(rgba.data, dtype=np.uint8).reshape(frame.height, frame.width, 4)
+            if not self._seq_queue:
+                continue  # frame arrived before its seq message (startup); drop
+            seq = self._seq_queue.popleft()  # FIFO 1:1 with frames
+            frame = event.frame.convert(rtc.VideoBufferType.RGB24)
+            img = np.frombuffer(frame.data, dtype=np.uint8).reshape(frame.height, frame.width, 3)
             if self._frame_cb is not None:
-                self._frame_cb(seq, np.ascontiguousarray(arr[:, :, :3]))
+                self._frame_cb(seq, np.ascontiguousarray(img))
 
     async def open(self, signaling=None) -> None:  # noqa: ANN001 - signaling unused for LiveKit
         await self.room.connect(self._url, self._token)
@@ -167,10 +181,12 @@ class LiveKitTransport(Transport):
             track = rtc.LocalVideoTrack.create_video_track("camera", self._video_source)
             options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_CAMERA)
             asyncio.ensure_future(self.room.local_participant.publish_track(track, options))
-        rgba = np.dstack([img, np.full((h, w, 1), 255, np.uint8)])  # RGB -> RGBA
-        # VERIFY: stamp the seq so the far side can pair frame<->state by seq.
-        frame = rtc.VideoFrame(w, h, rtc.VideoBufferType.RGBA, rgba.tobytes())
-        self._video_source.capture_frame(frame, timestamp_us=seq * 1000)  # VERIFY: kwarg name
+        # Send this frame's seq (reliable, ordered) so the subscriber can pair it FIFO 1:1.
+        asyncio.ensure_future(
+            self.room.local_participant.publish_data(str(seq).encode(), reliable=True, topic=_SEQ_TOPIC)
+        )
+        frame = rtc.VideoFrame(w, h, rtc.VideoBufferType.RGB24, np.ascontiguousarray(img).tobytes())
+        self._video_source.capture_frame(frame)
 
     def set_frame_handler(self, callback: Callable[[int, np.ndarray], None]) -> None:
         self._frame_cb = callback

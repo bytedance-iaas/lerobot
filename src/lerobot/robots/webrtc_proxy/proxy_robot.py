@@ -203,9 +203,12 @@ class WebRTCProxyRobot(Robot):
     def connect(self, calibrate: bool = True) -> None:
         if self._connected:
             raise RuntimeError("WebRTCProxyRobot already connected")
-        if not self.config.signaling_url or not self.config.signaling_url.startswith("ws"):
+        # aiortc reaches the daemon over our WS signaling relay; livekit signals itself.
+        if self.config.transport_backend == "aiortc" and (
+            not self.config.signaling_url or not self.config.signaling_url.startswith("ws")
+        ):
             raise ValueError(
-                "WebRTCProxyRobot needs a WebSocket signaling_url (ws://host:port/ws) to reach a Mac daemon"
+                "WebRTCProxyRobot (aiortc) needs a WebSocket signaling_url (ws://host:port/ws)"
             )
 
         self._loop = _EventLoopThread()
@@ -223,13 +226,15 @@ class WebRTCProxyRobot(Robot):
                 livekit_url=self.config.livekit_url,
                 livekit_token=self.config.livekit_token,
             )
-            # Pure controller: reach the remote Mac daemon over the signaling relay.
-            self._ws_sig = WebSocketSignaling(
-                self.config.signaling_url,
-                self.config.session_id,
-                role="controller",
-                token=self.config.signaling_token,
-            )
+            # aiortc reaches the daemon over our WS signaling relay; livekit signals itself
+            # (the transport ignores the signaling arg).
+            if self.config.transport_backend == "aiortc":
+                self._ws_sig = WebSocketSignaling(
+                    self.config.signaling_url,
+                    self.config.session_id,
+                    role="controller",
+                    token=self.config.signaling_token,
+                )
             await self._endpoint.run(self._ws_sig)
             await self._endpoint.connected.wait()
             # Push our desired obs size so the Mac resizes/encodes to it (bandwidth).
