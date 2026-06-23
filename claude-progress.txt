@@ -1,6 +1,28 @@
 Date: 2026-06-23
 TaskStatus: completed
-Task scope: 让 LiveKit 传输 backend 端到端跑通(aiortc backend 此前已全部完成并测过)。
+Task scope: (1) LiveKit 传输 backend 端到端跑通 +(2) 给 aiortc 路径加 TURN 支持
+  (signaling relay 在 connect 时下发 STUN/TURN 配置 + 现签 coturn REST/HMAC 临时凭据)。
+
+== 子任务2:aiortc TURN 支持(已实现并测,42 passed) ==
+- 决策(用户定):relay 下发 ICE 配置 + coturn REST/HMAC 临时凭据;coturn 单独跑。
+  (取代早先"aiortc 不做 TURN"的 v1 决策。)
+- signaling_server.py:IceConfig(STUN/TURN url + 现签凭据)+ _coturn_credentials
+  (username="<expiry>:<sess:role>", credential=base64(HMAC_SHA1(secret,username)));
+  peer join 时(flush 缓冲 SDP 之前)推 {"kind":"ice","iceServers":[...]};
+  CLI/env: --stun-url/--turn-url/--turn-secret/--turn-ttl(+ $STUN_URLS/$TURN_URLS/
+  $TURN_SHARED_SECRET/$TURN_TTL_S)。
+- signaling.py:WebSocketSignaling.open() 读首条 ICE 存 self.ice_servers;非 ICE 暂存给 recv()。
+  Signaling 协议加 ice_servers;LoopbackSignaling.ice_servers=[]。
+- transport.py:AiortcTransport 把 PC 创建**推迟到 open()**,合并 config 静态 ice +
+  signaling.ice_servers;新增 _to_ice_server 支持 str | {urls,username,credential}(补上
+  之前 RTCIceServer 只带 url、无凭据的缺口)。
+- 测试 tests/robots/test_webrtc_proxy_turn.py(8 个):HMAC 凭据格式、IceConfig 空/STUN/TURN、
+  _to_ice_server str|dict、relay→client 真 ws 下发(带凭据/空)。
+- smoke 验证:relay 配 bogus TURN + STUN → 全链路连通(localhost host candidate 直连,
+  dict 形式 ICE 不破坏连接);get_observation/send_action 正常。
+- 行为语义:ICE 自动选,host>srflx>relay,直连优先、coturn 兜底;无凭据则无 relay 候选。
+- 文档:DESIGN §11.1/§11.1.1、README、feature_list M4 决策注记 全部回滚 v1、改为 v2(支持 TURN)。
+- 媒体走 TURN 直连 coturn,**不经 websocket/relay**;relay 只发 SDP + 凭据。
 
 == 本次完成(LiveKit backend 端到端,已验证) ==
 - 用本地 `livekit-server --dev`(brew install livekit;凭据 devkey/secret)做端到端验证,
