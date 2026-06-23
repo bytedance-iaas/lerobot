@@ -69,15 +69,36 @@ WebRTC gives us two kinds of pipe; we use both deliberately (`protocol.py`):
 | Carrier | Payload | Reliability | Why |
 |---|---|---|---|
 | **media track** (RTP/UDP) | camera frames (VP8/H.264) | lossy, no retransmit | uncompressed 30 Hz ≈ 220 Mbps — must encode; loss tolerated |
-| DataChannel `state` | joints + capture `t`,`seq` + applied feedback | **unreliable** (`ordered:false, maxRetransmits:0`) | stale joints are useless; drop, don't retransmit |
-| DataChannel `action` | goal joints + `seq` + `obs_seq` | **unreliable** | absolute goal positions self-correct next tick |
-| DataChannel `control` | onboarding RPC (find_port, list_cameras, grab, plan) | **reliable, ordered** | one-shot commands must arrive |
+| DataChannel `state` | joints + capture `t`,`seq` + applied feedback | **configurable** (default unreliable) | see profiles below |
+| DataChannel `action` | goal joints + `seq` + `obs_seq` | **configurable** (default unreliable) | see profiles below |
+| DataChannel `control` | onboarding RPC (find_port, list_cameras, grab, plan) | **reliable, ordered** (always) | one-shot commands must arrive |
 
 Never put images on a DataChannel — bandwidth blows up (handoff 难点 A).
 
 **Absolute, not delta, actions.** Goals are absolute `<motor>.pos`. A dropped action
 just means the next absolute goal corrects the arm — no accumulating error. Deltas
 would be unsafe over a lossy channel.
+
+### 4.1 state/action reliability is per use case `[done]`
+
+`control` is always reliable+ordered. `state`/`action` are configurable
+(`reliable_state`/`reliable_action`; `--profile teleop|eval|record` on the daemon),
+because the requirements genuinely differ:
+
+| | teleop | eval (policy) | record (dataset) |
+|---|---|---|---|
+| **state** | unreliable — freshest wins | unreliable — freshest obs → action | **reliable** — never lose an obs / gap the trajectory |
+| **action** | unreliable — stale cmd useless | unreliable | tradeoff: reliable = faithful execution; unreliable = responsive |
+
+Realtime closed loops (teleop/eval) prize **freshness**: a lost packet on a *reliable*
+channel head-of-line-blocks until retransmitted, delivering a stale sample late — worse
+than dropping it and waiting 33 ms for the next. Recording prizes **completeness** on the
+obs (`state`) side so the dataset has no holes. Either way, total disconnect is still
+caught by the watchdog (§7), and absolute actions self-correct after a drop.
+
+Note (current limitation): channels are created by the Mac daemon (the offerer), so the
+profile is set **daemon-side** today. Controller-driven selection per session (push the
+profile through signaling before the offer) is a later refinement.
 
 ## 5. Observation assembly — pairing camera & joints `[done]`
 
@@ -172,8 +193,8 @@ So each transition is reconstructable across the data/track split:
 
 - **media**: frames drop (UDP); needs seq-keyed re-identification (§5.1) + skew drop as a
   safety net.
-- **state/action**: intentionally unreliable; absolute positions + nearest/seq pairing +
-  watchdog absorb loss.
+- **state/action**: configurable (§4.1); unreliable by default — absolute positions +
+  seq pairing + watchdog absorb loss; reliable for record so no obs is lost.
 - **control/signaling**: reliable; no loss unless the connection dies.
 
 ---

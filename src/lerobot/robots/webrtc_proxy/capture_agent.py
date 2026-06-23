@@ -49,12 +49,12 @@ from .protocol import (
     CH_ACTION,
     CH_CONTROL,
     CH_STATE,
-    ORDERED_CHANNEL_KWARGS,
-    RT_CHANNEL_KWARGS,
+    RELIABLE_KWARGS,
     VIDEO_CLOCK_RATE,
     VIDEO_PTS_PER_SEQ,
     ActionMsg,
     StateMsg,
+    channel_kwargs,
 )
 from .signaling import Signaling
 
@@ -116,10 +116,14 @@ class CaptureAgent:
         ice_servers: list[str] | None = None,
         camera=None,  # an opened lerobot Camera (read_latest); None => synthetic frames
         robot=None,  # a connected lerobot Robot (so_follower) — drives joints+action+torque (M2)
+        reliable_state: bool = False,  # True for record (no lost obs); False for teleop/eval (fresh)
+        reliable_action: bool = False,
     ) -> None:
         self.signaling = signaling
         self.motors = list(motors)
         self._ice_servers = list(ice_servers or [])
+        self._state_kwargs = channel_kwargs(reliable_state)
+        self._action_kwargs = channel_kwargs(reliable_action)
         self.cam_name = cam_name
         self.cam_h = cam_height
         self.cam_w = cam_width
@@ -173,10 +177,10 @@ class CaptureAgent:
                 self.closed.set()
 
         await self.signaling.open()
-        self._ch_state = self.pc.createDataChannel(CH_STATE, **RT_CHANNEL_KWARGS)
-        self._ch_action = self.pc.createDataChannel(CH_ACTION, **RT_CHANNEL_KWARGS)
+        self._ch_state = self.pc.createDataChannel(CH_STATE, **self._state_kwargs)
+        self._ch_action = self.pc.createDataChannel(CH_ACTION, **self._action_kwargs)
         self._ch_action.on("message", self._on_action)
-        self._ch_control = self.pc.createDataChannel(CH_CONTROL, **ORDERED_CHANNEL_KWARGS)
+        self._ch_control = self.pc.createDataChannel(CH_CONTROL, **RELIABLE_KWARGS)
         self._control.attach(self._ch_control)
 
         self.pc.addTrack(_SyntheticCameraTrack(self._frame_q))
