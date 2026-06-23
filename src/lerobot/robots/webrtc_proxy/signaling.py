@@ -37,7 +37,14 @@ class SignalingClosed(Exception):
 
 
 class Signaling(Protocol):
-    """Minimal duplex SDP exchange used by both endpoints."""
+    """Minimal duplex SDP exchange used by both endpoints.
+
+    ``ice_servers`` is populated by ``open()`` with any STUN/TURN config the relay hands
+    out on connect (empty for loopback / a relay with no TURN configured); the transport
+    merges it into the peer connection. See ``signaling_server.py``.
+    """
+
+    ice_servers: list
 
     async def open(self) -> None: ...
 
@@ -50,6 +57,8 @@ class Signaling(Protocol):
 
 class LoopbackSignaling:
     """One end of an in-process signaling pair. See :func:`loopback_signaling_pair`."""
+
+    ice_servers: list = []  # loopback has no relay to hand out STUN/TURN
 
     def __init__(self, outbox: asyncio.Queue, inbox: asyncio.Queue) -> None:
         self._outbox = outbox
@@ -92,6 +101,8 @@ class WebSocketSignaling:
         self._token = token
         self._client = None
         self._ws = None
+        self.ice_servers: list = []
+        self._pending: dict | None = None  # a non-ICE message read early in open()
 
     async def open(self) -> None:
         import aiohttp
@@ -99,23 +110,39 @@ class WebSocketSignaling:
         self._client = aiohttp.ClientSession()
         headers = {"Authorization": f"Bearer {self._token}"} if self._token else None
         self._ws = await self._client.ws_connect(self._url, headers=headers)
+        # The relay pushes an ICE config message on join (before any buffered SDP). Consume
+        # it here; if the first message isn't ICE (e.g. an older relay), stash it for recv().
+        first = await self._next_message()
+        if first is not None and first.get("kind") == "ice":
+            self.ice_servers = first.get("iceServers", [])
+        else:
+            self._pending = first
+
+    async def _next_message(self) -> dict | None:
+        """Return the next parsed TEXT message, or None if the socket closed."""
+        import aiohttp
+
+        async for msg in self._ws:
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                return msg.json()
+            if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                break
+        return None
 
     async def send(self, description: RTCSessionDescription) -> None:
         await self._ws.send_json({"kind": "sdp", "type": description.type, "sdp": description.sdp})
 
     async def recv(self) -> RTCSessionDescription:
-        import aiohttp
-
-        async for msg in self._ws:
-            if msg.type == aiohttp.WSMsgType.TEXT:
-                data = msg.json()
-                if data.get("kind") == "sdp":
-                    return RTCSessionDescription(sdp=data["sdp"], type=data["type"])
-                if data.get("kind") == "bye":
-                    raise SignalingClosed("peer left the signaling session")
-            elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                break
-        raise SignalingClosed("signaling websocket closed")
+        while True:
+            data = self._pending if self._pending is not None else await self._next_message()
+            self._pending = None
+            if data is None:
+                raise SignalingClosed("signaling websocket closed")
+            if data.get("kind") == "sdp":
+                return RTCSessionDescription(sdp=data["sdp"], type=data["type"])
+            if data.get("kind") == "bye":
+                raise SignalingClosed("peer left the signaling session")
+            # ignore anything else (e.g. a late ICE refresh) and keep waiting for SDP
 
     async def close(self) -> None:
         if self._ws is not None:

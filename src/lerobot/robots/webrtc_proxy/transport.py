@@ -48,7 +48,7 @@ def make_transport(
     *,
     role: str,
     channels: dict[str, bool],
-    ice_servers: list[str] | None = None,
+    ice_servers: list[str | dict] | None = None,
     livekit_url: str | None = None,
     livekit_token: str | None = None,
 ) -> "Transport":
@@ -192,21 +192,34 @@ class AiortcTransport(Transport):
         *,
         role: str,  # "publisher" (offers + sends video) | "subscriber" (answers + recvs video)
         channels: dict[str, bool],  # label -> reliable (reliability honoured by the publisher/offerer)
-        ice_servers: list[str] | None = None,
+        # Each entry is a STUN/TURN url string, or a dict {"urls", "username"?, "credential"?}
+        # (TURN needs credentials). Static config; the signaling relay may add more at open().
+        ice_servers: list[str | dict] | None = None,
     ) -> None:
         super().__init__()
-        from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection
-
         if role not in ("publisher", "subscriber"):
             raise ValueError(f"role must be 'publisher' or 'subscriber', got {role!r}")
         self.role = role
         self._channel_specs = dict(channels)
-        ice = [RTCIceServer(urls=u) for u in (ice_servers or [])]
-        self.pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=ice))
+        self._ice_cfg: list[str | dict] = list(ice_servers or [])
+        # The RTCPeerConnection is built in open(), once the signaling relay has had a
+        # chance to hand us additional ICE servers (e.g. TURN with ephemeral credentials).
+        # aiortc fixes iceServers at construction, so we can't build it earlier.
+        self.pc = None
         self._channels: dict[str, _AiortcChannel] = {label: _AiortcChannel() for label in channels}
         self._pub = _PublisherTrack() if role == "publisher" else None
         self._frame_cb: Callable[[int, np.ndarray], None] | None = None
-        self._register()
+
+    @staticmethod
+    def _to_ice_server(cfg: str | dict):  # noqa: ANN205 (RTCIceServer)
+        """Coerce a config entry (url string or {urls,username,credential}) to RTCIceServer."""
+        from aiortc import RTCIceServer
+
+        if isinstance(cfg, str):
+            return RTCIceServer(urls=cfg)
+        return RTCIceServer(
+            urls=cfg["urls"], username=cfg.get("username"), credential=cfg.get("credential")
+        )
 
     def _register(self) -> None:
         @self.pc.on("connectionstatechange")
@@ -242,9 +255,17 @@ class AiortcTransport(Transport):
                 self._frame_cb(seq, frame.to_ndarray(format="rgb24"))
 
     async def open(self, signaling: Signaling) -> None:
-        from aiortc import RTCSessionDescription
+        from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 
         await signaling.open()
+        # Merge static (config) ICE servers with any the relay handed us on connect
+        # (e.g. TURN with freshly-minted ephemeral credentials). Built now because aiortc
+        # fixes iceServers at RTCPeerConnection construction.
+        ice_cfg = self._ice_cfg + list(getattr(signaling, "ice_servers", None) or [])
+        self.pc = RTCPeerConnection(
+            configuration=RTCConfiguration(iceServers=[self._to_ice_server(c) for c in ice_cfg])
+        )
+        self._register()
         if self.role == "publisher":
             for label, reliable in self._channel_specs.items():
                 self._channels[label].bind(self.pc.createDataChannel(label, **channel_kwargs(reliable)))

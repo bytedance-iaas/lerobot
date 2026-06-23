@@ -198,30 +198,29 @@ What runs in K8s is **whatever consumes `WebRTCProxyRobot`** — a record job, a
 inference server, or a teleop-session backend pod. Each session = one controller pod ↔
 one Mac daemon.
 
-**Decision (relay strategy).** The two backends have a clean, non-overlapping division
-of labour and we do **not** build a TURN relay for aiortc:
+**Decision (relay strategy).** Two complementary paths to a relay; pick per deployment:
 
-- **aiortc = direct UDP P2P only.** Host candidates, plus *optional* STUN (`ice_servers`)
-  to get a server-reflexive candidate through ordinary cone NATs (STUN is stateless and
-  can use a free public server, so it costs nothing). If a direct/STUN path can't be
-  formed (symmetric NAT, UDP blocked, HTTP-proxy-only egress), aiortc **gives up** — we
-  deliberately do *not* self-host coturn to relay it.
-- **Need a relay → switch to the LiveKit backend.** LiveKit's SFU already bundles
-  signaling + TURN + scale and is tested; duplicating that with coturn+aiortc is wasted
-  effort and the heaviest, most error-prone ops (public IP, port ranges, credential
-  rotation, bandwidth). So "relay" is a *backend choice*, not extra aiortc infra.
+- **aiortc + coturn (P2P with TURN fallback).** Host candidates + STUN for ordinary NATs,
+  and **TURN (coturn) as the relay** when direct/STUN fails. We do **not** put TURN
+  credentials in static config: the **signaling relay mints time-limited coturn REST/HMAC
+  credentials and hands them to each peer on connect** (an `{"kind":"ice"}` message with
+  STUN urls + `{urls,username,credential}` TURN entries; see `signaling_server.py`
+  `IceConfig` / `_coturn_credentials`). coturn itself runs separately
+  (`--use-auth-secret --static-auth-secret=<secret>`), and the relay shares that secret —
+  no user database, creds auto-expire. Configure via `--stun-url` / `--turn-url` /
+  `--turn-secret` / `--turn-ttl` on the relay; peers need no TURN config at all.
+- **LiveKit (SFU) as an alternative.** Bundles signaling + TURN + scale in one server;
+  both peers dial outward, so it's the simplest answer for many concurrent users or the
+  proxy-only egress case. "relay" can thus be either *coturn under aiortc* or *the LiveKit
+  backend* — choose by operational fit.
 
-This deletes the original M4 coturn / `hostNetwork` / announced-IP burden: those existed
-only to make aiortc P2P relay across hard NATs. With relay delegated to LiveKit, the
-aiortc deployment stays simple (host + optional STUN), and hard-network cases use
-`transport_backend="livekit"`.
+The **media path is the constraint** for whichever you pick:
 
-The **media path is still the constraint** for whichever backend you pick:
-
-- **aiortc:** UDP P2P. A controller pod that must terminate aiortc media needs a routable
-  path (e.g. `hostNetwork`/node IP) and correctly **announced external IP** — the classic
-  failure is "signaling connects, SDP exchanges, but media never flows" from a wrong
-  announced IP. This is exactly the complexity that pushes anything non-trivial to LiveKit.
+- **aiortc:** UDP P2P, TURN-relayed when needed. A controller pod terminating aiortc media
+  needs a routable path (e.g. `hostNetwork`/node IP) and correctly **announced external
+  IP** — the classic failure is "signaling connects, SDP exchanges, but media never flows"
+  from a wrong announced IP (or no reachable TURN). coturn must sit where both peers can
+  reach it (public IP, open relay port range).
 - **LiveKit:** both peers dial *outward* to the SFU; no inbound path / announced IP / port
   range to manage on our side. `aiortc` (default) gives decoded `ndarray` frames straight
   into the LeRobot pipeline — great for the adapter, but single-connection / weak at scale.
@@ -237,14 +236,15 @@ The **media path is still the constraint** for whichever backend you pick:
 
 The two ends often sit in asymmetric network conditions; this drives the backend choice:
 
-- **aiortc P2P = direct UDP only.** Host candidates + optional STUN (srflx); it forms a
-  path only when one is directly reachable. It has **no TURN relay we operate** and **no
-  support for routing media through an HTTP forward proxy**. So symmetric NAT, UDP-blocked,
-  or `HTTP(S)_PROXY`-only egress → aiortc simply can't connect. That is by design: the
-  answer is not "add coturn", it is "use the LiveKit backend".
-- **LiveKit (SFU) = the relay.** **Both** peers *dial outward* to the SFU — neither needs
-  an inbound path — so it covers the **NAT side** cleanly (outbound + SFU-side TURN). For a
-  **proxy-only side**:
+- **aiortc P2P + coturn.** Host candidates + STUN (srflx) for direct paths; **TURN
+  (coturn) relays** when direct fails (symmetric NAT, UDP blocked) — the relay hands out
+  ephemeral TURN creds on connect, so this covers most NATs. The one case it still can't
+  cover is **`HTTP(S)_PROXY`-only egress**: aiortc has no support for routing media through
+  an HTTP forward proxy, so a peer that can *only* reach the network via such a proxy can't
+  form even a TURN path — there, use the LiveKit backend (or give that peer direct egress).
+- **LiveKit (SFU) = the all-in-one relay.** **Both** peers *dial outward* to the SFU —
+  neither needs an inbound path — covering the **NAT side** cleanly (outbound + SFU-side
+  TURN). For a **proxy-only side**:
   - *signaling* (wss:443) traverses the HTTP proxy fine (it is just HTTPS/CONNECT);
   - *media* still needs the WebRTC client to tunnel ICE/TURN (TURN/TLS:443) through that
     proxy, which libwebrtc supports only partially and the Python SDK does not expose.
