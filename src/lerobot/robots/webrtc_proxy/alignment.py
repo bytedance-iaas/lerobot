@@ -33,17 +33,8 @@ import bisect
 import threading
 from collections import deque
 from dataclasses import dataclass
-from typing import Generic, TypeVar
 
 import numpy as np
-
-T = TypeVar("T")
-
-
-@dataclass
-class _Sample(Generic[T]):
-    t: float
-    value: T
 
 
 @dataclass(frozen=True)
@@ -68,50 +59,43 @@ class AlignmentBuffer:
     """Bounded, thread-safe nearest-neighbour pairing of state and frames by capture ts."""
 
     def __init__(self, maxlen: int = 64, pair_tolerance_s: float = 0.1) -> None:
-        # frames kept in a time-sorted structure for nearest-neighbour search.
-        self._frame_t: deque[float] = deque(maxlen=maxlen)
-        self._frame_v: deque[np.ndarray] = deque(maxlen=maxlen)
-        self._states: deque[_Sample[dict[str, float]]] = deque(maxlen=maxlen)
-        self._state_seq: deque[int] = deque(maxlen=maxlen)
+        # Each entry is (capture_t, value); appended in capture order == time order, so
+        # the timestamps stay sorted and bisect (keyed on the timestamp) can binary-search.
+        self._frames: deque[tuple[float, np.ndarray]] = deque(maxlen=maxlen)
+        self._states: deque[tuple[float, dict[str, float], int]] = deque(maxlen=maxlen)
         self._lock = threading.Lock()
 
     def add_state(self, t: float, joints: dict[str, float], seq: int) -> None:
         with self._lock:
-            self._states.append(_Sample(t, dict(joints)))
-            self._state_seq.append(seq)
+            self._states.append((t, dict(joints), seq))
 
     def add_frame(self, t: float, frame: np.ndarray) -> None:
         with self._lock:
-            self._frame_t.append(t)
-            self._frame_v.append(frame)
+            self._frames.append((t, frame))
 
     def _nearest_frame_locked(self, t: float) -> tuple[float | None, np.ndarray | None]:
-        if not self._frame_t:
-            return None, None
-        times = list(self._frame_t)  # deque is append-sorted by capture order == time order
-        i = bisect.bisect_left(times, t)
-        # candidates straddling t: i-1 and i
-        best_idx, best_dt = None, None
-        for j in (i - 1, i):
-            if 0 <= j < len(times):
-                dt = abs(times[j] - t)
+        # bisect by the timestamp key only (never compares the ndarray frame).
+        i = bisect.bisect_left(self._frames, t, key=lambda pair: pair[0])
+        best: tuple[float, np.ndarray] | None = None
+        best_dt: float | None = None
+        for j in (i - 1, i):  # the two frames straddling t
+            if 0 <= j < len(self._frames):
+                ft, fv = self._frames[j]
+                dt = abs(ft - t)
                 if best_dt is None or dt < best_dt:
-                    best_dt, best_idx = dt, j
-        if best_idx is None:
-            return None, None
-        return times[best_idx], self._frame_v[best_idx]
+                    best_dt, best = dt, (ft, fv)
+        return best if best is not None else (None, None)
 
     def assemble(self) -> AlignedObs | None:
         """Pair the newest state with its nearest frame. None if no state yet."""
         with self._lock:
             if not self._states:
                 return None
-            state = self._states[-1]
-            seq = self._state_seq[-1]
-            t_frame, frame = self._nearest_frame_locked(state.t)
+            t_state, joints, seq = self._states[-1]
+            t_frame, frame = self._nearest_frame_locked(t_state)
             return AlignedObs(
-                t_state=state.t,
-                joints=dict(state.value),
+                t_state=t_state,
+                joints=dict(joints),
                 frame=frame,
                 t_frame=t_frame,
                 seq_state=seq,
