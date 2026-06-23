@@ -164,16 +164,28 @@ def main() -> None:
     global _running
     parser = argparse.ArgumentParser(description="Cloud-side teleop for a remote SO-100 over WebRTC")
     parser.add_argument("--mode", choices=["web", "console"], default="web")
+    parser.add_argument(
+        "--transport", choices=["aiortc", "livekit"], default="aiortc", help="transport backend"
+    )
+    parser.add_argument("--signaling-url", default=SIGNALING_URL, help="WS relay URL (aiortc)")
+    parser.add_argument("--livekit-url", default=None, help="LiveKit server URL (livekit)")
+    parser.add_argument("--livekit-token", default=None, help="LiveKit JWT for the controller (livekit)")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
+    if args.transport == "livekit" and (not args.livekit_url or not args.livekit_token):
+        parser.error("--livekit-url and --livekit-token are required for --transport livekit")
 
     robot = WebRTCProxyRobot(
         WebRTCProxyRobotConfig(
             cameras={"front": WebRTCCameraSpec(height=HEIGHT, width=WIDTH, fps=FPS)},
-            signaling_url=SIGNALING_URL,
+            signaling_url=args.signaling_url,
             session_id=SESSION_ID,
             capture_fps=FPS,
             action_timeout_s=0.5,
+            transport_backend=args.transport,
+            livekit_url=args.livekit_url,
+            livekit_token=args.livekit_token,
         )
     )
     robot.connect()

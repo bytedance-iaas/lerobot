@@ -1,61 +1,50 @@
 Date: 2026-06-23
-TaskStatus: not_completed
-Task scope: WebRTCProxyRobot (云端 Robot 代理 + Mac daemon, WebRTC 桥)。当前活跃子任务:
-  让 LiveKit 传输 backend 在 LiveKit Cloud 上端到端跑通(aiortc backend 已全部完成并测过)。
+TaskStatus: completed
+Task scope: 让 LiveKit 传输 backend 端到端跑通(aiortc backend 此前已全部完成并测过)。
 
-== 已完成(全部已 commit,见 git log) ==
-- M1 回环 → M3 信令/daemon/控制面 → M2 真 so_follower(关节/动作/看门狗切扭矩)→ provenance/applied 反馈
-  → 可配置 channel 可靠性(record=可靠, teleop/eval=不可靠)→ shared-token 鉴权 → 传输层抽象。
-- 传输层已抽成 `transport.py` 的 `Transport` 接口(命名 data channel + 带 seq 的视频流)。
-  默认 `AiortcTransport`(WebRTC P2P)。`make_transport(backend,...)` 工厂 + `transport_backend` 配置项
-  ("aiortc"|"livekit");daemon `--transport`。CaptureAgent/_ProxyEndpoint 只依赖接口。
-- 帧↔state 改为按 **seq 精确配对**(aiortc 里 seq 藏在帧 pts;AlignmentBuffer 是 seq-keyed 字典)。
-- aiortc 路径:**34 个测试全过**(tests/robots/test_webrtc_proxy_*.py,跑测试加 `-p no:hydra_pytest`)。
-- 示例 examples/webrtc_remote_so100/:mac_daemon_so100.py(真 SO100)+ cloud_teleop_so100.py
-  (web UI 看实时相机+jog / --mode console)+ panel.html。合成 daemon 现在“跟随指令”(jog 可见)。
-- 文档:src/lerobot/robots/webrtc_proxy/{README.md, DESIGN.md}(DESIGN 有 K8s/FaaS/coturn/LiveKit 部署)。
+== 本次完成(LiveKit backend 端到端,已验证) ==
+- 用本地 `livekit-server --dev`(brew install livekit;凭据 devkey/secret)做端到端验证,
+  并且**也对真 LiveKit Cloud**(wss://lerobot-zt6uc2pv.livekit.cloud)验证通过。
+  (沙箱里 `uv` 连 Cloud 报 UnknownIssuer,但 livekit Rust FFI 客户端连 Cloud 正常。)
+- 修掉两个真 bug(之前 controller 端 get_observation() TimeoutError 的根因):
+  1. `room.connect()` **不触发 "connected" 事件** → connect() 返回后直接 `self.connected.set()`。
+  2. seq↔帧 **FIFO 1:1 配对是错的**:视频流有丢帧(实测 ~46% 到达),FIFO 会越漂越旧
+     (末帧标成 ~80 帧前的 seq,约 2.7s 陈旧,且不会超时只会静默配错)。
+     → 改成订阅端用 `_SEQ_TOPIC` 上**最新** seq 给到达帧打标(monotonic + 新鲜,实测帧 seq 与
+     state seq 只差 1 帧)。auto_subscribe 默认 True,track_subscribed 正常触发(2a 排除)。
+- close() 取消 _consume task,消除断开时 "Task was destroyed but it is pending"。
+- mac_daemon:`--signaling-url` 改成非必填(livekit 自己做信令);加 per-backend 必填校验
+  (aiortc 需 signaling-url;livekit 需 url+token)。run_daemon 对 livekit 传 signaling=None;
+  CaptureAgent 容忍 signaling=None。
+- cloud_teleop_so100.py 加 `--transport/--signaling-url/--livekit-url/--livekit-token`。
+- 新增 opt-in 集成测试 tests/robots/test_webrtc_proxy_livekit.py(无 LEROBOT_LIVEKIT_URL 时 skip;
+  daemon 走子进程,本进程当 controller,断言 obs/action 往返 + obs 在推进)。
+- 文档:transport_livekit.py docstring 去掉 "UNTESTED SCAFFOLD"/`# VERIFY`,写清 _SEQ_TOPIC 方案;
+  DESIGN §11.1 标注 LiveKit 已验证 + 新增 §11.1.1 NAT/受限出网(http_proxy)可达性矩阵
+  (为什么选 SFU 而非 aiortc P2P);README 加「LiveKit backend(experimental)」运行+测试段落。
 
-== 当前卡点:LiveKit backend 端到端 ==
-环境验证 OK:沙箱能连 LiveKit Cloud;JWT 有效;livekit Python SDK 可用(已装)。
-项目:LiveKit Cloud project "lerobot",URL = wss://lerobot-zt6uc2pv.livekit.cloud,room 用 "so100"。
-JWT 在对话历史里(robot/controller 两个身份,24h);⚠️ API secret 已泄漏到对话,建议测完去
-  控制台 API keys 重建 key 轮换。重新签 token:用 livekit-api 的 AccessToken,room="so100"。
+== 验证结果 ==
+- aiortc 路径无回退:`pytest tests/robots/test_webrtc_proxy_*.py -p no:hydra_pytest` → 34 passed。
+- 含 LiveKit(对本地 dev server):35 passed。
+- Cloud 手动 e2e:CONNECTED → pan 0→8→18(action 落地)→ 30 个不同 obs seq → applied_seq=29 →
+  干净 DISCONNECTED,无 TLS/错误。
 
-已查明的 SDK 事实(重要,别重新踩):
-1. 帧的 seq **不能** 靠帧本身带:LiveKit 会重写 frame timestamp_us(实测发 0,1000,2000.. 收到的是
-   它自己的时钟 1043...);FrameMetadata 是固定 proto。→ 已改成:发布端每帧在 reliable data topic
-   "_seq" 上发一条 {seq},订阅端 FIFO 1:1 弹出配对(transport_livekit.py 已实现)。帧用 RGB24 直传。
-2. SDK 字段实测:DataPacket(data,kind,participant,topic);VideoFrameEvent(frame,timestamp_us,rotation,
-   metadata);capture_frame(frame,*,timestamp_us,rotation,metadata);publish_data(payload,*,reliable,
-   destination_identities,topic);VideoBufferType 有 RGB24/RGBA/I420...;VideoFrame.convert(type)。
-3. **一个进程里开两个 LiveKit Room、跑在两个 event loop 会冲突**(livekit FFI client 绑单 loop)→
-   必须把 daemon 和 controller 当**两个独立进程**测(真实部署本来就是两进程,无所谓)。
+== 复现命令 ==
+- 起本地 server:`livekit-server --dev`
+- 跑集成测试(本地):
+  LEROBOT_LIVEKIT_URL=ws://127.0.0.1:7880 LEROBOT_LIVEKIT_API_KEY=devkey \
+  LEROBOT_LIVEKIT_API_SECRET=secret .venv/bin/python -m pytest \
+  tests/robots/test_webrtc_proxy_livekit.py -p no:hydra_pytest -sv
+- 跑 Cloud(凭据在 ~/.zshrc 的 LIVEKIT_URL/API_KEY/API_SECRET):同上但用这三个值,room 名一致。
+- 手动两进程 + Web 面板:见 README「LiveKit backend」段。
+- 注意:livekit 一个进程只能绑一个 room → daemon 与 controller 必须是两个进程。
 
-当前现象(daemon 作为独立子进程跑):
-- daemon 端(publisher)正常(日志有 WATCHDOG 触发,无 "engine is closed");
-- controller 端(subscriber,主进程)join 上了 room,但 get_observation() **TimeoutError**
-  —— assemble() 一直拿不到“同 seq 的 state+frame”对。
-
-== 下一步(从这里继续) ==
-1. 给 controller 加诊断:连接(或超时后)打印
-   robot._buffer._states / _frames 的 key 集合、robot._endpoint._transport._seq_queue 长度、
-   transport.connected 状态。判断到底是 state 没来、frame 没来、还是 seq 没来导致配不上。
-2. 高度怀疑点:
-   a) 订阅端没收到 video track → 需要 Room 连接时 auto_subscribe(确认 livekit 默认是否自动订阅;
-      可能要 RoomOptions(auto_subscribe=True))。track_subscribed 回调有没有触发。
-   b) data 没收到 → 确认 publish_data 的 destination(默认广播应可达)、topic 路由
-      (transport_livekit `_on_data` 按 topic 分发到 channel / "_seq" 队列)。
-   c) FIFO 配对:_seq data 与 video frame 跨流到达,首帧前 seq 没来会丢帧;state(seq) 与 frame(seq)
-      要有交集 assemble 才返回。可能要放宽:若拿不到精确 seq,临时给帧打“最新 state 的 seq”凑一对验证链路通。
-3. 复现命令(daemon 独立子进程 + controller 主进程):见对话里最后一条 bash(export LK_URL/LK_ROBOT/
-   LK_CTRL;后台跑 `python -m lerobot.robots.webrtc_proxy.mac_daemon --transport livekit --livekit-url $LK_URL
-   --livekit-token $LK_ROBOT --signaling-url ws://unused --session so100`;前台跑 controller 用 LK_CTRL)。
-4. 跑通后:把 transport_livekit 的 `# VERIFY`/wip 注释清掉,补一个最小集成测试(需 livekit 服务,默认 skip),
-   给 cloud_teleop_so100.py 加 --transport/--livekit-url/--livekit-token 参数,更新 DESIGN/README,正式 commit。
-
-== 注意 ==
-- aiortc 默认不受影响,别为了 LiveKit 改坏 aiortc 路径(改完务必再跑 34 个测试)。
-- LiveKit 是可选 backend(extra: webrtc-livekit);保持隔离,import 都是 guarded。
-- 提交社区以 aiortc 为默认(轻、CI 可测);LiveKit 作为实验可选项。
-- mac_daemon `--signaling-url` 目前 required;LiveKit 时传 dummy `ws://unused`(transport 忽略它)。
-  可顺手改成 livekit 时不强制要 signaling-url。
+== 注意 / 后续 ==
+- ⚠️ LIVEKIT_API_SECRET 之前进过被清空的对话、且明文在 ~/.zshrc → 去 LiveKit 控制台轮换 key。
+- ruff 不在 .venv(dev extra 因沙箱 TLS 无法 sync);本次只做了 py_compile/import 校验 + 行宽自查
+  (新代码无 >110 行),提交前如能 sync dev 建议补跑 `pre-commit run --all-files`。
+- NAT 一端 + 只能走 http_proxy 一端:aiortc P2P 基本不行(不支持媒体走 HTTP 代理);
+  LiveKit SFU 两端都拨出,NAT 端 OK,代理端信令能过、媒体需 libwebrtc 经代理隧道 TURN/TLS:443
+  (Python SDK 未暴露代理配置),需在真实代理机实测;兜底自建 coturn 或把 controller 放能直连出网处。
+  细节见 DESIGN §11.1.1。
+- LiveKit 仍是可选实验 backend(extra: webrtc-livekit);社区默认 aiortc(轻、CI 可测)。
