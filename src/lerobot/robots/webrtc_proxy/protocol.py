@@ -65,6 +65,10 @@ class StateMsg:
     t: float  # capture time.monotonic() seconds
     seq: int  # capture sequence number (shared with the paired frame)
     joints: dict[str, float]  # {"<motor>.pos": degrees}
+    # Piggybacked closed-loop feedback: the most recent action this Mac applied.
+    # Lets the cloud confirm landing + measure round-trip without an extra channel.
+    applied_seq: int = -1  # ActionMsg.seq of the last applied action (-1 = none yet)
+    applied_t: float = 0.0  # Mac time.monotonic() when it was applied
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), separators=(",", ":"))
@@ -72,7 +76,13 @@ class StateMsg:
     @classmethod
     def from_json(cls, raw: str) -> StateMsg:
         d = json.loads(raw)
-        return cls(t=float(d["t"]), seq=int(d["seq"]), joints={k: float(v) for k, v in d["joints"].items()})
+        return cls(
+            t=float(d["t"]),
+            seq=int(d["seq"]),
+            joints={k: float(v) for k, v in d["joints"].items()},
+            applied_seq=int(d.get("applied_seq", -1)),
+            applied_t=float(d.get("applied_t", 0.0)),
+        )
 
 
 @dataclass(frozen=True)
@@ -98,6 +108,7 @@ class ActionMsg:
     t: float  # cloud send time.monotonic() seconds (debug/telemetry only)
     seq: int  # monotonically increasing action id
     goal: dict[str, float]  # {"<motor>.pos": degrees}
+    obs_seq: int = -1  # provenance: the StateMsg.seq of the obs this action was derived from
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), separators=(",", ":"))
@@ -105,7 +116,12 @@ class ActionMsg:
     @classmethod
     def from_json(cls, raw: str) -> ActionMsg:
         d = json.loads(raw)
-        return cls(t=float(d["t"]), seq=int(d["seq"]), goal={k: float(v) for k, v in d["goal"].items()})
+        return cls(
+            t=float(d["t"]),
+            seq=int(d["seq"]),
+            goal={k: float(v) for k, v in d["goal"].items()},
+            obs_seq=int(d.get("obs_seq", -1)),
+        )
 
 
 @dataclass(frozen=True)
