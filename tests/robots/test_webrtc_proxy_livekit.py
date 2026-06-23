@@ -36,6 +36,9 @@ import time
 import pytest
 
 pytest.importorskip("livekit", reason="livekit transport needs the lerobot[webrtc-livekit] extra")
+# Token signing lives in the separate livekit-api package (livekit.api); guard it too so
+# this test SKIPS (not errors) when only `livekit` (rtc) is installed without `livekit-api`.
+pytest.importorskip("livekit.api", reason="self-signing needs livekit-api (lerobot[webrtc-livekit])")
 
 _URL = os.environ.get("LEROBOT_LIVEKIT_URL")
 if not _URL:
