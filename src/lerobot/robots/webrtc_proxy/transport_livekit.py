@@ -50,6 +50,37 @@ from .transport import Channel, Transport
 
 logger = logging.getLogger(__name__)
 
+
+def make_livekit_token(
+    *, api_key: str, api_secret: str, identity: str, room: str, ttl_hours: float = 24.0
+) -> str:
+    """Sign a LiveKit access token (JWT) granting ``identity`` room-join in ``room``.
+
+    Lets each process **self-sign** its own token from a shared API key/secret (so the
+    daemon and controller each mint their own ``robot`` / ``controller`` identity instead
+    of you pasting two JWTs). Convenient for dev / single-tenant.
+
+    Production note: the API secret can mint a token for *any* room/identity, so don't
+    ship it to the user's Mac — prefer a cloud token server that hands out scoped,
+    short-lived tokens. That's why the transport still accepts a pre-signed token too.
+    """
+    try:
+        from livekit import api
+    except ImportError as e:  # pragma: no cover - optional dep
+        raise ImportError(
+            "signing a LiveKit token needs the LiveKit SDK: `uv pip install livekit-api` "
+            "(or the lerobot[webrtc-livekit] extra)."
+        ) from e
+    from datetime import timedelta
+
+    return (
+        api.AccessToken(api_key, api_secret)
+        .with_identity(identity)
+        .with_ttl(timedelta(hours=ttl_hours))
+        .with_grants(api.VideoGrants(room_join=True, room=room))
+        .to_jwt()
+    )
+
 # LiveKit re-stamps frame timestamps and FrameMetadata is a fixed proto, so the capture
 # seq can't ride the frame. The publisher announces each frame's seq on this internal
 # reliable data topic. The subscriber tracks the *latest* announced seq and stamps each
