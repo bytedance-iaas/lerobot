@@ -157,17 +157,17 @@ def main() -> None:
         "--profile",
         choices=["teleop", "eval", "record"],
         default="teleop",
-        help="channel reliability profile: teleop/eval => unreliable (fresh); record => reliable state",
+        help="channel reliability: teleop/eval => unreliable (fresh); record => reliable state+action",
     )
     parser.add_argument("--reliable-state", action="store_true", help="override: reliable state channel")
     parser.add_argument("--reliable-action", action="store_true", help="override: reliable action channel")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
-    # record needs complete obs (reliable state); realtime loops want freshness. Explicit
-    # flags override the profile.
+    # record needs complete, ordered obs AND actions (no lost transitions); realtime loops
+    # (teleop/eval) want freshness. Explicit flags override the profile.
     reliable_state = args.reliable_state or args.profile == "record"
-    reliable_action = args.reliable_action
+    reliable_action = args.reliable_action or args.profile == "record"
 
     inventory: DeviceInventory = LocalDeviceInventory() if args.real_devices else SyntheticInventory()
     logger.info("daemon device inventory: %s", type(inventory).__name__)
