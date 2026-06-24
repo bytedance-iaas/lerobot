@@ -1,38 +1,45 @@
 #!/usr/bin/env bash
 #
-# Minimal launcher for the WebRTC signaling relay.
+# RUN-time launcher for the WebRTC signaling relay.
 #
-# The relay (signaling_server.py) only needs `aiohttp` + the Python stdlib — none of
-# lerobot's heavy deps (torch, aiortc, ...). It has NO relative imports, so we run the
-# file directly. Do NOT use `python -m lerobot.robots.webrtc_proxy.signaling_server`:
-# the `-m` form imports the whole package tree (lerobot.robots.__init__ ->
-# make_robot_from_config -> torch/...), defeating the point of a slim install.
+# This NEVER installs anything: on FaaS-style hosts the rootfs is read-only at run time,
+# so the environment must already exist (built by build_relay.sh during the build phase).
+# It just picks an interpreter that already has aiohttp and execs signaling_server.py
+# directly (the relay is self-contained: stdlib + aiohttp, no relative imports, so the
+# lerobot package tree is never imported — torch/aiortc/etc. are NOT needed).
 #
-# This creates a throwaway venv with aiohttp only (a few MB) instead of running a full
-# `uv sync` (which pulls in the entire lerobot dependency set).
-#
-# Usage:
+# Usage (args forwarded verbatim to signaling_server.py):
 #   ./run_relay.sh --port 8765
-#   ./run_relay.sh --port 8765 --stun-url stun:stun.l.google.com:19302
-#   ./run_relay.sh --port 8765 --auth-token "$SIGNALING_AUTH_TOKEN"
-# All arguments are forwarded verbatim to signaling_server.py.
+#   ./run_relay.sh --port 8765 --stun-url stun:stun.qq.com:3478 --auth-token "$TOKEN"
 #
 # Env overrides:
-#   RELAY_VENV     venv location (default: <this dir>/.venv-relay)
-#   AIOHTTP_SPEC   pip spec for aiohttp (default: aiohttp==3.14.1, matching uv.lock)
+#   RELAY_VENV     venv built by build_relay.sh (default: <this dir>/.venv-relay)
+#   RELAY_PYTHON   explicit interpreter to use (skips venv lookup)
 
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV="${RELAY_VENV:-$HERE/.venv-relay}"
-AIOHTTP_SPEC="${AIOHTTP_SPEC:-aiohttp==3.14.1}"
+SERVER="$HERE/signaling_server.py"
 
-if [ ! -x "$VENV/bin/python" ]; then
-  echo "[run_relay] creating venv at $VENV with $AIOHTTP_SPEC only…" >&2
-  uv venv "$VENV" >&2
-  # --native-tls: fall back to the OS trust store (some networks/proxies present a cert
-  # chain uv's bundled roots reject). Harmless when not needed.
-  uv pip install --native-tls --python "$VENV/bin/python" "$AIOHTTP_SPEC" >&2
+pick_python() {
+  # 1) explicit override
+  if [ -n "${RELAY_PYTHON:-}" ]; then echo "$RELAY_PYTHON"; return 0; fi
+  # 2) the venv built at build time
+  if [ -x "$VENV/bin/python" ]; then echo "$VENV/bin/python"; return 0; fi
+  # 3) any system interpreter that already has aiohttp (e.g. installed --system at build)
+  for py in python3 python; do
+    if command -v "$py" >/dev/null 2>&1 && "$py" -c 'import aiohttp' >/dev/null 2>&1; then
+      echo "$py"; return 0
+    fi
+  done
+  return 1
+}
+
+if ! PY="$(pick_python)"; then
+  echo "[run_relay] no interpreter with aiohttp found (looked for $VENV/bin/python and system python)." >&2
+  echo "[run_relay] run build_relay.sh during the BUILD phase first (run-time rootfs is read-only)." >&2
+  exit 1
 fi
 
-exec "$VENV/bin/python" "$HERE/signaling_server.py" "$@"
+exec "$PY" "$SERVER" "$@"
