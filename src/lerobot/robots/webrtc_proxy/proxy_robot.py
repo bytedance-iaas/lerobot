@@ -235,8 +235,16 @@ class WebRTCProxyRobot(Robot):
                     role="controller",
                     token=self.config.signaling_token,
                 )
+            # Staged so a connect timeout points at the stuck phase (signaling vs media).
+            logger.info(
+                "connecting: signaling %s (session=%s)…",
+                self.config.signaling_url,
+                self.config.session_id,
+            )
             await self._endpoint.run(self._ws_sig)
+            logger.info("connecting: signaling done; waiting for media (ICE) to connect…")
             await self._endpoint.connected.wait()
+            logger.info("connecting: media connected")
             # Push our desired obs size so the Mac resizes/encodes to it (bandwidth).
             # Correctness doesn't depend on this — get_observation re-fits to the spec.
             with contextlib.suppress(Exception):
@@ -246,7 +254,18 @@ class WebRTCProxyRobot(Robot):
                     timeout=5.0,
                 )
 
-        self._loop.run(_bringup(), timeout=self.config.connect_timeout_s)
+        try:
+            self._loop.run(_bringup(), timeout=self.config.connect_timeout_s)
+        except TimeoutError as e:
+            raise TimeoutError(
+                f"WebRTCProxyRobot connect timed out after {self.config.connect_timeout_s}s. Check: "
+                "(1) the signaling relay is reachable at the signaling_url; "
+                "(2) the Mac daemon is connected to the SAME relay with --session "
+                f"'{self.config.session_id}' and a matching --auth-token; "
+                "(3) for a cross-NAT/public link, STUN/TURN is configured on the relay — host-only ICE "
+                "(ice_servers=[]) can't traverse the internet. See the 'connecting:' logs above for the "
+                "phase it stalled in (signaling vs media)."
+            ) from e
         self._wait_first_obs(self.config.connect_timeout_s)
         self._connected = True
         logger.info("WebRTCProxyRobot connected (%s)", self.config.signaling_url)
