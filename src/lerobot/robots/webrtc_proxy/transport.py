@@ -192,8 +192,11 @@ class AiortcTransport(Transport):
         *,
         role: str,  # "publisher" (offers + sends video) | "subscriber" (answers + recvs video)
         channels: dict[str, bool],  # label -> reliable (reliability honoured by the publisher/offerer)
-        # Each entry is a STUN/TURN url string, or a dict {"urls", "username"?, "credential"?}
-        # (TURN needs credentials). Static config; the signaling relay may add more at open().
+        # Each entry is a STUN url string or a dict {"urls", ...}. aiortc is direct-UDP:
+        # STUN gives a server-reflexive candidate for cross-NAT direct P2P. Static config;
+        # the signaling relay also hands out STUN at open(). (The dict form accepts
+        # username/credential as a generic escape hatch, but the media-relay path is the
+        # LiveKit backend, not a TURN server under aiortc — see DESIGN §11.1.)
         ice_servers: list[str | dict] | None = None,
     ) -> None:
         super().__init__()
@@ -203,8 +206,8 @@ class AiortcTransport(Transport):
         self._channel_specs = dict(channels)
         self._ice_cfg: list[str | dict] = list(ice_servers or [])
         # The RTCPeerConnection is built in open(), once the signaling relay has had a
-        # chance to hand us additional ICE servers (e.g. TURN with ephemeral credentials).
-        # aiortc fixes iceServers at construction, so we can't build it earlier.
+        # chance to hand us STUN servers. aiortc fixes iceServers at construction, so we
+        # can't build it earlier.
         self.pc = None
         self._channels: dict[str, _AiortcChannel] = {label: _AiortcChannel() for label in channels}
         self._pub = _PublisherTrack() if role == "publisher" else None

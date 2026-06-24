@@ -20,31 +20,27 @@ relay forwards every message to the *other* role, buffering until that peer join
 (so the daemon may offer before a controller exists). When one side drops, the
 relay sends ``{"kind":"bye"}`` to the survivor so the daemon can reset and loop.
 
-This is the control-plane signaler. It carries SDP plus, on connect, an **ICE config**
-message (STUN urls + freshly-minted, time-limited TURN credentials) so the aiortc peers
-can relay through a separate coturn when direct P2P fails — it never carries media itself.
-With no STUN/TURN configured it hands out an empty list (host-candidate-only, as before).
-In production it runs as an ordinary (non-hostNetwork) Deployment behind a normal
-Service/Ingress; coturn is deployed and operated separately.
+This is the control-plane signaler for the **aiortc** (direct-UDP) backend. It carries
+SDP plus, on connect, a small **ICE config** message (STUN urls) so peers can form a
+server-reflexive candidate and connect directly across NAT — it never carries media.
+With no STUN configured it hands out an empty list (host-candidate-only / LAN). aiortc
+is direct-only; for a media relay (both ends behind restrictive NAT) use the LiveKit
+backend instead (DESIGN §11.1). In production this runs as an ordinary (non-hostNetwork)
+Deployment behind a normal Service/Ingress.
 
 Run standalone:
     python -m lerobot.robots.webrtc_proxy.signaling_server --port 8765 \
-        --stun-url stun:stun.l.google.com:19302 \
-        --turn-url turn:turn.example.com:3478?transport=udp --turn-secret <coturn-secret>
+        --stun-url stun:stun.l.google.com:19302   # or a domestic STUN, or self-hosted
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
-import hashlib
-import hmac
 import logging
 import os
 import secrets
 import socket
-import time
 from collections import defaultdict
 
 from aiohttp import WSMsgType, web
@@ -59,54 +55,27 @@ def _split_env(name: str) -> list[str]:
     return [u.strip() for u in os.environ.get(name, "").split(",") if u.strip()]
 
 
-def _coturn_credentials(secret: str, ttl_s: int, name: str) -> tuple[str, str]:
-    """Mint a time-limited TURN credential pair (coturn ``use-auth-secret`` / TURN REST API).
-
-    ``username`` is ``"<expiry_unix_ts>:<name>"`` and ``credential`` is
-    ``base64(HMAC_SHA1(secret, username))``. coturn (run with ``--use-auth-secret
-    --static-auth-secret=<secret>``) validates this without any user database, and the
-    credential auto-expires at ``expiry_ts`` — so the relay can hand short-lived creds to
-    each peer instead of distributing a static TURN password.
-    """
-    expiry = int(time.time()) + ttl_s
-    username = f"{expiry}:{name}"
-    digest = hmac.new(secret.encode(), username.encode(), hashlib.sha1).digest()
-    return username, base64.b64encode(digest).decode()
-
-
 class IceConfig:
-    """Builds the ICE-server list the relay hands to each peer on connect.
+    """Builds the STUN-server list the relay hands to each peer on connect.
 
-    STUN urls are static. TURN urls get a freshly-minted, time-limited credential per
-    peer (see :func:`_coturn_credentials`) when a shared ``turn_secret`` is configured.
-    With nothing configured this yields ``[]`` — i.e. the previous host-candidate-only
-    behaviour, fully backward compatible.
+    aiortc is the **direct-UDP** backend: host candidates connect on a LAN, and STUN adds
+    a server-reflexive (public) candidate so peers can also connect directly across NAT
+    when at least one side is reachable. STUN only *discovers* the public address — media
+    still flows peer-to-peer, never through the relay. With no STUN configured this yields
+    ``[]`` (host-candidate-only / LAN). For a genuine media **relay** (both ends behind
+    restrictive NAT), use the LiveKit backend — we deliberately don't run a TURN relay
+    under aiortc (see DESIGN §11.1).
     """
 
-    def __init__(
-        self,
-        stun_urls: list[str] | None = None,
-        turn_urls: list[str] | None = None,
-        turn_secret: str | None = None,
-        turn_ttl_s: int = 3600,
-    ) -> None:
+    def __init__(self, stun_urls: list[str] | None = None) -> None:
         self._stun = list(stun_urls or [])
-        self._turn = list(turn_urls or [])
-        self._secret = turn_secret
-        self._ttl = turn_ttl_s
 
     @property
     def enabled(self) -> bool:
-        return bool(self._stun or (self._turn and self._secret))
+        return bool(self._stun)
 
     def for_peer(self, name: str) -> list[dict]:
-        servers: list[dict] = []
-        if self._stun:
-            servers.append({"urls": self._stun})
-        if self._turn and self._secret:
-            username, credential = _coturn_credentials(self._secret, self._ttl, name)
-            servers.append({"urls": self._turn, "username": username, "credential": credential})
-        return servers
+        return [{"urls": self._stun}] if self._stun else []
 
 
 class SignalingRelay:
@@ -147,9 +116,9 @@ class SignalingRelay:
         self._peers[(session, role)] = ws
         logger.info("signaling: %s joined session %s", role, session)
 
-        # Hand out ICE config (STUN + freshly-minted TURN creds) FIRST, so the peer can
-        # build its RTCPeerConnection with it before any SDP arrives. Always sent (the list
-        # is empty when no STUN/TURN is configured) so the client protocol is uniform.
+        # Hand out ICE config (STUN servers) FIRST, so the peer can build its
+        # RTCPeerConnection with it before any SDP arrives. Always sent (empty list when no
+        # STUN is configured) so the client protocol is uniform.
         await ws.send_json({"kind": "ice", "iceServers": self._ice.for_peer(f"{session}:{role}")})
 
         # Flush anything buffered for me before I joined.
@@ -218,36 +187,14 @@ def main() -> None:
         "--stun-url",
         action="append",
         default=_split_env("STUN_URLS"),
-        help="STUN url handed to peers (repeatable; or $STUN_URLS comma-separated)",
-    )
-    parser.add_argument(
-        "--turn-url",
-        action="append",
-        default=_split_env("TURN_URLS"),
-        help="TURN url handed to peers (repeatable; or $TURN_URLS). Needs --turn-secret.",
-    )
-    parser.add_argument(
-        "--turn-secret",
-        default=os.environ.get("TURN_SHARED_SECRET"),
-        help="coturn static-auth-secret; relay mints time-limited TURN creds with it",
-    )
-    parser.add_argument(
-        "--turn-ttl",
-        type=int,
-        default=int(os.environ.get("TURN_TTL_S", "3600")),
-        help="lifetime (s) of each minted TURN credential (default 3600)",
+        help="STUN url handed to peers for direct cross-NAT P2P (repeatable; or $STUN_URLS "
+        "comma-separated). e.g. stun:stun.l.google.com:19302 (domestic: stun:stun.qq.com:3478). "
+        "For a media relay across hard NATs, use the LiveKit backend instead.",
     )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
-    ice = IceConfig(
-        stun_urls=args.stun_url,
-        turn_urls=args.turn_url,
-        turn_secret=args.turn_secret,
-        turn_ttl_s=args.turn_ttl,
-    )
-    if args.turn_url and not args.turn_secret:
-        parser.error("--turn-url requires --turn-secret (or $TURN_SHARED_SECRET) to mint credentials")
+    ice = IceConfig(stun_urls=args.stun_url)
 
     async def _run() -> None:
         runner, _ = await start_relay(args.host, args.port, auth_token=args.auth_token, ice=ice)

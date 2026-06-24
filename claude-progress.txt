@@ -3,9 +3,18 @@ TaskStatus: completed
 Task scope: (1) LiveKit 传输 backend 端到端跑通 +(2) 给 aiortc 路径加 TURN 支持
   (signaling relay 在 connect 时下发 STUN/TURN 配置 + 现签 coturn REST/HMAC 临时凭据)。
 
-== 子任务2:aiortc TURN 支持(已实现并测,42 passed) ==
-- 决策(用户定):relay 下发 ICE 配置 + coturn REST/HMAC 临时凭据;coturn 单独跑。
-  (取代早先"aiortc 不做 TURN"的 v1 决策。)
+== 子任务2:backend 分工 v3(最终,直连=aiortc / 中继=LiveKit,39 passed)==
+- 决策演变:v1 不做 TURN → v2 加 coturn → **v3(最终):aiortc=UDP直连(host+STUN),
+  中继=LiveKit,aiortc 不做 coturn**。relay 只下发 STUN(IceConfig + --stun-url)。
+- v3 改动:移除 _coturn_credentials / --turn-* 参数 / IceConfig 的 TURN 部分;
+  test_webrtc_proxy_turn.py → 改写为 test_webrtc_proxy_ice.py(STUN 下发测试);
+  DESIGN/README/feature_list 全部改成 v3 分工(直连 STUN、中继 LiveKit、无 coturn)。
+- 实测验证(用户在真机):云端公网 controller + 家用 daemon,relay 只加 --stun-url
+  即直连成功(媒体 P2P 无中继)。STUN 国内可用:stun.qq.com:3478 / stun.miwifi.com:3478。
+- 同时补:cloud_teleop --auth-token(连鉴权 relay);proxy_robot.connect 分阶段日志 +
+  超时报错(指出卡信令还是媒体);webrtc-livekit extra 补 livekit-api(自签 token 用)。
+
+== (历史)子任务2 v2:aiortc coturn TURN —— 已撤销,见上 v3 ==
 - signaling_server.py:IceConfig(STUN/TURN url + 现签凭据)+ _coturn_credentials
   (username="<expiry>:<sess:role>", credential=base64(HMAC_SHA1(secret,username)));
   peer join 时(flush 缓冲 SDP 之前)推 {"kind":"ice","iceServers":[...]};

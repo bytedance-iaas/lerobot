@@ -141,14 +141,19 @@ print(r.get_observation().keys()); print(r.list_ports()); r.disconnect()
 PY
 ```
 
-Across real NATs, the **signaling relay distributes ICE config on connect** — STUN urls
-plus, when a coturn is configured, **TURN entries with freshly-minted, time-limited
-credentials** (coturn REST/HMAC). Start the relay with `--stun-url` / `--turn-url` /
-`--turn-secret` (coturn runs separately with `--use-auth-secret --static-auth-secret=...`)
-and peers need no TURN config — they receive creds automatically and aiortc relays through
-coturn when direct/STUN fails. The one case TURN can't cover is HTTP-proxy-only egress
-(aiortc can't tunnel media through an HTTP forward proxy) — use the LiveKit backend there.
-See `DESIGN.md` §11.1.
+Across NAT, start the **signaling relay with `--stun-url`** — it hands each peer its STUN
+servers on connect (an `{"kind":"ice"}` message; peers need no ICE config). STUN gives a
+server-reflexive (public) candidate, so aiortc connects **directly** as long as one side
+is reachable (e.g. a cloud controller with a public IP + a home daemon dialing out — media
+stays peer-to-peer, no relay hop). aiortc is **direct-only**; if *both* ends sit behind
+restrictive/symmetric NAT (or a peer only egresses via an HTTP proxy), use the **LiveKit
+backend** for the relay — we don't run a TURN/coturn under aiortc. See `DESIGN.md` §11.1.
+
+```bash
+# relay with STUN (public, or domestic, or self-hosted):
+python -m lerobot.robots.webrtc_proxy.signaling_server --host 0.0.0.0 --port 8765 \
+    --auth-token <T> --stun-url stun:stun.l.google.com:19302   # CN: stun:stun.qq.com:3478
+```
 
 Tests (suites needing the transport skip automatically without aiortc/aiohttp):
 
@@ -220,13 +225,11 @@ NAT / restrictive-egress reachability (why SFU, not P2P) is covered in `DESIGN.m
   `list_cameras` return real ids. Default stays `SyntheticInventory`. Persisting the
   chosen port/camera→role mapping into a daemon config (and using it to open the bus)
   is M2.
-- **aiortc reach.** Host candidates connect same-host / same-LAN; STUN adds cone-NAT
-  (srflx) P2P; **coturn (TURN) relays** the rest. TURN creds aren't configured on the
-  peers — the **signaling relay mints ephemeral coturn REST/HMAC creds and pushes them on
-  connect** (`--stun-url`/`--turn-url`/`--turn-secret` on the relay; coturn deployed
-  separately). Remaining gap: HTTP-proxy-only egress (aiortc can't tunnel media through an
-  HTTP forward proxy) → use the LiveKit backend. K8s media path (hostNetwork / announced
-  external IP) + coturn deployment is still real ops, untested here.
+- **aiortc reach = direct UDP.** Host candidates connect same-host / same-LAN; **STUN**
+  (relay `--stun-url`, auto-distributed on connect) adds a public srflx candidate so peers
+  connect directly across NAT when one side is reachable. aiortc runs **no TURN relay**:
+  if *both* ends are behind restrictive/symmetric NAT, or a peer only egresses via an HTTP
+  proxy, use the **LiveKit backend** (the relay path) instead.
 - **Daemon reconnect is per-session, single controller.** One `session_id` ↔ one
   daemon ↔ one controller at a time. Multi-tenant routing / auth on the relay is later.
 - **send_action returns the optimistic goal** (no real clip/ack from the Mac yet). M2.
