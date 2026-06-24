@@ -135,16 +135,16 @@
 - K8s：媒体 Pod hostNetwork、announced/external IP、信令 relay 普通 Deployment、coturn。
 - relay 多租户路由 + 鉴权（当前单 session 单 controller）。
 
-> **决策（2026-06-23，relay 策略 v2）**：两条互补的 relay 路径,按部署选。
-> 1) **aiortc + coturn**：signaling relay 在 connect 时下发 ICE 配置（STUN url + 现签的
->    time-limited coturn REST/HMAC TURN 凭据），peer 端零 TURN 配置;coturn 单独跑
->    (`--use-auth-secret`)。**已实现并测**（`signaling_server.IceConfig/_coturn_credentials`,
->    `WebSocketSignaling.ice_servers`,`AiortcTransport` 合并 + `RTCIceServer` 带凭据;
->    见 `tests/robots/test_webrtc_proxy_turn.py`）。
-> 2) **LiveKit backend** 作为 SFU 替代（自带 signaling+TURN+扩展,已端到端验证）。
-> 唯一 aiortc 覆盖不了的：**只能走 http_proxy 出网**(媒体穿不过 HTTP 正向代理)→ 用 LiveKit。
-> M4 仍剩真活：coturn 实际部署 + K8s 媒体面(hostNetwork / announced IP),本机不可测。细节见 DESIGN §11.1。
-> （注:本条取代了早先"aiortc 不做 TURN"的 v1 决策。）
+> **决策（2026-06-23，backend 分工 v3，最终）**：直连↔aiortc,中继↔LiveKit,aiortc 不做 TURN。
+> - **aiortc = UDP 直连**：host(同网)+ STUN(srflx 跨 NAT 直连,只要一端可达)。signaling relay
+>   在 connect 时**下发 STUN**(`signaling_server.IceConfig` + `--stun-url`;`WebSocketSignaling.ice_servers`;
+>   `AiortcTransport` open() 时合并建 PC)。媒体始终 P2P,不经 relay。**已实测**:云端公网 controller +
+>   家用 daemon,只配 STUN 即直连成功。见 `tests/robots/test_webrtc_proxy_ice.py`。
+> - **LiveKit = relay**：两端都严格 NAT/对称 NAT,或要零运维穿透/多人/扩展 → 用 LiveKit SFU
+>   (自带 signaling+TURN+转发,已端到端验证)。不在 aiortc 下自建 coturn(单点哑中继,SFU 做得更好)。
+> v2 的 aiortc+coturn 路线**已撤销**(coturn REST/HMAC 签发、--turn-* 参数、turn 测试均移除)。
+> M4 仍剩真活:K8s 媒体面(hostNetwork / announced IP)、relay 多租户路由+鉴权,本机不可测。详见 DESIGN §11.1。
+> （演变:v1"不做 TURN" → v2"加 coturn" → v3"直连用 STUN、中继用 LiveKit、不做 coturn"。）
 
 ## 不在 M1 范围（不要回头做）
 - 真实串口/相机（M2）、信令服务/STUN/TURN（M3）、K8s/coturn（M4）、paradigm 落地（M5）。
