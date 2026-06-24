@@ -15,7 +15,6 @@
 ### Environments & Dependencies ###
 .env
 .venv
-.venv-relay/
 env/
 venv/
 env.bak/
