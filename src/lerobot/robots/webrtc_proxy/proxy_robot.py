@@ -44,6 +44,7 @@ import numpy as np
 from lerobot.types import RobotAction, RobotObservation
 
 from ..robot import Robot
+from . import tiling
 from .alignment import AlignmentBuffer
 from .capture_agent import _fit_frame
 from .configuration_webrtc_proxy import WebRTCProxyRobotConfig
@@ -155,12 +156,14 @@ class WebRTCProxyRobot(Robot):
     def __init__(self, config: WebRTCProxyRobotConfig):
         super().__init__(config)
         self.config = config
-        if len(config.cameras) != 1:
-            # M1 transports a single media track. Multi-camera is M2 (one track each).
-            raise NotImplementedError(
-                f"WebRTCProxyRobot M1 supports exactly one camera, got {list(config.cameras)}"
-            )
-        self.cam_name, self.cam_spec = next(iter(config.cameras.items()))
+        if not config.cameras:
+            raise ValueError("WebRTCProxyRobot needs at least one camera")
+        # Cameras are tiled into one video track on the Mac and sliced back here; both ends
+        # derive the same layout from the (name-sorted) specs. See tiling.py.
+        self._cam_specs = {name: (spec.height, spec.width) for name, spec in config.cameras.items()}
+        self._specs = tiling.ordered_specs(self._cam_specs)
+        # The first camera (name order) backs the single-camera set_camera_plan hint.
+        self.cam_name, self.cam_spec = sorted(config.cameras.items())[0]
         self.motors = list(config.motors)
 
         self._buffer = AlignmentBuffer()
@@ -178,7 +181,8 @@ class WebRTCProxyRobot(Robot):
 
     @property
     def observation_features(self) -> dict:
-        return {**self._motors_ft, self.cam_name: (self.cam_spec.height, self.cam_spec.width, 3)}
+        cams = {name: (spec.height, spec.width, 3) for name, spec in self.config.cameras.items()}
+        return {**self._motors_ft, **cams}
 
     @property
     def action_features(self) -> dict:
@@ -287,8 +291,11 @@ class WebRTCProxyRobot(Robot):
         if aligned is not None:
             self._last_obs_seq = aligned.seq  # actions sent next derive from this obs
             obs: RobotObservation = dict(aligned.joints)
-            # Enforce the declared obs shape regardless of what the Mac sent.
-            obs[self.cam_name] = _fit_frame(aligned.frame, self.cam_spec.height, self.cam_spec.width)
+            # The Mac tiled all cameras into one frame; slice it back per camera (same
+            # name-sorted layout) and enforce each declared obs shape.
+            for name, tile in tiling.untile(aligned.frame, self._specs).items():
+                spec = self.config.cameras[name]
+                obs[name] = _fit_frame(tile, spec.height, spec.width)
             self._last_obs = obs
             return dict(obs)
         # No complete pair yet (camera lag/stall): hold the last good obs rather than
