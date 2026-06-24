@@ -36,7 +36,7 @@ import numpy as np
 from . import tiling
 from .control import ControlServer, DeviceInventory, SyntheticInventory
 from .protocol import CH_ACTION, CH_CONTROL, CH_STATE, ActionMsg, StateMsg
-from .signaling import Signaling
+from .signaling import Signaling, SignalingClosed
 from .transport import Transport, make_transport
 
 logger = logging.getLogger(__name__)
@@ -153,7 +153,31 @@ class CaptureAgent:
             asyncio.ensure_future(self._capture_loop()),
             asyncio.ensure_future(self._watchdog_loop()),
         ]
+        # Recycle fast: keep watching the signaling channel so the relay's "bye" (controller
+        # left) ends the session in sub-second time, instead of waiting ~10-30s for WebRTC's
+        # own ICE/DTLS disconnect detection. Only for aiortc (livekit has its own signaling).
+        if self.signaling is not None:
+            self._tasks.append(asyncio.ensure_future(self._watch_signaling()))
         logger.info("CaptureAgent connected; streaming %d motors + camera %r", len(self.motors), self.cam_name)
+
+    async def _watch_signaling(self) -> None:
+        """End the session promptly when the relay reports the controller left ("bye").
+
+        After the offer/answer exchange the signaling socket is otherwise idle; reading it
+        lets us notice the peer's departure immediately and recycle for the next session,
+        rather than waiting for the media link's slow timeout.
+        """
+        try:
+            while not self._stop.is_set():
+                await self.signaling.recv()  # blocks; raises SignalingClosed on bye / close
+        except SignalingClosed:
+            logger.info("signaling: controller left (bye) -> ending session for fast recycle")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("signaling watcher error")
+        finally:
+            self.closed.set()  # unblock wait_closed() -> daemon loops to the next session
 
     async def wait_closed(self) -> None:
         """Block until the WebRTC link to the controller drops."""
