@@ -209,14 +209,21 @@ NAT / restrictive-egress reachability (why SFU, not P2P) is covered in `DESIGN.m
   received frame to pts=0, so if the *initial* frame is lost the seq offset shifts.
   Mitigated by resetting seq per session; production should carry an absolute seq in an
   RTP header extension. See `DESIGN.md` §5.1.
-- **Single camera.** M1 transports one media track. Multi-camera = one track each. (M2)
-- **Real robot (M2).** Pass a connected lerobot `Robot` (e.g. `SO100Follower`) to the
-  daemon (`run_daemon(robot=...)`): joints + camera come from one `robot.get_observation()`
-  (shared capture instant), actions call `robot.send_action`, and the watchdog cuts
-  torque via `robot.bus.disable_torque()`. All serial-bus access runs on one worker
-  thread so the public-net loop never blocks and the bus is never touched concurrently.
-  See `examples/webrtc_remote_so100`. Without a robot, the synthetic source (or a bare
-  `--real-camera`) still works for transport testing.
+- **Multi-camera (tiled).** N cameras stream over the single video track by stacking each
+  frame into one tall frame on the Mac and slicing them back on the cloud (`tiling.py`);
+  both ends derive the same layout from the name-sorted camera specs, so the seq pairing is
+  untouched and one camera is the identity. One encoder for the tiled frame is cheapest on
+  aiortc's Python encode path; for many/high-res streams use the LiveKit backend.
+- **Any robot (not just SO-100).** The daemon is robot-agnostic — it only uses the generic
+  `get_observation` / `send_action` / `bus` interface. Pick any registered robot on the CLI
+  via draccus: `mac_daemon --robot.type=so101_follower --robot.port=/dev/tty... [--robot.cameras...]`.
+  Motors + cameras are derived from the robot's own `observation_features` (the cloud
+  `WebRTCProxyRobotConfig` must declare the same schema). Joints + every camera come from one
+  `robot.get_observation()` (shared capture instant); actions call `robot.send_action`; the
+  watchdog cuts torque via `robot.bus.disable_torque()` (robots without a motor `bus` need a
+  custom `on_safe_stop`). All serial-bus access runs on one worker thread. Without `--robot.*`,
+  the synthetic source (or a bare `--real-camera`) still works for transport testing; the
+  `examples/webrtc_remote_so100` script shows the in-code `run_daemon(robot=...)` path.
 - **Camera sizing.** The daemon opens at the requested capture size, falling back to
   native if the camera rejects it; `_fit_frame` + the cloud's defensive re-fit guarantee
   the declared obs shape, and the cloud pushes its spec via `set_camera_plan` at connect.
