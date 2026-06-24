@@ -90,12 +90,16 @@ def webrtc_link():
         height: int = 48,
         width: int = 64,
         fps: int = 30,
+        cameras: dict | None = None,  # multi-cam: name -> (height, width); overrides cam_name/size
         action_timeout_s: float = 0.5,
         connect_timeout_s: float = 20.0,
     ):
         relay_lt = _LoopThread()
         runner, port = relay_lt.submit(start_relay("127.0.0.1", 0, auth_token=token)).result(timeout=5)
         url = f"ws://127.0.0.1:{port}/ws"
+
+        # Single camera by default; a `cameras` map enables the multi-camera (tiled) path.
+        cam_specs = cameras or {cam_name: (height, width)}
 
         agent_box: dict = {}
         daemon_lt = _LoopThread()
@@ -107,6 +111,7 @@ def webrtc_link():
                 cam_name=cam_name,
                 cam_height=height,
                 cam_width=width,
+                cameras=cameras,
                 capture_fps=fps,
                 action_timeout_s=action_timeout_s,
                 ice_servers=[],
@@ -122,7 +127,7 @@ def webrtc_link():
         time.sleep(0.4)  # let the daemon connect + buffer its offer
 
         cfg_kwargs = dict(
-            cameras={cam_name: WebRTCCameraSpec(height=height, width=width, fps=fps)},
+            cameras={n: WebRTCCameraSpec(height=h, width=w, fps=fps) for n, (h, w) in cam_specs.items()},
             signaling_url=url,
             session_id="test",
             ice_servers=[],

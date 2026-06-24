@@ -82,6 +82,8 @@ async def run_daemon(
     ice_servers: list[str] | None = None,
     inventory: DeviceInventory | None = None,
     camera=None,
+    cameras: dict[str, tuple[int, int]] | None = None,  # multi-cam: name -> (height, width)
+    cameras_src: dict | None = None,  # multi-cam: name -> opened Camera
     robot=None,
     reliable_state: bool = False,
     reliable_action: bool = False,
@@ -117,6 +119,8 @@ async def run_daemon(
             inventory=inventory if inventory is not None else SyntheticInventory(),
             ice_servers=ice_servers,
             camera=camera,
+            cameras=cameras,
+            cameras_src=cameras_src,
             robot=robot,
             reliable_state=reliable_state,
             reliable_action=reliable_action,
