@@ -192,6 +192,7 @@ def main() -> None:
     parser.add_argument(
         "--session", default=SESSION_ID, help="session id == LiveKit room; must match the daemon's --session"
     )
+    parser.add_argument("--web-port", type=int, default=WEB_PORT, help=f"web panel port (default {WEB_PORT})")
     parser.add_argument(
         "--transport", choices=["aiortc", "livekit"], default="aiortc", help="transport backend"
     )
@@ -277,9 +278,9 @@ def main() -> None:
 
     server = None
     if args.mode == "web":
-        server = ThreadingHTTPServer(("0.0.0.0", WEB_PORT), _Handler)  # noqa: S104
+        server = ThreadingHTTPServer(("0.0.0.0", args.web_port), _Handler)  # noqa: S104
         threading.Thread(target=server.serve_forever, daemon=True).start()
-        print(f"\n  open http://localhost:{WEB_PORT}  — live remote camera + jog buttons. Ctrl-C to stop.\n")
+        print(f"\n  open http://localhost:{args.web_port}  — live remote camera + jog buttons. Ctrl-C to stop.\n")
     else:
         threading.Thread(target=_console_reader, daemon=True).start()
 
