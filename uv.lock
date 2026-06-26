@@ -2918,6 +2918,8 @@ accelerate-dep = [
 ]
 all = [
     { name = "accelerate" },
+    { name = "aiohttp" },
+    { name = "aiortc" },
     { name = "av" },
     { name = "contourpy" },
     { name = "datasets" },
@@ -2939,6 +2941,8 @@ all = [
     { name = "ipykernel" },
     { name = "jsonlines" },
     { name = "jupyter" },
+    { name = "livekit" },
+    { name = "livekit-api" },
     { name = "matplotlib" },
     { name = "metaworld" },
     { name = "mock-serial", marker = "sys_platform != 'win32'" },
@@ -3480,6 +3484,7 @@ requires-dist = [
     { name = "lerobot", extras = ["vla-jepa"], marker = "extra == 'all'" },
     { name = "lerobot", extras = ["wallx"], marker = "extra == 'all'" },
     { name = "lerobot", extras = ["webrtc"], marker = "extra == 'webrtc-livekit'" },
+    { name = "lerobot", extras = ["webrtc-livekit"], marker = "extra == 'all'" },
     { name = "lerobot", extras = ["xvla"], marker = "extra == 'all'" },
     { name = "livekit", marker = "extra == 'webrtc-livekit'", specifier = ">=0.18.0,<2.0.0" },
     { name = "livekit-api", marker = "extra == 'webrtc-livekit'", specifier = ">=0.8.0,<2.0.0" },

@@ -350,6 +350,7 @@ all = [
     "lerobot[robometer]",
     "lerobot[topreward]",
     "lerobot[peft]",
+    "lerobot[webrtc-livekit]",
     # "lerobot[unitree_g1]", TODO: Unitree requires specific installation instructions for unitree_sdk2
 ]
 
