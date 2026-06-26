@@ -56,6 +56,7 @@ SESSION_ID = "so100"
 FPS, WIDTH, HEIGHT = 30, 640, 480
 WEB_PORT = 8088
 JOG_DEG = 3.0
+HOME_RATE_DPS = 30.0  # "reset to home" ramps to 0 at this deg/sec (gentle, not a snap)
 
 _PANEL_HTML = (Path(__file__).parent / "panel.html").read_text(encoding="utf-8")
 
@@ -65,6 +66,8 @@ _targets: dict[str, float] = {}
 _latest_frame: dict[str, np.ndarray | None] = {"img": None}
 _latest_joints: dict[str, float] = {}
 _motors: list[str] = []
+_cam_names: list[str] = []  # one or more cameras; the panel hconcats them into one view
+_homing = {"on": False}  # when True, the control loop ramps every target toward 0
 _sel = {"i": 0}
 _running = True
 
@@ -88,7 +91,11 @@ class _Handler(BaseHTTPRequestHandler):
             q = parse_qs(path.query)
             key = f"{q.get('motor', [''])[0]}.pos"
             if key in _targets:
+                _homing["on"] = False  # manual jog cancels an in-progress home
                 _targets[key] += float(q.get("delta", ["0"])[0])
+            self._json({"ok": True})
+        elif path.path == "/home":
+            _homing["on"] = True  # ramp to 0 gradually in the control loop (HOME_RATE_DPS)
             self._json({"ok": True})
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
@@ -152,9 +159,26 @@ def _control_loop(robot: WebRTCProxyRobot) -> None:
     safe-stops), and refresh the latest obs (joints + camera) for the front-end."""
     try:
         while _running:
+            if _homing["on"]:  # ease every joint toward 0 by a bounded step per tick
+                step = HOME_RATE_DPS / FPS
+                done = True
+                for k in _targets:
+                    cur = _targets[k]
+                    if abs(cur) <= step:
+                        _targets[k] = 0.0
+                    else:
+                        _targets[k] = cur - step if cur > 0 else cur + step
+                        done = False
+                if done:
+                    _homing["on"] = False
             robot.send_action(dict(_targets))  # action -> WebRTC -> Mac motors
-            o = robot.get_observation()  # joints + camera <- WebRTC <- Mac
-            _latest_frame["img"] = o["front"]
+            o = robot.get_observation()  # joints + camera(s) <- WebRTC <- Mac
+            imgs = [o[n] for n in _cam_names if o.get(n) is not None]
+            if imgs:
+                try:
+                    _latest_frame["img"] = imgs[0] if len(imgs) == 1 else np.concatenate(imgs, axis=1)
+                except ValueError:  # mismatched heights — fall back to the first camera
+                    _latest_frame["img"] = imgs[0]
             _latest_joints.update({m: float(o[f"{m}.pos"]) for m in _motors})
             time.sleep(1 / FPS)
     except KeyboardInterrupt:
@@ -165,6 +189,9 @@ def main() -> None:
     global _running
     parser = argparse.ArgumentParser(description="Cloud-side teleop for a remote SO-100 over WebRTC")
     parser.add_argument("--mode", choices=["web", "console"], default="web")
+    parser.add_argument(
+        "--session", default=SESSION_ID, help="session id == LiveKit room; must match the daemon's --session"
+    )
     parser.add_argument(
         "--transport", choices=["aiortc", "livekit"], default="aiortc", help="transport backend"
     )
@@ -187,6 +214,12 @@ def main() -> None:
         "--livekit-api-secret", default=os.environ.get("LIVEKIT_API_SECRET"), help="$LIVEKIT_API_SECRET"
     )
     parser.add_argument("--livekit-identity", default="controller", help="this controller's LiveKit identity")
+    parser.add_argument(
+        "--cameras",
+        default="front",
+        help="camera set, comma-separated; must match the Mac daemon's names. "
+        "Each is 'name' (default %dx%d) or 'name:WxH'. e.g. 'front,wrist:640x480'" % (WIDTH, HEIGHT),
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
@@ -202,20 +235,34 @@ def main() -> None:
                 )
             from lerobot.robots.webrtc_proxy.transport_livekit import make_livekit_token
 
-            # Room == session id; must match the daemon's. (cloud_teleop uses SESSION_ID.)
+            # Room == session id; must match the daemon's --session.
             livekit_token = make_livekit_token(
                 api_key=args.livekit_api_key,
                 api_secret=args.livekit_api_secret,
                 identity=args.livekit_identity,
-                room=SESSION_ID,
+                room=args.session,
             )
+
+    # camera set must match the Mac daemon (same names + per-camera height/width) so the
+    # tiled video de-tiles correctly. 'name' => default res; 'name:WxH' => custom.
+    cams_cfg: dict[str, WebRTCCameraSpec] = {}
+    for item in (s.strip() for s in args.cameras.split(",")):
+        if not item:
+            continue
+        if ":" in item:
+            name, res = item.split(":", 1)
+            w, h = (int(x) for x in res.lower().split("x"))
+        else:
+            name, h, w = item, HEIGHT, WIDTH
+        cams_cfg[name.strip()] = WebRTCCameraSpec(height=h, width=w, fps=FPS)
+    _cam_names[:] = list(cams_cfg)
 
     robot = WebRTCProxyRobot(
         WebRTCProxyRobotConfig(
-            cameras={"front": WebRTCCameraSpec(height=HEIGHT, width=WIDTH, fps=FPS)},
+            cameras=cams_cfg,
             signaling_url=args.signaling_url,
             signaling_token=args.auth_token,
-            session_id=SESSION_ID,
+            session_id=args.session,
             capture_fps=FPS,
             action_timeout_s=0.5,
             transport_backend=args.transport,

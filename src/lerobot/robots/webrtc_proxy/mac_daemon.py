@@ -93,6 +93,13 @@ def _build_robot(robot_args: list[str]):
     )
     from ..utils import make_robot_from_config
 
+    # Robots register RobotConfig choices but NOT camera ones; import the camera configs so
+    # `--robot.cameras="{...type: opencv...}"` resolves. Same set lerobot-record imports.
+    from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
+    from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
+    from lerobot.cameras.reachy2_camera import Reachy2CameraConfig  # noqa: F401
+    from lerobot.cameras.zmq import ZMQCameraConfig  # noqa: F401
+
     register_third_party_plugins()  # let pip-installed robots register too
 
     cfg = draccus.parse(_RobotWrap, args=robot_args).robot

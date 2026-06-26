@@ -18,9 +18,13 @@
   <h3>Remote SO-100 over WebRTC — live camera + jog</h3>
   <img src="/stream" alt="remote camera" />
   <div id="ctrl"></div>
+  <div class="row" style="margin-top:12px">
+    <button id="home" style="width:auto;height:34px;padding:0 14px;font-size:14px">Reset to Home</button>
+  </div>
   <script>
     let STEP = 3;
     function jog(m, sign) { fetch(`/jog?motor=${m}&delta=${sign * STEP}`); }
+    function home() { fetch("/home"); }
     async function poll() {
       try {
         const j = await (await fetch("/state")).json();
@@ -44,6 +48,7 @@
           `<b id="v_${m}">–</b>`;
         c.appendChild(r);
       }
+      document.getElementById("home").onclick = home;
       setInterval(poll, 300);
     }
     init();
