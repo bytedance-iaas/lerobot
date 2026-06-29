@@ -18,7 +18,7 @@ FROM ${BASE_IMAGE}
 ARG HERMES_PACKAGE=hermes-agent
 ARG PIP_INDEX_URL=https://mirrors.volces.com/pypi/simple
 ENV PIP_INDEX_URL=${PIP_INDEX_URL}
-RUN python -m pip install --no-cache-dir "aiohttp>=3.9" "${HERMES_PACKAGE}" \
+RUN python -m pip install --no-cache-dir "aiohttp>=3.9" "pyyaml>=6" "${HERMES_PACKAGE}" \
     && (hermes postinstall --yes 2>/dev/null || true)
 
 # --- the console app ------------------------------------------------------ #

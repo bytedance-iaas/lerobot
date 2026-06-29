@@ -82,6 +82,29 @@ def _hermes_config_path() -> Path:
     return home / "config.yaml"
 
 
+def _parse_model_block(text: str) -> dict:
+    """Extract model.{default,base_url,api_key} from config.yaml WITHOUT pyyaml.
+
+    pyyaml may not be installed in every runtime; we must NOT silently report the
+    chat as not-ready just because a yaml import failed (that traps the key modal
+    in a loop). hermes writes a plain block-style `model:` mapping, so a tiny
+    indentation-aware line parser is enough and dependency-free.
+    """
+    out: dict[str, str] = {}
+    in_model = False
+    for raw in text.splitlines():
+        if re.match(r"^model:\s*$", raw):
+            in_model = True
+            continue
+        if in_model:
+            if raw and not raw[0].isspace():  # next top-level key → end of block
+                break
+            m = re.match(r"^\s+(default|base_url|api_key):\s*(.*?)\s*$", raw)
+            if m:
+                out[m.group(1)] = m.group(2).strip().strip("\"'")
+    return out
+
+
 def read_chat_config() -> dict:
     """Return {chat_ready, model, base_url} by reading hermes' config.yaml."""
     cfg_path = _hermes_config_path()
@@ -89,18 +112,29 @@ def read_chat_config() -> dict:
     base_url = DEFAULT_BASE_URL
     api_key = ""
     try:
-        import yaml
-
-        data = yaml.safe_load(cfg_path.read_text()) or {}
-        m = data.get("model")
-        if isinstance(m, dict):
-            model = m.get("default") or model
-            base_url = m.get("base_url") or base_url
-            api_key = (m.get("api_key") or "").strip()
+        text = cfg_path.read_text()
     except FileNotFoundError:
-        pass
-    except Exception as e:  # noqa: BLE001 — config is best-effort
+        text = ""
+    except Exception as e:  # noqa: BLE001
         log.warning("could not read hermes config: %s", e)
+        text = ""
+    if text:
+        fields = {}
+        try:
+            import yaml  # preferred when available
+
+            data = yaml.safe_load(text) or {}
+            m = data.get("model")
+            if isinstance(m, dict):
+                fields = {k: m.get(k) for k in ("default", "base_url", "api_key")}
+        except ImportError:
+            fields = _parse_model_block(text)  # dependency-free fallback
+        except Exception as e:  # noqa: BLE001 — malformed yaml etc.
+            log.warning("yaml parse failed, falling back to line parse: %s", e)
+            fields = _parse_model_block(text)
+        model = (fields.get("default") or model)
+        base_url = (fields.get("base_url") or base_url)
+        api_key = (fields.get("api_key") or "").strip()
     chat_ready = api_key.lower() not in _PLACEHOLDERS
     return {"chat_ready": chat_ready, "model": model, "base_url": base_url}
 

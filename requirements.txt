@@ -1,1 +1,2 @@
 aiohttp>=3.9
+pyyaml>=6      # preferred config parse; server has a yaml-free fallback if absent
