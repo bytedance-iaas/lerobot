@@ -177,6 +177,20 @@ body {
 .q-purple { color: var(--purple); border-color: #ddd4ff; }
 .q:hover { filter: brightness(.97); }
 
+/* tool-call lines + permission prompts (ACP streaming) */
+.tool-ava { background: #eef0f4 !important; color: #6b7180 !important; }
+.tool-bubble { background: #0b0f17; color: #9fb3d1; font-family: ui-monospace, Menlo, monospace;
+  font-size: 12px; border-radius: 10px; padding: 8px 11px; }
+.tool-bubble.tool-done { color: #6ee7a8; }
+.bubble.perm { background: #fff7ed; border: 1px solid #fed7aa; color: #9a3412; }
+.perm-btns { display: flex; gap: 8px; margin-top: 10px; }
+.perm-btn { border: 1px solid var(--line); background: #fff; border-radius: 9px; padding: 6px 12px;
+  font-size: 12.5px; cursor: pointer; color: var(--ink); }
+.perm-btn:hover { background: #f6f7f9; }
+.perm-btn.perm-deny { color: #dc2626; }
+.perm-btn.chosen { background: var(--orange); color: #fff; border-color: var(--orange); }
+.perm-btn:disabled { opacity: .5; cursor: default; }
+
 .chat-input { display: flex; align-items: flex-end; gap: 10px; padding: 12px 16px 16px; border-top: 1px solid var(--line); }
 .chat-input textarea { flex: 1; resize: none; border: 1px solid var(--line); border-radius: 14px;
   padding: 11px 14px; font: inherit; max-height: 140px; outline: none; }

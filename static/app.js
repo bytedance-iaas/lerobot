@@ -191,7 +191,7 @@
 
   /* --------------------------------------------------------------------- chat */
   const body = $("chat-body"), textEl = $("chat-text"), sendBtn = $("chat-send");
-  let chatWS, busy = false, thinkingEl = null, chatReady = false, pendingText = null;
+  let chatWS, busy = false, chatReady = false, pendingText = null;
 
   const looksHtml = (s) =>
     /<(html|body|div|table|section|article|main|header|h[1-6]|ul|ol|li|p|span|canvas|svg|img|pre|code|style|script|button|form|iframe)[\s>/]/i.test(s);
@@ -220,23 +220,90 @@
     b.style.color = "#2563eb";
     b.style.cursor = "default";
   }
-  function showThinking() { thinkingEl = addMsg("bot", "Agent 正在思考"); thinkingEl.classList.add("thinking"); }
-  function clearThinking() { if (thinkingEl) { thinkingEl.closest(".msg").remove(); thinkingEl = null; } }
   function setBusy(b) { busy = b; sendBtn.disabled = b; }
+
+  // streaming-turn state
+  let curBubble = null, curText = "", toolEls = {};
+  function rm(el) { if (el) el.closest(".msg").remove(); }
+
+  function startTurn() {
+    curText = ""; toolEls = {};
+    curBubble = addMsg("bot", "");
+    curBubble.classList.add("thinking");
+    curBubble.textContent = "思考中";
+  }
+  function appendToken(t) {
+    if (!curBubble) startTurn();
+    curBubble.classList.remove("thinking");
+    curText += t;
+    curBubble.textContent = curText;
+    body.scrollTop = body.scrollHeight;
+  }
+  function addToolLine(u) {
+    const id = u.id || Math.random();
+    let t = toolEls[id];
+    if (!t) {
+      const wrap = document.createElement("div");
+      wrap.className = "msg msg-bot";
+      wrap.innerHTML = '<span class="msg-ava tool-ava">⚙</span><div class="bubble tool-bubble"></div>';
+      body.appendChild(wrap);
+      t = toolEls[id] = { el: wrap.querySelector(".tool-bubble"), title: "" };
+    }
+    if (u.title) t.title = u.title;             // tool_call has the title; updates may not
+    t.el.textContent = "🔧 " + (t.title || "工具") + (u.status ? " · " + u.status : "");
+    t.el.classList.toggle("tool-done", u.status === "completed" || u.status === "failed");
+    body.scrollTop = body.scrollHeight;
+  }
+  function addPermission(m) {
+    const bubble = addMsg("bot", "");
+    bubble.classList.add("perm");
+    bubble.textContent = "⚠️ 需要授权：" + (m.title || "");
+    const box = document.createElement("div");
+    box.className = "perm-btns";
+    (m.options || []).forEach((o) => {
+      const b = document.createElement("button");
+      b.className = "perm-btn" + (/reject|deny/i.test(o.kind || o.optionId || "") ? " perm-deny" : "");
+      b.textContent = o.name || o.optionId;
+      b.onclick = () => {
+        chatWS.send(JSON.stringify({ type: "permission_response", reqId: m.reqId, optionId: o.optionId }));
+        box.querySelectorAll("button").forEach((x) => (x.disabled = true));
+        b.classList.add("chosen");
+      };
+      box.appendChild(b);
+    });
+    bubble.appendChild(box);
+    body.scrollTop = body.scrollHeight;
+  }
+  function finishTurn() {
+    const txt = curText.trim();
+    if (txt && looksHtml(txt)) {
+      const label = htmlTitle(txt) || "AI 输出";
+      addHtmlTab(txt, label);
+      rm(curBubble);                 // don't show raw HTML in chat
+      addRenderedNote(label);
+    } else if (!txt) {
+      rm(curBubble);                 // tool-only turn: drop the empty answer bubble
+    } else {
+      curBubble.classList.remove("thinking");
+    }
+    curBubble = null;
+    setBusy(false);
+  }
 
   function connectChat() {
     chatWS = new WebSocket(wsURL("/ws/chat"));
     chatWS.onmessage = (e) => {
       const m = JSON.parse(e.data);
-      if (m.type === "start") showThinking();
-      else if (m.type === "answer") {
-        clearThinking();
-        const txt = m.text || "";
-        if (looksHtml(txt)) { const label = htmlTitle(txt) || "AI 输出"; addHtmlTab(txt, label); addRenderedNote(label); }
-        else addMsg("bot", txt || "(空响应)");
-      } else if (m.type === "done") setBusy(false);
-      else if (m.type === "error") { clearThinking(); addMsg("bot", "⚠️ " + m.error); setBusy(false); }
-      else if (m.type === "need_key") { clearThinking(); setBusy(false); openKeyModal(); }
+      switch (m.type) {
+        case "start": startTurn(); break;
+        case "thought": if (curBubble && !curText) curBubble.textContent = "思考中…"; break;
+        case "token": appendToken(m.text || ""); break;
+        case "tool": addToolLine(m); break;
+        case "permission": addPermission(m); break;
+        case "done": finishTurn(); break;
+        case "error": rm(curBubble); curBubble = null; addMsg("bot", "⚠️ " + m.error); setBusy(false); break;
+        case "need_key": rm(curBubble); curBubble = null; setBusy(false); openKeyModal(); break;
+      }
     };
     chatWS.onclose = () => setTimeout(connectChat, 1500);
   }

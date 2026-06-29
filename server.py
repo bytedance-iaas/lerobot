@@ -66,15 +66,6 @@ HTML_DIRECTIVE = (
     "以便直接在面板中渲染。普通问答用简洁排版即可；涉及数据/表格/状态时尽量结构化展示。\n\n"
 )
 
-# The console is single-user: we keep one rolling hermes session id so chat
-# context carries across turns. hermes prints `session_id: <id>` to stderr in
-# quiet mode; we capture it on the first turn and `--resume` it afterwards.
-_SESSION_RE = re.compile(r"session_id:\s*(\S+)")
-_CHAT_STATE: dict[str, str | None] = {"session_id": None}
-# Tri-state cache for "is CHAT_SKILL installed?": None=unknown, True/False once checked.
-# Passing `-s <skill>` for an uninstalled skill makes hermes hard-error
-# ("Unknown skill(s): ...") instead of answering, so we only pass it when present.
-_SKILL_OK: list[bool | None] = [None]
 # Ark / Volcengine OpenAI-compatible endpoint and a sensible default model.
 DEFAULT_BASE_URL = os.environ.get("ARK_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
 DEFAULT_MODEL = os.environ.get("ARK_MODEL", "doubao-seed-2-0-pro-260215")
@@ -159,6 +150,13 @@ async def handle_volcano_key(request: web.Request) -> web.Response:
     except Exception as e:  # noqa: BLE001
         log.exception("failed to set volcano key")
         return web.json_response({"ok": False, "error": str(e)}, status=500)
+    # Restart the persistent agent so a new session uses the new credentials.
+    acp: HermesACP = request.app.get("acp")
+    if acp:
+        try:
+            await acp.restart()
+        except Exception as e:  # noqa: BLE001
+            log.warning("acp restart after key change failed: %s", e)
     return web.json_response({"ok": True, **read_chat_config()})
 
 
@@ -255,97 +253,179 @@ async def handle_term(request: web.Request) -> web.WebSocketResponse:
 
 
 # --------------------------------------------------------------------------- #
-# Chat websocket — bridge to the hermes agent                                 #
+# Chat — one persistent `hermes acp` process, driven over its session API       #
 # --------------------------------------------------------------------------- #
-async def _skill_available() -> bool:
-    """Whether CHAT_SKILL is installed (cached). Empty CHAT_SKILL => disabled."""
-    if not CHAT_SKILL:
-        return False
-    if _SKILL_OK[0] is None:
+# Instead of cold-spawning `hermes chat` per turn (~10s startup each), we launch
+# ONE `hermes acp` process together with the server and talk JSON-RPC to it:
+#   initialize -> session/new (once) -> session/prompt (per turn, streaming).
+# This keeps the agent warm and lets us stream tokens + tool calls live.
+
+class HermesACP:
+    """A persistent hermes ACP (Agent Client Protocol) client over stdio."""
+
+    def __init__(self) -> None:
+        self.proc: asyncio.subprocess.Process | None = None
+        self.session_id: str | None = None
+        self._id = 0
+        self._pending: dict[int, asyncio.Future] = {}
+        self._write_lock = asyncio.Lock()
+        self._start_lock = asyncio.Lock()
+        self._first_turn = True
+        # Per-turn callbacks (single-user console → one active turn at a time):
+        self.on_update = None       # async fn(update dict) — stream notifications
+        self.on_permission = None   # async fn(params) -> optionId|None
+
+    @property
+    def alive(self) -> bool:
+        return self.proc is not None and self.proc.returncode is None
+
+    async def ensure(self) -> None:
+        async with self._start_lock:
+            if self.alive and self.session_id:
+                return
+            await self._spawn()
+
+    async def restart(self) -> None:
+        """Used after the Volcengine key changes (a new session picks it up)."""
+        async with self._start_lock:
+            if self.alive:
+                try:
+                    self.proc.terminate()
+                except ProcessLookupError:
+                    pass
+            self.proc = None
+            self.session_id = None
+            self._first_turn = True
+            await self._spawn()
+
+    async def _spawn(self) -> None:
+        env = dict(os.environ)
+        env["HERMES_ACCEPT_HOOKS"] = "1"
+        env.setdefault("NO_COLOR", "1")
+        self.proc = await asyncio.create_subprocess_exec(
+            HERMES_BIN, "acp", "--accept-hooks",
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL, cwd=WORKDIR, env=env,
+        )
+        self._pending = {}
+        asyncio.create_task(self._read_loop(self.proc))
+        await self._request("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
+        res = await self._request("session/new", {"cwd": WORKDIR, "mcpServers": []})
+        self.session_id = res.get("sessionId")
+        self._first_turn = True
+        log.info("hermes acp ready: session=%s", self.session_id)
+
+    async def _write(self, obj: dict) -> None:
+        async with self._write_lock:
+            self.proc.stdin.write((json.dumps(obj) + "\n").encode())
+            await self.proc.stdin.drain()
+
+    async def _request(self, method: str, params: dict):
+        self._id += 1
+        rid = self._id
+        fut = asyncio.get_event_loop().create_future()
+        self._pending[rid] = fut
+        await self._write({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        return await fut
+
+    async def _read_loop(self, proc: asyncio.subprocess.Process) -> None:
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "id" in msg and ("result" in msg or "error" in msg):
+                fut = self._pending.pop(msg["id"], None)
+                if fut and not fut.done():
+                    fut.set_result(msg.get("result") or {"_error": msg.get("error")})
+            elif msg.get("method") == "session/update":
+                if self.on_update:
+                    try:
+                        await self.on_update(msg["params"].get("update", {}))
+                    except Exception:  # noqa: BLE001
+                        log.debug("on_update failed", exc_info=True)
+            elif msg.get("method") == "session/request_permission":
+                await self._reply_permission(msg)
+            elif "id" in msg:  # server->client request we don't implement (e.g. fs/*)
+                await self._write({"jsonrpc": "2.0", "id": msg["id"],
+                                   "error": {"code": -32601, "message": "unsupported"}})
+        # process exited — drop the session so the next turn respawns
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.set_exception(RuntimeError("hermes acp exited"))
+        self._pending = {}
+        self.session_id = None
+        log.warning("hermes acp process exited")
+
+    async def _reply_permission(self, msg: dict) -> None:
+        params = msg.get("params", {})
+        option_id = None
+        if self.on_permission:
+            try:
+                option_id = await self.on_permission(params)
+            except Exception:  # noqa: BLE001
+                option_id = None
+        outcome = {"outcome": "selected", "optionId": option_id} if option_id else {"outcome": "cancelled"}
+        await self._write({"jsonrpc": "2.0", "id": msg["id"], "result": {"outcome": outcome}})
+
+    async def prompt(self, text: str, on_update, on_permission):
+        await self.ensure()
+        # Steer the agent to answer in HTML once at the start of the session.
+        if self._first_turn:
+            text = HTML_DIRECTIVE + text
+            self._first_turn = False
+        self.on_update = on_update
+        self.on_permission = on_permission
         try:
-            proc = await asyncio.create_subprocess_exec(
-                HERMES_BIN, "skills", "list",
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            return await self._request(
+                "session/prompt",
+                {"sessionId": self.session_id, "prompt": [{"type": "text", "text": text}]},
             )
-            out, _ = await proc.communicate()
-            _SKILL_OK[0] = CHAT_SKILL.lower() in out.decode(errors="replace").lower()
-        except Exception:  # noqa: BLE001
-            _SKILL_OK[0] = False
-        if not _SKILL_OK[0]:
-            log.warning("hermes skill %r not installed — chat runs without it", CHAT_SKILL)
-    return bool(_SKILL_OK[0])
+        finally:
+            self.on_update = None
+            self.on_permission = None
 
 
-def _build_chat_cmd(text: str, resume: str | None, with_skill: bool) -> list[str]:
-    cmd = [
-        HERMES_BIN, "chat",
-        "-q", text,
-        "-Q",          # quiet: final response on stdout, `session_id:` on stderr
-    ]
-    if resume:
-        cmd += ["--resume", resume]  # carry context across turns
-    if with_skill and CHAT_SKILL:
-        cmd += ["-s", CHAT_SKILL]
-    return cmd
-
-
-async def _spawn_hermes(text: str, resume: str | None, with_skill: bool) -> tuple[int, str, str]:
-    env = dict(os.environ)
-    env["HERMES_ACCEPT_HOOKS"] = "1"
-    env.setdefault("NO_COLOR", "1")
-    proc = await asyncio.create_subprocess_exec(
-        *_build_chat_cmd(text, resume, with_skill), cwd=WORKDIR, env=env,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-    )
-    out, err = await proc.communicate()
-    return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
-
-
-async def _run_hermes_turn(ws: web.WebSocketResponse, text: str) -> None:
-    if not read_chat_config()["chat_ready"]:
-        await ws.send_json({"type": "need_key"})
-        return
-
-    await ws.send_json({"type": "start"})
-    resume = _CHAT_STATE["session_id"]
-    with_skill = await _skill_available()
-    # First turn of a session: steer the agent to answer in self-contained HTML so
-    # the left viewer can render it. With --resume the steer persists, so set once.
-    prompt = text if resume else (HTML_DIRECTIVE + text)
-    try:
-        rc, out, err = await _spawn_hermes(prompt, resume, with_skill)
-    except FileNotFoundError:
-        await ws.send_json({"type": "error", "error": f"hermes not found ({HERMES_BIN})"})
-        return
-
-    # Skill vanished between check and run (or list was stale) — retry without it.
-    if with_skill and "Unknown skill" in (out + err):
-        _SKILL_OK[0] = False
-        with_skill = False
-        rc, out, err = await _spawn_hermes(prompt, resume, False)
-
-    # A stale/pruned session id can't be resumed — retry once as a fresh session
-    # (now fresh, so re-apply the HTML steer).
-    if resume and rc != 0 and "No session found" in (out + err):
-        _CHAT_STATE["session_id"] = None
-        rc, out, err = await _spawn_hermes(HTML_DIRECTIVE + text, None, with_skill)
-
-    m = _SESSION_RE.search(err) or _SESSION_RE.search(out)
-    if m:
-        _CHAT_STATE["session_id"] = m.group(1)
-
-    answer = out.strip()
-    if rc != 0 and not answer:
-        await ws.send_json({"type": "error", "error": err.strip() or f"hermes exited with code {rc}"})
-        return
-    await ws.send_json({"type": "answer", "text": answer})
-    await ws.send_json({"type": "done"})
+def _chunk_text(update: dict) -> str:
+    c = update.get("content") or {}
+    return c.get("text", "") if isinstance(c, dict) else ""
 
 
 async def handle_chat(request: web.Request) -> web.WebSocketResponse:
     ws = web.WebSocketResponse(heartbeat=30, max_msg_size=8 * 1024 * 1024)
     await ws.prepare(request)
-    lock = asyncio.Lock()  # serialize turns so the named session stays consistent
+    acp: HermesACP = request.app["acp"]
+    lock = asyncio.Lock()                # one turn at a time per connection
+    perm_waiters: dict[str, asyncio.Future] = {}
+
+    async def on_update(u: dict) -> None:
+        kind = u.get("sessionUpdate")
+        if kind == "agent_message_chunk":
+            await ws.send_json({"type": "token", "text": _chunk_text(u)})
+        elif kind == "agent_thought_chunk":
+            await ws.send_json({"type": "thought", "text": _chunk_text(u)})
+        elif kind in ("tool_call", "tool_call_update"):
+            await ws.send_json({"type": "tool", "title": u.get("title", ""),
+                                "status": u.get("status", ""), "id": u.get("toolCallId", "")})
+
+    async def on_permission(params: dict):
+        # Ask the user (no --yolo): forward options, await their pick.
+        req_id = params.get("toolCall", {}).get("toolCallId") or str(len(perm_waiters))
+        fut = asyncio.get_event_loop().create_future()
+        perm_waiters[req_id] = fut
+        await ws.send_json({"type": "permission", "reqId": req_id,
+                            "title": params.get("toolCall", {}).get("title", "请求授权"),
+                            "options": params.get("options", [])})
+        try:
+            return await asyncio.wait_for(fut, timeout=300)
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            perm_waiters.pop(req_id, None)
+
     try:
         async for msg in ws:
             if msg.type != WSMsgType.TEXT:
@@ -354,16 +434,31 @@ async def handle_chat(request: web.Request) -> web.WebSocketResponse:
                 payload = json.loads(msg.data)
             except json.JSONDecodeError:
                 continue
-            if payload.get("type") == "msg":
-                text = (payload.get("text") or "").strip()
-                if not text:
-                    continue
-                async with lock:
-                    try:
-                        await _run_hermes_turn(ws, text)
-                    except Exception as e:  # noqa: BLE001
-                        log.exception("chat turn failed")
-                        await ws.send_json({"type": "error", "error": str(e)})
+            ptype = payload.get("type")
+            if ptype == "permission_response":
+                fut = perm_waiters.get(payload.get("reqId"))
+                if fut and not fut.done():
+                    fut.set_result(payload.get("optionId"))
+                continue
+            if ptype != "msg":
+                continue
+            text = (payload.get("text") or "").strip()
+            if not text:
+                continue
+            if not read_chat_config()["chat_ready"]:
+                await ws.send_json({"type": "need_key"})
+                continue
+            async with lock:
+                await ws.send_json({"type": "start"})
+                try:
+                    result = await acp.prompt(text, on_update, on_permission)
+                    if isinstance(result, dict) and result.get("_error"):
+                        await ws.send_json({"type": "error", "error": str(result["_error"])})
+                    else:
+                        await ws.send_json({"type": "done", "stopReason": (result or {}).get("stopReason")})
+                except Exception as e:  # noqa: BLE001
+                    log.exception("chat turn failed")
+                    await ws.send_json({"type": "error", "error": str(e)})
     finally:
         if not ws.closed:
             await ws.close()
@@ -537,10 +632,22 @@ async def _redirect_to_slash(request: web.Request) -> web.Response:
 # --------------------------------------------------------------------------- #
 async def _on_startup(app: web.Application) -> None:
     app["proxy_session"] = aiohttp.ClientSession(auto_decompress=True)
+    app["acp"] = HermesACP()
+    # Warm the agent up alongside the server (best-effort; chat also ensures lazily).
+    try:
+        await app["acp"].ensure()
+    except Exception as e:  # noqa: BLE001
+        log.warning("hermes acp warmup failed (will retry on first chat): %s", e)
 
 
 async def _on_cleanup(app: web.Application) -> None:
     await app["proxy_session"].close()
+    acp: HermesACP = app.get("acp")
+    if acp and acp.alive:
+        try:
+            acp.proc.terminate()
+        except ProcessLookupError:
+            pass
 
 
 def build_app() -> web.Application:
