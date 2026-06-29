@@ -43,7 +43,8 @@ Environment knobs:
 | var | default | meaning |
 |---|---|---|
 | `PORT` | `8080` | HTTP port |
-| `CONSOLE_WORKDIR` | cwd | shell + agent working directory |
+| `LEROBOT_HOME` | cwd | shell + agent working dir; exported to all child processes (precedence: `LEROBOT_HOME` > `CONSOLE_WORKDIR` > cwd) |
+| `CONSOLE_WORKDIR` | cwd | fallback working dir if `LEROBOT_HOME` unset |
 | `CONSOLE_SHELL` | `bash` | shell for the PTY console |
 | `HERMES_BIN` | `hermes` | hermes executable |
 | `HERMES_CHAT_SKILL` | `robot_sft` | skill preloaded into chat (empty to disable) |

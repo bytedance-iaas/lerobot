@@ -36,9 +36,9 @@ RUN bash scripts/install_skill.sh || echo "WARN: robot_sft skill install deferre
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh scripts/install_skill.sh
 
-# The PTY console drops the user into the LeRobot working tree.
+# The PTY console + agent operate from LEROBOT_HOME (exported to all children).
 ENV PORT=8080 \
-    CONSOLE_WORKDIR=/workspace/lerobot \
+    LEROBOT_HOME=/workspace/lerobot \
     HERMES_CHAT_SKILL=robot_sft
 
 EXPOSE 8080

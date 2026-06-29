@@ -55,7 +55,12 @@ STATIC = HERE / "static"
 
 PORT = int(os.environ.get("PORT", "8080"))
 SHELL = os.environ.get("CONSOLE_SHELL") or shutil.which("bash") or "/bin/sh"
-WORKDIR = os.environ.get("CONSOLE_WORKDIR", os.environ.get("LEROBOT_HOME", os.getcwd()))
+# Both the shell console and the hermes agent operate from LEROBOT_HOME (the
+# lerobot install/checkout). Precedence: LEROBOT_HOME > CONSOLE_WORKDIR > cwd.
+# We then export LEROBOT_HOME so every child (shell, hermes acp, lerobot CLIs)
+# sees a consistent value even if only CONSOLE_WORKDIR was provided.
+WORKDIR = os.environ.get("LEROBOT_HOME") or os.environ.get("CONSOLE_WORKDIR") or os.getcwd()
+os.environ["LEROBOT_HOME"] = WORKDIR
 HERMES_BIN = os.environ.get("HERMES_BIN") or shutil.which("hermes") or "hermes"
 # Skill to preload so the agent knows how to drive LeRobot SFT (requirement f).
 CHAT_SKILL = os.environ.get("HERMES_CHAT_SKILL", "robot_sft")
@@ -671,13 +676,15 @@ async def _on_startup(app: web.Application) -> None:
     app["proxy_session"] = aiohttp.ClientSession(auto_decompress=True)
     app["acp"] = HermesACP()
     # Only start hermes once a Volcengine key exists, so the agent always boots
-    # WITH credentials. If there's no key yet, we wait: the key submission in chat
-    # (POST /api/volcano-key) starts it. If a key is already configured, warm up now.
+    # WITH credentials. Warm up in the BACKGROUND so the server starts serving the
+    # UI (terminal, viewer) immediately instead of blocking on the ~6s acp boot.
     if read_chat_config()["chat_ready"]:
-        try:
-            await app["acp"].ensure()
-        except Exception as e:  # noqa: BLE001
-            log.warning("hermes acp warmup failed (will retry on first chat): %s", e)
+        async def _warm() -> None:
+            try:
+                await app["acp"].ensure()
+            except Exception as e:  # noqa: BLE001
+                log.warning("hermes acp warmup failed (will retry on first chat): %s", e)
+        app["acp_warm"] = asyncio.create_task(_warm())
     else:
         log.info("no Volcengine key yet — hermes acp will start when the key is set")
 
@@ -709,7 +716,7 @@ def build_app() -> web.Application:
 
 
 def main() -> None:
-    log.info("LeRobot Agent Console on :%s  shell=%s  workdir=%s  hermes=%s", PORT, SHELL, WORKDIR, HERMES_BIN)
+    log.info("LeRobot Agent Console on :%s  shell=%s  LEROBOT_HOME=%s  hermes=%s", PORT, SHELL, WORKDIR, HERMES_BIN)
     web.run_app(build_app(), host="0.0.0.0", port=PORT, access_log=None)
 
 
