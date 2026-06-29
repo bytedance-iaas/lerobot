@@ -633,11 +633,16 @@ async def _redirect_to_slash(request: web.Request) -> web.Response:
 async def _on_startup(app: web.Application) -> None:
     app["proxy_session"] = aiohttp.ClientSession(auto_decompress=True)
     app["acp"] = HermesACP()
-    # Warm the agent up alongside the server (best-effort; chat also ensures lazily).
-    try:
-        await app["acp"].ensure()
-    except Exception as e:  # noqa: BLE001
-        log.warning("hermes acp warmup failed (will retry on first chat): %s", e)
+    # Only start hermes once a Volcengine key exists, so the agent always boots
+    # WITH credentials. If there's no key yet, we wait: the key submission in chat
+    # (POST /api/volcano-key) starts it. If a key is already configured, warm up now.
+    if read_chat_config()["chat_ready"]:
+        try:
+            await app["acp"].ensure()
+        except Exception as e:  # noqa: BLE001
+            log.warning("hermes acp warmup failed (will retry on first chat): %s", e)
+    else:
+        log.info("no Volcengine key yet — hermes acp will start when the key is set")
 
 
 async def _on_cleanup(app: web.Application) -> None:
