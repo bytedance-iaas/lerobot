@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LeRobot · Agent Console</title>
+  <link rel="stylesheet" href="/static/vendor/xterm.css" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <!-- Top bar -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">🤖</span>
+      <span class="brand-name">LeRobot</span>
+      <span class="brand-badge">Agent Console</span>
+      <nav class="crumbs"><span>应用中心</span><span>/</span><span>应用模板</span><span>/</span><b>lerobot</b></nav>
+    </div>
+    <div class="top-right">
+      <span class="node-pill"><i class="dot dot-green"></i> <span id="node-label">console</span> · 已连接</span>
+      <span class="avatar">d</span>
+    </div>
+  </header>
+
+  <main class="grid">
+    <!-- LEFT column -->
+    <section class="col-left">
+      <div class="panel monitor">
+        <div class="panel-head">
+          <div class="tabs">
+            <button class="tab active">Training Monitor</button>
+            <button class="tab">Dataset review</button>
+          </div>
+          <span class="state-pill"><i class="dot dot-grey"></i> <span id="train-state">Idle</span></span>
+        </div>
+        <div class="metrics">
+          <div class="metric"><div class="m-label">Step</div><div class="m-big" id="m-step">0 / 20,000</div><div class="m-bar"><i></i></div></div>
+          <div class="metric"><div class="m-label">Train Loss</div><div class="m-big m-dash">—</div><div class="m-sub">smoothed L1+MSE</div></div>
+          <div class="metric"><div class="m-label">Held-out MSE</div><div class="m-big m-dash">—</div><div class="m-sub">best —</div></div>
+          <div class="metric"><div class="m-label">Throughput</div><div class="m-big m-dash">—</div><div class="m-sub">ETA —</div></div>
+        </div>
+        <div class="chart">
+          <div class="chart-head"><b>Loss curves</b>
+            <span class="legend"><i class="lg lg-blue"></i>train <i class="lg lg-purple"></i>held-out</span>
+          </div>
+          <div class="chart-empty">
+            <div class="spark">📈</div>
+            <p>暂无训练任务 — 在右侧让 Agent 启动，或在下方控制台运行</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- linux console -->
+      <div class="panel console">
+        <div class="console-head">
+          <span class="ch-title">⌨ linux console</span>
+          <span class="ch-sub">bash · <span id="term-host">lerobot</span></span>
+          <button class="ch-clear" id="term-clear">clear</button>
+        </div>
+        <div id="terminal"></div>
+      </div>
+    </section>
+
+    <!-- RIGHT column: chat -->
+    <aside class="col-right panel chat">
+      <div class="chat-head">
+        <span class="chat-logo">🤖</span>
+        <div class="chat-title">
+          <b>Messages</b>
+          <span class="chat-sub">LeRobot Agent · <span id="chat-model">hermes</span></span>
+        </div>
+        <i class="dot dot-green chat-status" id="chat-status" title="agent"></i>
+        <button class="chat-gear" id="chat-gear" title="设置火山 API Key">⚙</button>
+      </div>
+
+      <div class="chat-body" id="chat-body">
+        <div class="msg msg-bot">
+          <span class="msg-ava">L</span>
+          <div class="bubble">你好 👋 我是 LeRobot Agent。我可以帮你启动训练、评估 checkpoint、检查数据集，或直接在控制台执行命令。<br/>试试说「探索数据集并规划一次 SFT」。</div>
+        </div>
+      </div>
+
+      <div class="chat-quick" id="chat-quick">
+        <button class="q q-orange" data-q="探索当前 LeRobot 数据集并规划一次 SFT 训练">规划 SFT 训练</button>
+        <button class="q q-blue" data-q="评估最新的 checkpoint 并给出指标">评估 checkpoint</button>
+        <button class="q q-purple" data-q="列出可用的数据集并展示其结构">查看数据集</button>
+        <button class="q q-grey" data-q="停止当前正在运行的训练">停止训练</button>
+      </div>
+
+      <div class="chat-input">
+        <textarea id="chat-text" rows="1" placeholder="让 Agent 帮你训练、评估、检查数据集…"></textarea>
+        <button id="chat-send" class="send-btn" title="发送">➤</button>
+      </div>
+    </aside>
+  </main>
+
+  <!-- Volcengine API key modal (first time chat is opened) -->
+  <div class="modal-mask" id="key-modal" hidden>
+    <div class="modal">
+      <h3>设置火山方舟 API Key</h3>
+      <p class="modal-desc">首次使用 Agent 聊天需要填入火山方舟（Volcengine Ark）的 API Key。<b>仅用于 chat，不影响终端与其他功能。</b></p>
+      <label>API Key</label>
+      <input id="key-input" type="password" placeholder="例如 88ede0ee-xxxx-xxxx-xxxx-xxxxxxxxxxxx" autocomplete="off" />
+      <details class="modal-adv">
+        <summary>高级（可选）</summary>
+        <label>Base URL</label>
+        <input id="key-baseurl" type="text" placeholder="https://ark.cn-beijing.volces.com/api/v3" />
+        <label>模型</label>
+        <input id="key-model" type="text" placeholder="doubao-seed-2-0-pro-260215" />
+      </details>
+      <div class="modal-err" id="key-err" hidden></div>
+      <div class="modal-actions">
+        <button class="btn-ghost" id="key-cancel">取消</button>
+        <button class="btn-primary" id="key-save">保存并开始</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/vendor/xterm.js"></script>
+  <script src="/static/vendor/addon-fit.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
