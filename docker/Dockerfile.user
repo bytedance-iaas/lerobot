@@ -58,9 +58,10 @@ ENV HOME=/home/user_lerobot \
 # Dockerfile ENV (not a pipeline variable): Volcengine CP discontinued injecting
 # pipeline env vars into Dockerfile builds, so a UV_DEFAULT_INDEX pipeline variable
 # never reaches this RUN layer. mirrors.ivolces.com is the internal address (same
-# network as the build cluster — no public egress); use mirrors.volces.com if
-# building outside Volcengine.
-ENV UV_DEFAULT_INDEX=https://mirrors.ivolces.com/pypi/simple/
+# network as the build cluster — no public egress). This must match the index
+# uv.lock was generated against (re-lock with the same UV_DEFAULT_INDEX), since
+# `uv sync --locked` downloads from the URLs recorded in the lockfile.
+ENV UV_DEFAULT_INDEX=https://mirrors.volces.com/pypi/simple/
 
 # Create the virtual environment
 # We use a virtual environment inside the container—even though the container itself \
