@@ -14,7 +14,6 @@
       <span class="logo">🤖</span>
       <span class="brand-name">LeRobot</span>
       <span class="brand-badge">Agent Console</span>
-      <nav class="crumbs"><span>应用中心</span><span>/</span><span>应用模板</span><span>/</span><b>lerobot</b></nav>
     </div>
     <div class="top-right">
       <span class="node-pill"><i class="dot dot-green"></i> <span id="node-label">console</span> · 已连接</span>
@@ -22,36 +21,57 @@
     </div>
   </header>
 
-  <main class="grid">
-    <!-- LEFT column -->
-    <section class="col-left">
-      <div class="panel monitor">
-        <div class="panel-head">
-          <div class="tabs">
-            <button class="tab active">Training Monitor</button>
-            <button class="tab">Dataset review</button>
+  <main class="grid" id="grid">
+    <!-- LEFT column: a browser-like viewer over the console -->
+    <section class="col-left" id="col-left">
+      <div class="panel viewer" id="viewer">
+        <div class="viewer-bar">
+          <div class="viewer-tabs" id="viewer-tabs">
+            <button class="vtab active" data-tab="home">概览</button>
           </div>
-          <span class="state-pill"><i class="dot dot-grey"></i> <span id="train-state">Idle</span></span>
+          <div class="viewer-actions">
+            <button class="vadd" id="viewer-add" title="打开服务 / 网址">＋ 打开</button>
+          </div>
         </div>
-        <div class="metrics">
-          <div class="metric"><div class="m-label">Step</div><div class="m-big" id="m-step">0 / 20,000</div><div class="m-bar"><i></i></div></div>
-          <div class="metric"><div class="m-label">Train Loss</div><div class="m-big m-dash">—</div><div class="m-sub">smoothed L1+MSE</div></div>
-          <div class="metric"><div class="m-label">Held-out MSE</div><div class="m-big m-dash">—</div><div class="m-sub">best —</div></div>
-          <div class="metric"><div class="m-label">Throughput</div><div class="m-big m-dash">—</div><div class="m-sub">ETA —</div></div>
+
+        <div class="viewer-body" id="viewer-body">
+          <!-- default "home" pane: lightweight overview (not a fixed feature) -->
+          <div class="vpane active" data-pane="home">
+            <div class="metrics">
+              <div class="metric"><div class="m-label">Step</div><div class="m-big" id="m-step">0 / 20,000</div><div class="m-bar"><i></i></div></div>
+              <div class="metric"><div class="m-label">Train Loss</div><div class="m-big m-dash">—</div><div class="m-sub">smoothed L1+MSE</div></div>
+              <div class="metric"><div class="m-label">Held-out MSE</div><div class="m-big m-dash">—</div><div class="m-sub">best —</div></div>
+              <div class="metric"><div class="m-label">Throughput</div><div class="m-big m-dash">—</div><div class="m-sub">ETA —</div></div>
+            </div>
+            <div class="chart">
+              <div class="chart-head"><b>面板</b>
+                <span class="legend">Agent 的 HTML 输出与控制台里启动的服务都会作为标签页出现在这里</span>
+              </div>
+              <div class="chart-empty">
+                <div class="spark">🗂️</div>
+                <p>像浏览器一样：右侧让 Agent 生成 HTML、或在下方控制台启动一个 web 服务，<br/>再点上方「＋ 打开」把它作为标签页查看。</p>
+              </div>
+            </div>
+          </div>
+          <!-- dynamic panes (iframes for html artifacts / proxied services) injected here -->
         </div>
-        <div class="chart">
-          <div class="chart-head"><b>Loss curves</b>
-            <span class="legend"><i class="lg lg-blue"></i>train <i class="lg lg-purple"></i>held-out</span>
-          </div>
-          <div class="chart-empty">
-            <div class="spark">📈</div>
-            <p>暂无训练任务 — 在右侧让 Agent 启动，或在下方控制台运行</p>
-          </div>
+
+        <!-- "open" popover: discovered services + manual address -->
+        <div class="open-menu" id="open-menu" hidden>
+          <div class="om-head">控制台中发现的服务</div>
+          <div class="om-list" id="om-list"><div class="om-empty">（暂无，刷新中…）</div></div>
+          <form class="om-form" id="om-form">
+            <input id="om-url" placeholder="localhost:7000 / http://… / 端口号" autocomplete="off" />
+            <button type="submit">打开</button>
+          </form>
         </div>
       </div>
 
+      <!-- draggable splitter (viewer <-> console) -->
+      <div class="splitter-h" id="splitter-h" title="拖动调整高度"></div>
+
       <!-- linux console -->
-      <div class="panel console">
+      <div class="panel console" id="console">
         <div class="console-head">
           <span class="ch-title">⌨ linux console</span>
           <span class="ch-sub">bash · <span id="term-host">lerobot</span></span>
@@ -61,8 +81,11 @@
       </div>
     </section>
 
+    <!-- draggable splitter (left <-> chat) -->
+    <div class="splitter-v" id="splitter-v" title="拖动调整宽度"></div>
+
     <!-- RIGHT column: chat -->
-    <aside class="col-right panel chat">
+    <aside class="col-right panel chat" id="chat">
       <div class="chat-head">
         <span class="chat-logo">🤖</span>
         <div class="chat-title">
@@ -76,7 +99,7 @@
       <div class="chat-body" id="chat-body">
         <div class="msg msg-bot">
           <span class="msg-ava">L</span>
-          <div class="bubble">你好 👋 我是 LeRobot Agent。我可以帮你启动训练、评估 checkpoint、检查数据集，或直接在控制台执行命令。<br/>试试说「探索数据集并规划一次 SFT」。</div>
+          <div class="bubble">你好 👋 我是 LeRobot Agent。我可以帮你启动训练、评估 checkpoint、检查数据集，或直接在控制台执行命令。<br/>我的回答会以 HTML 渲染在左侧面板。试试说「探索数据集并规划一次 SFT」。</div>
         </div>
       </div>
 

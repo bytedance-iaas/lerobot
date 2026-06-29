@@ -47,17 +47,61 @@ body {
 .dot-green { background: var(--green); box-shadow: 0 0 0 3px rgba(34,197,94,.18); }
 .dot-grey { background: #c2c7d2; }
 
-/* layout */
+/* layout — columns/rows driven by CSS vars so splitters can resize them */
 .grid {
   flex: 1; min-height: 0;
-  display: grid; grid-template-columns: 1fr 410px; gap: 20px; padding: 20px 24px;
+  display: grid;
+  grid-template-columns: minmax(280px, var(--left, 1fr)) 8px minmax(320px, var(--right, 410px));
+  padding: 16px 18px;
 }
-.col-left { display: flex; flex-direction: column; gap: 20px; min-height: 0; }
+.col-left { display: flex; flex-direction: column; min-height: 0; }
 .panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
   box-shadow: var(--shadow); }
 
-/* monitor */
-.monitor { padding: 20px 22px; }
+/* splitters */
+.splitter-v { cursor: col-resize; align-self: stretch; border-radius: 6px; }
+.splitter-h { height: 8px; cursor: row-resize; flex: 0 0 8px; border-radius: 6px; }
+.splitter-v:hover, .splitter-h:hover, .splitting .splitter-v, .splitting .splitter-h { background: #dfe3ea; }
+.splitting { user-select: none; cursor: inherit; }
+.splitting iframe { pointer-events: none; }  /* let drag cross iframes */
+
+/* viewer (browser-like tabbed area) */
+.viewer { flex: 0 0 var(--viewer-h, 46%); display: flex; flex-direction: column; overflow: hidden; min-height: 90px; }
+.viewer-bar { display: flex; align-items: center; gap: 8px; padding: 8px 10px 0; border-bottom: 1px solid var(--line); }
+.viewer-tabs { display: flex; gap: 4px; overflow-x: auto; flex: 1; scrollbar-width: thin; }
+.vtab { border: 1px solid transparent; background: transparent; font-size: 13px; color: var(--muted);
+  cursor: pointer; padding: 7px 12px; border-radius: 9px 9px 0 0; font-weight: 600; white-space: nowrap;
+  display: flex; align-items: center; gap: 7px; max-width: 220px; }
+.vtab.active { color: var(--ink); background: #f6f7f9; border-color: var(--line); border-bottom-color: #f6f7f9; }
+.vtab .vt-label { overflow: hidden; text-overflow: ellipsis; }
+.vtab .vt-close { border: 0; background: transparent; color: var(--muted); cursor: pointer; font-size: 14px;
+  line-height: 1; padding: 0 2px; border-radius: 4px; }
+.vtab .vt-close:hover { background: #e6e8ee; color: var(--ink); }
+.vtab .vt-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); flex: 0 0 auto; }
+.viewer-actions { display: flex; align-items: center; gap: 8px; padding-bottom: 6px; }
+.vadd { border: 1px solid var(--line); background: #fff; border-radius: 9px; padding: 6px 11px;
+  font-size: 12.5px; color: #4b5160; cursor: pointer; white-space: nowrap; }
+.vadd:hover { background: #f6f7f9; }
+
+.viewer-body { position: relative; flex: 1; min-height: 0; overflow: auto; }
+.vpane { display: none; height: 100%; }
+.vpane.active { display: block; }
+.vpane[data-pane="home"] { padding: 18px 20px; overflow: auto; }
+.vpane iframe { width: 100%; height: 100%; border: 0; background: #fff; display: block; }
+
+/* "open" popover */
+.open-menu { position: absolute; top: 46px; right: 14px; width: 320px; background: #fff;
+  border: 1px solid var(--line); border-radius: 14px; box-shadow: 0 16px 40px rgba(20,24,40,.18); z-index: 30; padding: 12px; }
+.om-head { font-size: 12px; color: var(--muted); margin: 2px 4px 8px; }
+.om-list { max-height: 200px; overflow: auto; display: flex; flex-direction: column; gap: 4px; }
+.om-item { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 9px; cursor: pointer; font-size: 13px; }
+.om-item:hover { background: #f6f7f9; }
+.om-item .om-port { font-weight: 700; font-variant-numeric: tabular-nums; }
+.om-item .om-proc { color: var(--muted); margin-left: auto; font-size: 12px; }
+.om-empty { color: var(--muted); font-size: 12.5px; padding: 10px; text-align: center; }
+.om-form { display: flex; gap: 6px; margin-top: 10px; border-top: 1px solid var(--line); padding-top: 10px; }
+.om-form input { flex: 1; border: 1px solid var(--line); border-radius: 9px; padding: 8px 10px; font: inherit; outline: none; }
+.om-form button { border: 0; background: var(--orange); color: #fff; border-radius: 9px; padding: 8px 14px; cursor: pointer; }
 .panel-head { display: flex; align-items: center; justify-content: space-between; }
 .tabs { display: flex; gap: 18px; }
 .tab { border: 0; background: transparent; font-size: 15px; color: var(--muted); cursor: pointer;
