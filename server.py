@@ -449,7 +449,10 @@ async def handle_chat(request: web.Request) -> web.WebSocketResponse:
                 await ws.send_json({"type": "need_key"})
                 continue
             async with lock:
-                await ws.send_json({"type": "start"})
+                # Booting = hermes not up yet (first turn / after a respawn): the
+                # ensure() inside prompt() will spend a few seconds starting it.
+                booting = not (acp.alive and acp.session_id)
+                await ws.send_json({"type": "start", "booting": booting})
                 try:
                     result = await acp.prompt(text, on_update, on_permission)
                     if isinstance(result, dict) and result.get("_error"):

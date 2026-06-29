@@ -226,11 +226,11 @@
   let curBubble = null, curText = "", toolEls = {};
   function rm(el) { if (el) el.closest(".msg").remove(); }
 
-  function startTurn() {
+  function startTurn(booting) {
     curText = ""; toolEls = {};
     curBubble = addMsg("bot", "");
     curBubble.classList.add("thinking");
-    curBubble.textContent = "思考中";
+    curBubble.textContent = booting ? "正在启动 Agent" : "思考中";
   }
   function appendToken(t) {
     if (!curBubble) startTurn();
@@ -295,7 +295,7 @@
     chatWS.onmessage = (e) => {
       const m = JSON.parse(e.data);
       switch (m.type) {
-        case "start": startTurn(); break;
+        case "start": startTurn(m.booting); break;
         case "thought": if (curBubble && !curText) curBubble.textContent = "思考中…"; break;
         case "token": appendToken(m.text || ""); break;
         case "tool": addToolLine(m); break;
@@ -337,7 +337,7 @@
   saveBtn.onclick = async () => {
     const api_key = keyInput.value.trim();
     if (!api_key) { keyErr.textContent = "请输入 API Key"; keyErr.hidden = false; return; }
-    saveBtn.disabled = true; saveBtn.textContent = "保存中…";
+    saveBtn.disabled = true; saveBtn.textContent = "正在启动 Agent…";
     try {
       const r = await fetch("/api/volcano-key", {
         method: "POST", headers: { "Content-Type": "application/json" },
