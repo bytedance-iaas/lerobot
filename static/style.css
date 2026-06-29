@@ -134,6 +134,7 @@ body {
 
 /* modal */
 .modal-mask { position: fixed; inset: 0; background: rgba(20,24,40,.4); display: grid; place-items: center; z-index: 50; }
+.modal-mask[hidden] { display: none; }  /* the `hidden` attr must beat display:grid above */
 .modal { width: 440px; max-width: calc(100vw - 32px); background: #fff; border-radius: 18px; padding: 26px; box-shadow: 0 20px 60px rgba(0,0,0,.25); }
 .modal h3 { margin: 0 0 8px; font-size: 19px; }
 .modal-desc { color: #5b616f; font-size: 13.5px; margin: 0 0 18px; }
