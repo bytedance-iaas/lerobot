@@ -33,7 +33,9 @@ in a minimal image.
 from __future__ import annotations
 
 import asyncio
+import base64
 import fcntl
+import hmac
 import json
 import logging
 import os
@@ -62,6 +64,12 @@ SHELL = os.environ.get("CONSOLE_SHELL") or shutil.which("bash") or "/bin/sh"
 WORKDIR = os.environ.get("LEROBOT_HOME") or os.environ.get("CONSOLE_WORKDIR") or os.getcwd()
 os.environ["LEROBOT_HOME"] = WORKDIR
 HERMES_BIN = os.environ.get("HERMES_BIN") or shutil.which("hermes") or "hermes"
+# Single-user HTTP Basic auth, credentials from the environment. When both are
+# set, EVERY route (page, static, WS, proxy) requires them; otherwise the console
+# is open (logged as a warning). This is a single account by design.
+AUTH_USER = os.environ.get("CONSOLE_USER") or os.environ.get("AUTH_USER") or ""
+AUTH_PASS = os.environ.get("CONSOLE_PASSWORD") or os.environ.get("AUTH_PASSWORD") or ""
+AUTH_ENABLED = bool(AUTH_USER and AUTH_PASS)
 # Skill to preload so the agent knows how to drive LeRobot SFT (requirement f).
 CHAT_SKILL = os.environ.get("HERMES_CHAT_SKILL", "robot_sft")
 
@@ -427,6 +435,15 @@ class HermesACP:
             self.on_update = None
             self.on_permission = None
 
+    async def cancel(self) -> None:
+        """Interrupt the current turn (ACP notification, no response expected).
+
+        The in-flight session/prompt then returns with stopReason="cancelled".
+        """
+        if self.alive and self.session_id:
+            await self._write({"jsonrpc": "2.0", "method": "session/cancel",
+                               "params": {"sessionId": self.session_id}})
+
 
 def _chunk_text(update: dict) -> str:
     c = update.get("content") or {}
@@ -437,8 +454,8 @@ async def handle_chat(request: web.Request) -> web.WebSocketResponse:
     ws = web.WebSocketResponse(heartbeat=30, max_msg_size=8 * 1024 * 1024)
     await ws.prepare(request)
     acp: HermesACP = request.app["acp"]
-    lock = asyncio.Lock()                # one turn at a time per connection
     perm_waiters: dict[str, asyncio.Future] = {}
+    turn: dict[str, asyncio.Task | None] = {"task": None}
 
     async def on_update(u: dict) -> None:
         kind = u.get("sessionUpdate")
@@ -465,6 +482,20 @@ async def handle_chat(request: web.Request) -> web.WebSocketResponse:
         finally:
             perm_waiters.pop(req_id, None)
 
+    async def run_turn(text: str) -> None:
+        # Booting = hermes not up yet (first turn / after a respawn): the
+        # ensure() inside prompt() will spend a few seconds starting it.
+        await ws.send_json({"type": "start", "booting": not (acp.alive and acp.session_id)})
+        try:
+            result = await acp.prompt(text, on_update, on_permission)
+            if isinstance(result, dict) and result.get("_error"):
+                await ws.send_json({"type": "error", "error": str(result["_error"])})
+            else:
+                await ws.send_json({"type": "done", "stopReason": (result or {}).get("stopReason")})
+        except Exception as e:  # noqa: BLE001
+            log.exception("chat turn failed")
+            await ws.send_json({"type": "error", "error": str(e)})
+
     try:
         async for msg in ws:
             if msg.type != WSMsgType.TEXT:
@@ -479,29 +510,26 @@ async def handle_chat(request: web.Request) -> web.WebSocketResponse:
                 if fut and not fut.done():
                     fut.set_result(payload.get("optionId"))
                 continue
+            if ptype == "stop":
+                # Interrupt the running turn; the prompt resolves with "cancelled".
+                await acp.cancel()
+                continue
             if ptype != "msg":
                 continue
             text = (payload.get("text") or "").strip()
             if not text:
                 continue
+            if turn["task"] and not turn["task"].done():
+                continue  # a turn is already running (UI shows stop, not send)
             if not read_chat_config()["chat_ready"]:
                 await ws.send_json({"type": "need_key"})
                 continue
-            async with lock:
-                # Booting = hermes not up yet (first turn / after a respawn): the
-                # ensure() inside prompt() will spend a few seconds starting it.
-                booting = not (acp.alive and acp.session_id)
-                await ws.send_json({"type": "start", "booting": booting})
-                try:
-                    result = await acp.prompt(text, on_update, on_permission)
-                    if isinstance(result, dict) and result.get("_error"):
-                        await ws.send_json({"type": "error", "error": str(result["_error"])})
-                    else:
-                        await ws.send_json({"type": "done", "stopReason": (result or {}).get("stopReason")})
-                except Exception as e:  # noqa: BLE001
-                    log.exception("chat turn failed")
-                    await ws.send_json({"type": "error", "error": str(e)})
+            # Run the turn as a task so this loop keeps reading (stop / permission).
+            turn["task"] = asyncio.create_task(run_turn(text))
     finally:
+        t = turn["task"]
+        if t and not t.done():
+            t.cancel()
         if not ws.closed:
             await ws.close()
     return ws
@@ -670,6 +698,78 @@ async def _redirect_to_slash(request: web.Request) -> web.Response:
 
 
 # --------------------------------------------------------------------------- #
+# Auth (single-user HTTP Basic) + single-session lock                          #
+# --------------------------------------------------------------------------- #
+@web.middleware
+async def auth_middleware(request: web.Request, handler):
+    if AUTH_ENABLED:
+        hdr = request.headers.get("Authorization", "")
+        ok = False
+        if hdr.startswith("Basic "):
+            try:
+                user, _, pw = base64.b64decode(hdr[6:]).decode("utf-8", "replace").partition(":")
+                ok = hmac.compare_digest(user, AUTH_USER) and hmac.compare_digest(pw, AUTH_PASS)
+            except Exception:  # noqa: BLE001
+                ok = False
+        if not ok:
+            return web.Response(
+                status=401, text="Authentication required",
+                headers={"WWW-Authenticate": 'Basic realm="LeRobot Agent Console"'},
+            )
+    return await handler(request)
+
+
+async def handle_control(request: web.Request) -> web.WebSocketResponse:
+    """Single-session presence lock: only one open console at a time.
+
+    The page opens this on load. The first holder is granted; a second open is
+    denied (can request takeover, which evicts the current holder).
+    """
+    ws = web.WebSocketResponse(heartbeat=20)
+    await ws.prepare(request)
+    app = request.app
+
+    def occupied() -> bool:
+        cur = app.get("session_ws")
+        return cur is not None and cur is not ws and not cur.closed
+
+    async def grant() -> None:
+        app["session_ws"] = ws
+        await ws.send_json({"type": "granted"})
+
+    if occupied():
+        await ws.send_json({"type": "denied"})
+    else:
+        await grant()
+
+    try:
+        async for msg in ws:
+            if msg.type != WSMsgType.TEXT:
+                if msg.type in (WSMsgType.CLOSE, WSMsgType.ERROR):
+                    break
+                continue
+            try:
+                d = json.loads(msg.data)
+            except json.JSONDecodeError:
+                continue
+            if d.get("type") == "takeover":
+                old = app.get("session_ws")
+                if old is not None and old is not ws and not old.closed:
+                    try:
+                        await old.send_json({"type": "evicted"})
+                        await old.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                await grant()
+    finally:
+        if app.get("session_ws") is ws:
+            app["session_ws"] = None
+        if not ws.closed:
+            await ws.close()
+    return ws
+
+
+# --------------------------------------------------------------------------- #
 # App                                                                         #
 # --------------------------------------------------------------------------- #
 async def _on_startup(app: web.Application) -> None:
@@ -700,13 +800,15 @@ async def _on_cleanup(app: web.Application) -> None:
 
 
 def build_app() -> web.Application:
-    app = web.Application()
+    app = web.Application(middlewares=[auth_middleware])
+    app["session_ws"] = None
     app.on_startup.append(_on_startup)
     app.on_cleanup.append(_on_cleanup)
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/status", handle_status)
     app.router.add_get("/api/services", handle_services)
     app.router.add_post("/api/volcano-key", handle_volcano_key)
+    app.router.add_get("/ws/control", handle_control)
     app.router.add_get("/ws/term", handle_term)
     app.router.add_get("/ws/chat", handle_chat)
     app.router.add_get(r"/proxy/{port:\d+}", _redirect_to_slash)
@@ -717,6 +819,10 @@ def build_app() -> web.Application:
 
 def main() -> None:
     log.info("LeRobot Agent Console on :%s  shell=%s  LEROBOT_HOME=%s  hermes=%s", PORT, SHELL, WORKDIR, HERMES_BIN)
+    if AUTH_ENABLED:
+        log.info("auth: single-user HTTP Basic ENABLED (user=%s)", AUTH_USER)
+    else:
+        log.warning("auth: DISABLED — set CONSOLE_USER + CONSOLE_PASSWORD to protect the console")
     web.run_app(build_app(), host="0.0.0.0", port=PORT, access_log=None)
 
 

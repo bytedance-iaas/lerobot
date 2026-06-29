@@ -79,6 +79,11 @@
           <span class="chat-sub">LeRobot Agent · <span id="chat-model">hermes</span></span>
         </div>
         <i class="dot dot-green chat-status" id="chat-status" title="agent"></i>
+        <label class="html-toggle" title="开启后，HTML 回答渲染到左侧面板；关闭则内联显示在聊天中">
+          <input type="checkbox" id="html-toggle" checked />
+          <span class="ht-track"><span class="ht-thumb"></span></span>
+          <span class="ht-label">面板渲染</span>
+        </label>
         <button class="chat-gear" id="chat-gear" title="设置火山 API Key">⚙</button>
       </div>
 
@@ -102,6 +107,16 @@
       </div>
     </aside>
   </main>
+
+  <!-- single-session lock overlay (shown when console already open elsewhere) -->
+  <div class="session-mask" id="session-mask" hidden>
+    <div class="session-card">
+      <div class="ve-icon">🔒</div>
+      <h3 id="session-title">控制台已在其他窗口打开</h3>
+      <p id="session-desc">为避免冲突，这个控制台同一时间只允许一个窗口。</p>
+      <button class="btn-primary" id="session-takeover">在此窗口打开（断开其他）</button>
+    </div>
+  </div>
 
   <!-- Volcengine API key modal (first time chat is opened) -->
   <div class="modal-mask" id="key-modal" hidden>

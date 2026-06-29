@@ -9,6 +9,7 @@
   "use strict";
   const $ = (id) => document.getElementById(id);
   const wsURL = (p) => (location.protocol === "https:" ? "wss://" : "ws://") + location.host + p;
+  let sessionActive = false;   // single-session lock: only reconnect WS while we hold it
 
   /* ----------------------------------------------------------------- terminal */
   const term = new Terminal({
@@ -30,8 +31,9 @@
     termWS.onopen = () => sendResize();
     termWS.onmessage = (e) => term.write(typeof e.data === "string" ? e.data : new Uint8Array(e.data));
     termWS.onclose = () => {
+      if (!sessionActive) return;
       term.write("\r\n\x1b[33m[console disconnected — reconnecting…]\x1b[0m\r\n");
-      setTimeout(connectTerm, 1500);
+      setTimeout(() => sessionActive && connectTerm(), 1500);
     };
   }
   function sendResize() {
@@ -41,7 +43,6 @@
   term.onData((d) => { if (termWS && termWS.readyState === 1) termWS.send(JSON.stringify({ type: "input", data: d })); });
   window.addEventListener("resize", refit);
   $("term-clear").onclick = () => term.clear();
-  connectTerm();
 
   /* ------------------------------------------------------------------- viewer */
   const viewerTabs = $("viewer-tabs"), viewerBody = $("viewer-body"), viewerEmpty = $("viewer-empty");
@@ -220,7 +221,16 @@
     b.style.color = "#2563eb";
     b.style.cursor = "default";
   }
-  function setBusy(b) { busy = b; sendBtn.disabled = b; }
+  function setBusy(b) {
+    busy = b;
+    sendBtn.disabled = false;                 // stays clickable so it can stop
+    sendBtn.classList.toggle("is-stop", b);
+    sendBtn.textContent = b ? "■" : "➤";
+    sendBtn.title = b ? "停止" : "发送";
+  }
+  function stopTurn() {
+    if (chatWS && chatWS.readyState === 1) chatWS.send(JSON.stringify({ type: "stop" }));
+  }
 
   // streaming-turn state
   let curBubble = null, curText = "", toolEls = {};
@@ -277,10 +287,17 @@
   function finishTurn() {
     const txt = curText.trim();
     if (txt && looksHtml(txt)) {
-      const label = htmlTitle(txt) || "AI 输出";
-      addHtmlTab(txt, label);
-      rm(curBubble);                 // don't show raw HTML in chat
-      addRenderedNote(label);
+      if (htmlToViewer()) {
+        const label = htmlTitle(txt) || "AI 输出";
+        addHtmlTab(txt, label);
+        rm(curBubble);               // rendered in the left panel instead
+        addRenderedNote(label);
+      } else {
+        // toggle off → render the HTML inline in the chat bubble
+        curBubble.classList.remove("thinking");
+        curBubble.classList.add("html-inline");
+        curBubble.innerHTML = txt;
+      }
     } else if (!txt) {
       rm(curBubble);                 // tool-only turn: drop the empty answer bubble
     } else {
@@ -305,9 +322,14 @@
         case "need_key": rm(curBubble); curBubble = null; setBusy(false); openKeyModal(); break;
       }
     };
-    chatWS.onclose = () => setTimeout(connectChat, 1500);
+    chatWS.onclose = () => { if (sessionActive) setTimeout(() => sessionActive && connectChat(), 1500); };
   }
-  connectChat();
+
+  // HTML-render toggle: ON → answers render in the left viewer; OFF → inline in chat.
+  const htmlToggle = $("html-toggle");
+  htmlToggle.checked = localStorage.getItem("htmlToViewer") !== "0";
+  htmlToggle.onchange = () => localStorage.setItem("htmlToViewer", htmlToggle.checked ? "1" : "0");
+  function htmlToViewer() { return htmlToggle.checked; }
 
   function send() {
     const text = textEl.value.trim();
@@ -319,7 +341,7 @@
     if (chatWS.readyState !== 1) connectChat();
     chatWS.send(JSON.stringify({ type: "msg", text }));
   }
-  sendBtn.onclick = send;
+  sendBtn.onclick = () => { if (busy) stopTurn(); else send(); };
   textEl.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
   textEl.addEventListener("input", () => { textEl.style.height = "auto"; textEl.style.height = Math.min(textEl.scrollHeight, 140) + "px"; });
   $("chat-quick").addEventListener("click", (e) => {
@@ -376,9 +398,11 @@
   }
   const grid = $("grid"), viewer = $("viewer"), colLeft = $("col-left");
   dragSplit($("splitter-v"), (e) => {
+    // Resize the chat (right) column; the left stays 1fr so the app always
+    // fills the viewport at any window width.
     const r = grid.getBoundingClientRect();
-    const left = Math.max(280, Math.min(e.clientX - r.left, r.width - 340));
-    grid.style.setProperty("--left", left + "px");
+    const right = Math.max(300, Math.min(r.right - e.clientX, r.width - 380));
+    grid.style.setProperty("--right", right + "px");
   });
   dragSplit($("splitter-h"), (e) => {
     const r = colLeft.getBoundingClientRect();
@@ -388,9 +412,49 @@
   });
 
   /* ------------------------------------------------------------------ status */
-  fetch("/api/status").then((r) => r.json()).then((s) => {
-    chatReady = !!s.chat_ready;
-    if (s.model) $("chat-model").textContent = s.model;
-    $("chat-status").style.background = chatReady ? "" : "#c2c7d2";
-  }).catch(() => {});
+  function fetchStatus() {
+    fetch("/api/status").then((r) => r.json()).then((s) => {
+      chatReady = !!s.chat_ready;
+      if (s.model) $("chat-model").textContent = s.model;
+      $("chat-status").style.background = chatReady ? "" : "#c2c7d2";
+    }).catch(() => {});
+  }
+
+  /* --------------------------------------------- single-session presence lock */
+  const sessionMask = $("session-mask");
+  let controlWS, evicted = false;
+  function showMask(title, desc, canTakeover) {
+    $("session-title").textContent = title;
+    $("session-desc").textContent = desc;
+    $("session-takeover").hidden = !canTakeover;
+    sessionMask.hidden = false;
+  }
+  function startApp() {
+    sessionActive = true;
+    sessionMask.hidden = true;
+    if (!termWS || termWS.readyState > 1) connectTerm();
+    if (!chatWS || chatWS.readyState > 1) connectChat();
+    fetchStatus();
+  }
+  function connectControl() {
+    controlWS = new WebSocket(wsURL("/ws/control"));
+    controlWS.onmessage = (e) => {
+      const m = JSON.parse(e.data);
+      if (m.type === "granted") { evicted = false; startApp(); }
+      else if (m.type === "denied") {
+        sessionActive = false;
+        showMask("控制台已在其他窗口打开", "为避免冲突，这个控制台同一时间只允许一个窗口。", true);
+      } else if (m.type === "evicted") {
+        evicted = true; sessionActive = false;
+        try { termWS && termWS.close(); chatWS && chatWS.close(); } catch (_) {}
+        showMask("此会话已被接管", "你已在另一个窗口打开了控制台。", true);
+      }
+    };
+    controlWS.onclose = () => { if (!evicted) setTimeout(connectControl, 1500); };
+  }
+  $("session-takeover").onclick = () => {
+    if (controlWS && controlWS.readyState === 1) controlWS.send(JSON.stringify({ type: "takeover" }));
+    else { evicted = false; connectControl(); }
+  };
+  connectControl();
 })();
