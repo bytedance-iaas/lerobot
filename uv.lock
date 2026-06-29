@@ -69,7 +69,7 @@ dependencies = [
     { name = "pyyaml" },
     { name = "safetensors" },
     { name = "torch", version = "2.11.0", source = { registry = "https://mirrors.volces.com/pypi/simple/" }, marker = "sys_platform != 'linux'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux'" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://mirrors.aliyun.com/pytorch-wheels/cu128/" }, marker = "sys_platform == 'linux'" },
 ]
 sdist = { url = "https://mirrors.volces.com/pypi/packages/8d/75/94cd5d389649578aca399e5aa822637eec18319a1dadc400ffe2f9a7493f/accelerate-1.14.0.tar.gz", hash = "sha256:41b9c4377a54e0b460a959b0defa1b736e4ca0a2373252d9a539964c2afe3c8d" }
 wheels = [
@@ -1584,7 +1584,7 @@ source = { registry = "https://mirrors.volces.com/pypi/simple/" }
 dependencies = [
     { name = "einops", marker = "platform_machine != 'arm64' or sys_platform != 'darwin'" },
     { name = "torch", version = "2.11.0", source = { registry = "https://mirrors.volces.com/pypi/simple/" }, marker = "(platform_machine != 'arm64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux'" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://mirrors.aliyun.com/pytorch-wheels/cu128/" }, marker = "sys_platform == 'linux'" },
 ]
 sdist = { url = "https://mirrors.volces.com/pypi/packages/01/7a/92a46e7cd6bbb4d7b2855a457c3b855df54a97af5656d98fc92e58e61065/flash_attn-2.8.3.post1.tar.gz", hash = "sha256:55d5103ed846da8b56e0797acf4bde07dee4b1c7e8907fcfc6699c203030c348" }
 
@@ -2906,9 +2906,9 @@ dependencies = [
     { name = "setuptools" },
     { name = "termcolor" },
     { name = "torch", version = "2.11.0", source = { registry = "https://mirrors.volces.com/pypi/simple/" }, marker = "sys_platform != 'linux'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux'" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://mirrors.aliyun.com/pytorch-wheels/cu128/" }, marker = "sys_platform == 'linux'" },
     { name = "torchvision", version = "0.26.0", source = { registry = "https://mirrors.volces.com/pypi/simple/" }, marker = "sys_platform != 'linux'" },
-    { name = "torchvision", version = "0.26.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux'" },
+    { name = "torchvision", version = "0.26.0+cu128", source = { registry = "https://mirrors.aliyun.com/pytorch-wheels/cu128/" }, marker = "sys_platform == 'linux'" },
     { name = "tqdm" },
 ]
 
@@ -3538,13 +3538,13 @@ requires-dist = [
     { name = "termcolor", specifier = ">=2.4.0,<4.0.0" },
     { name = "timm", marker = "extra == 'groot'", specifier = ">=1.0.0,<1.1.0" },
     { name = "torch", marker = "sys_platform != 'linux'", specifier = ">=2.7,<2.12.0" },
-    { name = "torch", marker = "sys_platform == 'linux'", specifier = ">=2.7,<2.12.0", index = "https://download.pytorch.org/whl/cu128" },
+    { name = "torch", marker = "sys_platform == 'linux'", specifier = ">=2.7,<2.12.0", index = "https://mirrors.aliyun.com/pytorch-wheels/cu128/" },
     { name = "torchcodec", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'dataset') or (platform_machine == 'AMD64' and sys_platform == 'linux' and extra == 'dataset') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'dataset')", specifier = ">=0.3.0,<0.12.0" },
     { name = "torchcodec", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'dataset') or (platform_machine == 'arm64' and sys_platform == 'linux' and extra == 'dataset')", specifier = ">=0.11.0,<0.12.0" },
     { name = "torchcodec", marker = "sys_platform == 'win32' and extra == 'dataset'", specifier = ">=0.7.0,<0.12.0" },
     { name = "torchdiffeq", marker = "extra == 'wallx'", specifier = ">=0.2.4,<0.3.0" },
     { name = "torchvision", marker = "sys_platform != 'linux'", specifier = ">=0.22.0,<0.27.0" },
-    { name = "torchvision", marker = "sys_platform == 'linux'", specifier = ">=0.22.0,<0.27.0", index = "https://download.pytorch.org/whl/cu128" },
+    { name = "torchvision", marker = "sys_platform == 'linux'", specifier = ">=0.22.0,<0.27.0", index = "https://mirrors.aliyun.com/pytorch-wheels/cu128/" },
     { name = "tqdm", specifier = ">=4.66.0,<5.0.0" },
     { name = "transformers", marker = "extra == 'transformers-dep'", specifier = ">=5.4.0,<5.6.0" },
     { name = "wandb", marker = "extra == 'training'", specifier = ">=0.24.0,<0.28.0" },
@@ -4850,7 +4850,7 @@ dependencies = [
     { name = "pyyaml" },
     { name = "safetensors" },
     { name = "torch", version = "2.11.0", source = { registry = "https://mirrors.volces.com/pypi/simple/" }, marker = "sys_platform != 'linux'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux'" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://mirrors.aliyun.com/pytorch-wheels/cu128/" }, marker = "sys_platform == 'linux'" },
     { name = "tqdm" },
     { name = "transformers" },
 ]
@@ -6143,8 +6143,8 @@ dependencies = [
     { name = "tensorboard", marker = "sys_platform == 'linux'" },
     { name = "tensorboardx", marker = "sys_platform == 'linux'" },
     { name = "termcolor", marker = "sys_platform == 'linux'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux'" },
-    { name = "torchvision", version = "0.26.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux'" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://mirrors.aliyun.com/pytorch-wheels/cu128/" }, marker = "sys_platform == 'linux'" },
+    { name = "torchvision", version = "0.26.0+cu128", source = { registry = "https://mirrors.aliyun.com/pytorch-wheels/cu128/" }, marker = "sys_platform == 'linux'" },
     { name = "tqdm", marker = "sys_platform == 'linux'" },
 ]
 sdist = { url = "https://mirrors.volces.com/pypi/packages/3d/c3/44b1d1ea4bcb4bbed43d19e09505f4142714451ded74020d4f679cdc89fb/robomimic-0.2.0.tar.gz", hash = "sha256:ee3bb5cf9c3e1feead6b57b43c5db738fd0a8e0c015fdf6419808af8fffdc463" }
@@ -6670,7 +6670,7 @@ name = "thop"
 version = "0.1.1.post2209072238"
 source = { registry = "https://mirrors.volces.com/pypi/simple/" }
 dependencies = [
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux'" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://mirrors.aliyun.com/pytorch-wheels/cu128/" }, marker = "sys_platform == 'linux'" },
 ]
 wheels = [
     { url = "https://mirrors.volces.com/pypi/packages/bb/0f/72beeab4ff5221dc47127c80f8834b4bcd0cb36f6ba91c0b1d04a1233403/thop-0.1.1.post2209072238-py3-none-any.whl", hash = "sha256:01473c225231927d2ad718351f78ebf7cffe6af3bed464c4f1ba1ef0f7cdda27" },
@@ -6697,9 +6697,9 @@ dependencies = [
     { name = "pyyaml" },
     { name = "safetensors" },
     { name = "torch", version = "2.11.0", source = { registry = "https://mirrors.volces.com/pypi/simple/" }, marker = "sys_platform != 'linux'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux'" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://mirrors.aliyun.com/pytorch-wheels/cu128/" }, marker = "sys_platform == 'linux'" },
     { name = "torchvision", version = "0.26.0", source = { registry = "https://mirrors.volces.com/pypi/simple/" }, marker = "sys_platform != 'linux'" },
-    { name = "torchvision", version = "0.26.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux'" },
+    { name = "torchvision", version = "0.26.0+cu128", source = { registry = "https://mirrors.aliyun.com/pytorch-wheels/cu128/" }, marker = "sys_platform == 'linux'" },
 ]
 sdist = { url = "https://mirrors.volces.com/pypi/packages/08/54/ece85b0eef3700c90db8271a43669b05a0ebbe2edb1962329c34374a297e/timm-1.0.27.tar.gz", hash = "sha256:315dfe63186ca9fb7ff941268941231fd5be259f2b4bb4afa28560ae1015cb9a" }
 wheels = [
@@ -6812,7 +6812,7 @@ wheels = [
 [[package]]
 name = "torch"
 version = "2.11.0+cu128"
-source = { registry = "https://download.pytorch.org/whl/cu128" }
+source = { registry = "https://mirrors.aliyun.com/pytorch-wheels/cu128/" }
 resolution-markers = [
     "(python_full_version >= '3.15' and platform_machine == 'AMD64' and sys_platform == 'linux') or (python_full_version >= '3.15' and platform_machine == 'x86_64' and sys_platform == 'linux')",
     "(python_full_version == '3.14.*' and platform_machine == 'AMD64' and sys_platform == 'linux') or (python_full_version == '3.14.*' and platform_machine == 'x86_64' and sys_platform == 'linux')",
@@ -6848,16 +6848,16 @@ dependencies = [
     { name = "typing-extensions", marker = "sys_platform == 'linux'" },
 ]
 wheels = [
-    { url = "https://download-r2.pytorch.org/whl/cu128/torch-2.11.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:9c8f38efee365cb9d334de8a83ce52fc7e5fc9e5a7b0853285efa1b69e00b0f2", upload-time = "2026-04-27T17:41:30Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu128/torch-2.11.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:d252cf975fb18c94a85336323ad425f473df56dab35a44b00399bd70c7a3b997", upload-time = "2026-04-27T17:42:06Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu128/torch-2.11.0%2Bcu128-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:7db3580106bba044da5b8950f3fb8fe5f31999eaab3f6a3aa2ac5d202c3684d2", upload-time = "2026-04-27T17:45:35Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu128/torch-2.11.0%2Bcu128-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:db964b33c55035a72ab3e2162287af8f1cc276039c65d015740cc88c26dcedf7", upload-time = "2026-04-27T17:46:18Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu128/torch-2.11.0%2Bcu128-cp313-cp313t-manylinux_2_28_aarch64.whl", hash = "sha256:cd1cf1005c5fe419194ee294b7b584ba5ad0f2fb1778b3fe5a7b9c3f4617ddbc", upload-time = "2026-04-27T17:50:01Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu128/torch-2.11.0%2Bcu128-cp313-cp313t-manylinux_2_28_x86_64.whl", hash = "sha256:74b628dbc71603977b09f4e140792c6e997081a35ef3421555f3f6e201b81210", upload-time = "2026-04-27T17:50:42Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu128/torch-2.11.0%2Bcu128-cp314-cp314-manylinux_2_28_aarch64.whl", hash = "sha256:baa52f7b8a53cab16587b10f1c27d1000ca033f97236878b685b75d5a1b92408", upload-time = "2026-04-27T17:54:24Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu128/torch-2.11.0%2Bcu128-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:d389a850677f0d24dafae1573644034428d8d3b9c80b51d55ba62fed7e6c8777", upload-time = "2026-04-27T17:55:03Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu128/torch-2.11.0%2Bcu128-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:06849e9311dbb0617c97557d9c26c99a9e1c4f2ac9cb8e9b6d9b420d522acb91", upload-time = "2026-04-27T17:58:48Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu128/torch-2.11.0%2Bcu128-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:169a9987e1f84f0c5eee07544b3a34827a163ac9180e23abf0c3548f1335762c", upload-time = "2026-04-27T17:59:26Z" },
+    { url = "https://mirrors.aliyun.com/pytorch-wheels/cu128/torch-2.11.0+cu128-cp312-cp312-manylinux_2_28_aarch64.whl" },
+    { url = "https://mirrors.aliyun.com/pytorch-wheels/cu128/torch-2.11.0+cu128-cp312-cp312-manylinux_2_28_x86_64.whl" },
+    { url = "https://mirrors.aliyun.com/pytorch-wheels/cu128/torch-2.11.0+cu128-cp313-cp313-manylinux_2_28_aarch64.whl" },
+    { url = "https://mirrors.aliyun.com/pytorch-wheels/cu128/torch-2.11.0+cu128-cp313-cp313-manylinux_2_28_x86_64.whl" },
+    { url = "https://mirrors.aliyun.com/pytorch-wheels/cu128/torch-2.11.0+cu128-cp313-cp313t-manylinux_2_28_aarch64.whl" },
+    { url = "https://mirrors.aliyun.com/pytorch-wheels/cu128/torch-2.11.0+cu128-cp313-cp313t-manylinux_2_28_x86_64.whl" },
+    { url = "https://mirrors.aliyun.com/pytorch-wheels/cu128/torch-2.11.0+cu128-cp314-cp314-manylinux_2_28_aarch64.whl" },
+    { url = "https://mirrors.aliyun.com/pytorch-wheels/cu128/torch-2.11.0+cu128-cp314-cp314-manylinux_2_28_x86_64.whl" },
+    { url = "https://mirrors.aliyun.com/pytorch-wheels/cu128/torch-2.11.0+cu128-cp314-cp314t-manylinux_2_28_aarch64.whl" },
+    { url = "https://mirrors.aliyun.com/pytorch-wheels/cu128/torch-2.11.0+cu128-cp314-cp314t-manylinux_2_28_x86_64.whl" },
 ]
 
 [[package]]
@@ -6886,7 +6886,7 @@ source = { registry = "https://mirrors.volces.com/pypi/simple/" }
 dependencies = [
     { name = "scipy" },
     { name = "torch", version = "2.11.0", source = { registry = "https://mirrors.volces.com/pypi/simple/" }, marker = "sys_platform != 'linux'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux'" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://mirrors.aliyun.com/pytorch-wheels/cu128/" }, marker = "sys_platform == 'linux'" },
 ]
 sdist = { url = "https://mirrors.volces.com/pypi/packages/87/ec/a40aa124660f0ee65e6760cb53df6a82ad91a1a3ef1da5e747f1336644dd/torchdiffeq-0.2.5.tar.gz", hash = "sha256:b50d3760d13fd138dcceac651f4b80396f44fefcebd037a033fecfeaa9cc12e7" }
 wheels = [
@@ -6948,7 +6948,7 @@ wheels = [
 [[package]]
 name = "torchvision"
 version = "0.26.0+cu128"
-source = { registry = "https://download.pytorch.org/whl/cu128" }
+source = { registry = "https://mirrors.aliyun.com/pytorch-wheels/cu128/" }
 resolution-markers = [
     "(python_full_version >= '3.15' and platform_machine == 'AMD64' and sys_platform == 'linux') or (python_full_version >= '3.15' and platform_machine == 'x86_64' and sys_platform == 'linux')",
     "(python_full_version == '3.14.*' and platform_machine == 'AMD64' and sys_platform == 'linux') or (python_full_version == '3.14.*' and platform_machine == 'x86_64' and sys_platform == 'linux')",
@@ -6970,19 +6970,19 @@ resolution-markers = [
 dependencies = [
     { name = "numpy", marker = "sys_platform == 'linux'" },
     { name = "pillow", marker = "sys_platform == 'linux'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux'" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://mirrors.aliyun.com/pytorch-wheels/cu128/" }, marker = "sys_platform == 'linux'" },
 ]
 wheels = [
-    { url = "https://download-r2.pytorch.org/whl/cu128/torchvision-0.26.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:63e35234aed13b6edda37056f417b5c281249669db631e706811917af36b21d7", upload-time = "2026-04-09T23:21:35Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu128/torchvision-0.26.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:ccf26b4b659cfce6f2208cb8326071d51c70219a34856dfdf468d1e19af52c0d", upload-time = "2026-03-23T15:36:22Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu128/torchvision-0.26.0%2Bcu128-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:c4a9cacd521f2a4df0bcd9d8e96704771b928f478f1f3067e4085bb53a1da298", upload-time = "2026-04-09T23:21:37Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu128/torchvision-0.26.0%2Bcu128-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:cb1f6184a7ba30fba40580e1a01a6604a86c55e79fdda187f40116ee680441ec", upload-time = "2026-03-23T15:36:22Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu128/torchvision-0.26.0%2Bcu128-cp313-cp313t-manylinux_2_28_aarch64.whl", hash = "sha256:e594732552a8c2fee2ace9c6475c6c6904fc44ccca622ee6765a89a045416a44", upload-time = "2026-04-09T23:21:38Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu128/torchvision-0.26.0%2Bcu128-cp313-cp313t-manylinux_2_28_x86_64.whl", hash = "sha256:6168abc019803ac9e97efce27eafd2fdb33db04dcc54a86039537729e5047b29", upload-time = "2026-03-23T15:36:23Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu128/torchvision-0.26.0%2Bcu128-cp314-cp314-manylinux_2_28_aarch64.whl", hash = "sha256:b3865fa227661dd75b7b28c96d3d14e739bd08bf0614132758922fe0e7206f91", upload-time = "2026-04-09T23:21:39Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu128/torchvision-0.26.0%2Bcu128-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:aac647c9130f1f25f5c8f5bca3d95cfd96bdfac93ab54529690b088e64e4fa64", upload-time = "2026-03-23T15:36:23Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu128/torchvision-0.26.0%2Bcu128-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:e2ee9e16ee4518292694537fcbd20d2d27044e381d92b864f637e82795796a84", upload-time = "2026-04-09T23:21:40Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu128/torchvision-0.26.0%2Bcu128-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:b5772c55bfda4377df8f1930d43c4e0231ef231b0228eade4b227c8d3ba6e34e", upload-time = "2026-03-23T15:36:23Z" },
+    { url = "https://mirrors.aliyun.com/pytorch-wheels/cu128/torchvision-0.26.0+cu128-cp312-cp312-manylinux_2_28_aarch64.whl" },
+    { url = "https://mirrors.aliyun.com/pytorch-wheels/cu128/torchvision-0.26.0+cu128-cp312-cp312-manylinux_2_28_x86_64.whl" },
+    { url = "https://mirrors.aliyun.com/pytorch-wheels/cu128/torchvision-0.26.0+cu128-cp313-cp313-manylinux_2_28_aarch64.whl" },
+    { url = "https://mirrors.aliyun.com/pytorch-wheels/cu128/torchvision-0.26.0+cu128-cp313-cp313-manylinux_2_28_x86_64.whl" },
+    { url = "https://mirrors.aliyun.com/pytorch-wheels/cu128/torchvision-0.26.0+cu128-cp313-cp313t-manylinux_2_28_aarch64.whl" },
+    { url = "https://mirrors.aliyun.com/pytorch-wheels/cu128/torchvision-0.26.0+cu128-cp313-cp313t-manylinux_2_28_x86_64.whl" },
+    { url = "https://mirrors.aliyun.com/pytorch-wheels/cu128/torchvision-0.26.0+cu128-cp314-cp314-manylinux_2_28_aarch64.whl" },
+    { url = "https://mirrors.aliyun.com/pytorch-wheels/cu128/torchvision-0.26.0+cu128-cp314-cp314-manylinux_2_28_x86_64.whl" },
+    { url = "https://mirrors.aliyun.com/pytorch-wheels/cu128/torchvision-0.26.0+cu128-cp314-cp314t-manylinux_2_28_aarch64.whl" },
+    { url = "https://mirrors.aliyun.com/pytorch-wheels/cu128/torchvision-0.26.0+cu128-cp314-cp314t-manylinux_2_28_x86_64.whl" },
 ]
 
 [[package]]

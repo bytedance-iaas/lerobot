@@ -365,7 +365,9 @@ lerobot-rollout="lerobot.scripts.lerobot_rollout:main"
 #       --index-url https://download.pytorch.org/whl/cu130
 [[tool.uv.index]]
 name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+# Aliyun mirror (flat layout) — actually hosts the cu128 wheel files in China.
+url = "https://mirrors.aliyun.com/pytorch-wheels/cu128/"
+format = "flat"
 explicit = true
 
 [tool.uv.sources]
