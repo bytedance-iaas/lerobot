@@ -86,12 +86,21 @@ body {
 .viewer-body { position: relative; flex: 1; min-height: 0; overflow: auto; }
 .vpane { display: none; height: 100%; }
 .vpane.active { display: block; }
-.vpane[data-pane="home"] { padding: 18px 20px; overflow: auto; }
 .vpane iframe { width: 100%; height: 100%; border: 0; background: #fff; display: block; }
 
+/* empty state — the inline browser's "new tab" page */
+.viewer-empty { height: 100%; display: flex; flex-direction: column; align-items: center;
+  justify-content: center; text-align: center; color: #b1b6c2; gap: 14px; padding: 24px; }
+.viewer-empty[hidden] { display: none; }
+.ve-icon { font-size: 38px; opacity: .55; }
+.viewer-empty p { margin: 0; font-size: 13.5px; max-width: 460px; line-height: 1.7; }
+.ve-open { border: 1px solid var(--line); background: #fff; border-radius: 10px; padding: 9px 16px;
+  font-size: 13px; color: var(--orange); cursor: pointer; font-weight: 600; }
+.ve-open:hover { background: #fff7f1; }
+
 /* "open" popover */
-.open-menu { position: absolute; top: 46px; right: 14px; width: 320px; background: #fff;
-  border: 1px solid var(--line); border-radius: 14px; box-shadow: 0 16px 40px rgba(20,24,40,.18); z-index: 30; padding: 12px; }
+.open-menu { position: fixed; width: 320px; background: #fff;
+  border: 1px solid var(--line); border-radius: 14px; box-shadow: 0 16px 40px rgba(20,24,40,.18); z-index: 40; padding: 12px; }
 .om-head { font-size: 12px; color: var(--muted); margin: 2px 4px 8px; }
 .om-list { max-height: 200px; overflow: auto; display: flex; flex-direction: column; gap: 4px; }
 .om-item { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 9px; cursor: pointer; font-size: 13px; }

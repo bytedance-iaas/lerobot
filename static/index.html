@@ -26,32 +26,18 @@
     <section class="col-left" id="col-left">
       <div class="panel viewer" id="viewer">
         <div class="viewer-bar">
-          <div class="viewer-tabs" id="viewer-tabs">
-            <button class="vtab active" data-tab="home">概览</button>
-          </div>
+          <div class="viewer-tabs" id="viewer-tabs"></div>
           <div class="viewer-actions">
             <button class="vadd" id="viewer-add" title="打开服务 / 网址">＋ 打开</button>
           </div>
         </div>
 
         <div class="viewer-body" id="viewer-body">
-          <!-- default "home" pane: lightweight overview (not a fixed feature) -->
-          <div class="vpane active" data-pane="home">
-            <div class="metrics">
-              <div class="metric"><div class="m-label">Step</div><div class="m-big" id="m-step">0 / 20,000</div><div class="m-bar"><i></i></div></div>
-              <div class="metric"><div class="m-label">Train Loss</div><div class="m-big m-dash">—</div><div class="m-sub">smoothed L1+MSE</div></div>
-              <div class="metric"><div class="m-label">Held-out MSE</div><div class="m-big m-dash">—</div><div class="m-sub">best —</div></div>
-              <div class="metric"><div class="m-label">Throughput</div><div class="m-big m-dash">—</div><div class="m-sub">ETA —</div></div>
-            </div>
-            <div class="chart">
-              <div class="chart-head"><b>面板</b>
-                <span class="legend">Agent 的 HTML 输出与控制台里启动的服务都会作为标签页出现在这里</span>
-              </div>
-              <div class="chart-empty">
-                <div class="spark">🗂️</div>
-                <p>像浏览器一样：右侧让 Agent 生成 HTML、或在下方控制台启动一个 web 服务，<br/>再点上方「＋ 打开」把它作为标签页查看。</p>
-              </div>
-            </div>
+          <!-- empty state (no tabs): an inline-browser "new tab" page -->
+          <div class="viewer-empty" id="viewer-empty">
+            <div class="ve-icon">🗂️</div>
+            <p>这里是一个内嵌页面浏览器。<br/>Agent 的 HTML 输出，或在下方控制台里启动的 web 服务（如 web-so100 远程遥操作、训练监控面板），都会作为标签页在这里打开。</p>
+            <button class="ve-open" id="viewer-empty-open">＋ 打开服务 / 网址</button>
           </div>
           <!-- dynamic panes (iframes for html artifacts / proxied services) injected here -->
         </div>

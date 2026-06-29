@@ -44,24 +44,21 @@
   connectTerm();
 
   /* ------------------------------------------------------------------- viewer */
-  const viewerTabs = $("viewer-tabs"), viewerBody = $("viewer-body");
+  const viewerTabs = $("viewer-tabs"), viewerBody = $("viewer-body"), viewerEmpty = $("viewer-empty");
   const tabs = new Map();             // id -> { tabEl, paneEl, kind, port }
   let tabSeq = 0;
 
+  // The viewer is a pure inline browser: no default tab. When empty, show the
+  // "new tab" placeholder; otherwise the active tab's iframe fills the area.
   function activate(id) {
-    if (!tabs.has(id)) id = "home";
+    if (!tabs.has(id)) id = null;
     for (const [tid, t] of tabs) {
       const on = tid === id;
       t.tabEl.classList.toggle("active", on);
       t.paneEl.classList.toggle("active", on);
     }
+    viewerEmpty.hidden = tabs.size > 0;
   }
-  // home pane is the default <div.vpane[data-pane=home]>
-  tabs.set("home", {
-    tabEl: document.querySelector('.vtab[data-tab="home"]'),
-    paneEl: document.querySelector('.vpane[data-pane="home"]'),
-    kind: "home",
-  });
 
   function makeTab(id, label, { closeable = true, live = false } = {}) {
     const tabEl = document.createElement("button");
@@ -126,13 +123,10 @@
 
   function closeTab(id) {
     const t = tabs.get(id);
-    if (!t || id === "home") return;
+    if (!t) return;
     const wasActive = t.tabEl.classList.contains("active");
     t.tabEl.remove(); t.paneEl.remove(); tabs.delete(id);
-    if (wasActive) {
-      const last = [...tabs.keys()].filter((k) => k !== "home").pop();
-      activate(last || "home");
-    }
+    if (wasActive) activate([...tabs.keys()].pop() || null);
   }
 
   viewerTabs.addEventListener("click", (e) => {
@@ -160,9 +154,15 @@
   function toggleOpenMenu(force) {
     const show = force !== undefined ? force : openMenu.hidden;
     openMenu.hidden = !show;
-    if (show) refreshServices();
+    if (show) {
+      const r = $("viewer-add").getBoundingClientRect();
+      openMenu.style.top = r.bottom + 6 + "px";
+      openMenu.style.left = Math.max(8, r.right - 320) + "px";
+      refreshServices();
+    }
   }
   $("viewer-add").onclick = (e) => { e.stopPropagation(); toggleOpenMenu(); };
+  $("viewer-empty-open").onclick = (e) => { e.stopPropagation(); toggleOpenMenu(true); };
   document.addEventListener("click", (e) => {
     if (!openMenu.hidden && !openMenu.contains(e.target) && e.target !== $("viewer-add")) toggleOpenMenu(false);
   });
