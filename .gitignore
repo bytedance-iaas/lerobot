@@ -10,3 +10,7 @@ build/
 
 # real secret (never commit)
 k8s/secret.yaml
+
+# editor swap files
+*.swp
+*.swo
