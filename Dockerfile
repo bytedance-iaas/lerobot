@@ -7,13 +7,16 @@
 # no browser/Chromium, no ffmpeg, no messaging/matrix/voice/web-search extras,
 # no dashboard/TUI frontend. That keeps the image close to the lerobot base.
 #
-# Build (separate pipeline, FROM a known-good GZIP lerobot tag — VKE node
-# containerd 1.6.x rejects zstd):
+# Build (separate pipeline). MUST push with `force-compression=true,compression=gzip`
+# so the FINAL console image is all-gzip — VKE node containerd 1.6.x rejects zstd.
+# NOTE: the default BASE_IMAGE below is a ZSTD-pushed lerobot tag; that's fine here
+# because `force-compression=true` RE-COMPRESSES the inherited base layers to gzip
+# in the output. (The builder must be able to PULL zstd — modern buildkit can.)
 #   docker buildx build \
-#     --build-arg BASE_IMAGE=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot:<gzip-tag> \
+#     --build-arg BASE_IMAGE=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot:<lerobot-tag> \
 #     --output type=image,name=<registry>/lerobot-console:<tag>,push=true,compression=gzip,force-compression=true,oci-mediatypes=true \
 #     .
-ARG BASE_IMAGE=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot:a64719559e6fea31e2f767e296f64fb0d6ef31b7
+ARG BASE_IMAGE=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot:00370ca7ffea5b3c8ecb05e098e910b9559ba6e7
 FROM ${BASE_IMAGE}
 
 # CN-friendly PyPI mirror (matches the lerobot build). Override with --build-arg.

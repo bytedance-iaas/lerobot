@@ -77,10 +77,12 @@ dashboard/TUI. ~100 MB of Python on top of the lerobot base (validated:
 pip-installing optional tools at runtime.
 
 ```bash
-# Separate pipeline: FROM a known-good GZIP lerobot tag (VKE node containerd 1.6.x
-# rejects zstd — `number of layers and diffIDs don't match`).
+# Separate pipeline. force-compression=true,compression=gzip makes the FINAL image
+# all-gzip (VKE node containerd 1.6.x rejects zstd — `number of layers and diffIDs
+# don't match`). The base tag below is zstd-pushed; force-compression re-compresses
+# its layers to gzip in the output, so the console image still pulls fine on VKE.
 docker buildx build \
-  --build-arg BASE_IMAGE=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot:<gzip-tag> \
+  --build-arg BASE_IMAGE=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot:00370ca7ffea5b3c8ecb05e098e910b9559ba6e7 \
   --output type=image,name=<registry>/lerobot-console:<tag>,push=true,compression=gzip,force-compression=true,oci-mediatypes=true \
   .
 
