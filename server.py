@@ -42,6 +42,7 @@ import os
 import re
 import shutil
 import signal
+import ssl
 import struct
 import termios
 from pathlib import Path
@@ -70,6 +71,11 @@ HERMES_BIN = os.environ.get("HERMES_BIN") or shutil.which("hermes") or "hermes"
 AUTH_USER = os.environ.get("CONSOLE_USER") or os.environ.get("AUTH_USER") or ""
 AUTH_PASS = os.environ.get("CONSOLE_PASSWORD") or os.environ.get("AUTH_PASSWORD") or ""
 AUTH_ENABLED = bool(AUTH_USER and AUTH_PASS)
+# Native TLS: if both paths are set and exist, the console serves HTTPS (wss)
+# directly — no TLS-terminating sidecar needed. Use a self-signed cert behind an
+# L4 LB, or any cert. Unset => plain HTTP (handy for local dev).
+TLS_CERT = os.environ.get("CONSOLE_TLS_CERT") or ""
+TLS_KEY = os.environ.get("CONSOLE_TLS_KEY") or ""
 # Skill to preload so the agent knows how to drive LeRobot SFT (requirement f).
 CHAT_SKILL = os.environ.get("HERMES_CHAT_SKILL", "robot_sft")
 
@@ -826,12 +832,20 @@ def build_app() -> web.Application:
 
 
 def main() -> None:
-    log.info("LeRobot Agent Console on :%s  shell=%s  LEROBOT_HOME=%s  hermes=%s", PORT, SHELL, WORKDIR, HERMES_BIN)
+    ssl_ctx = None
+    if TLS_CERT and TLS_KEY and os.path.exists(TLS_CERT) and os.path.exists(TLS_KEY):
+        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_ctx.load_cert_chain(TLS_CERT, TLS_KEY)
+    scheme = "https" if ssl_ctx else "http"
+    log.info("LeRobot Agent Console %s://0.0.0.0:%s  shell=%s  LEROBOT_HOME=%s  hermes=%s",
+             scheme, PORT, SHELL, WORKDIR, HERMES_BIN)
     if AUTH_ENABLED:
         log.info("auth: single-user HTTP Basic ENABLED (user=%s)", AUTH_USER)
     else:
         log.warning("auth: DISABLED — set CONSOLE_USER + CONSOLE_PASSWORD to protect the console")
-    web.run_app(build_app(), host="0.0.0.0", port=PORT, access_log=None)
+    if not ssl_ctx and (TLS_CERT or TLS_KEY):
+        log.warning("TLS requested but cert/key missing (%s / %s) — serving plain HTTP", TLS_CERT, TLS_KEY)
+    web.run_app(build_app(), host="0.0.0.0", port=PORT, ssl_context=ssl_ctx, access_log=None)
 
 
 if __name__ == "__main__":

@@ -42,7 +42,9 @@ Environment knobs:
 
 | var | default | meaning |
 |---|---|---|
-| `PORT` | `8080` | HTTP port |
+| `PORT` | `8080` | listen port (HTTP, or HTTPS when TLS is set) |
+| `CONSOLE_TLS_CERT` / `CONSOLE_TLS_KEY` | unset | if both set + exist, the console serves **HTTPS/wss natively** (no TLS sidecar). Unset → plain HTTP. |
+| `CONSOLE_USER` / `CONSOLE_PASSWORD` | unset | single-user HTTP Basic auth (both required to enable) |
 | `LEROBOT_HOME` | cwd | shell + agent working dir; exported to all child processes (precedence: `LEROBOT_HOME` > `CONSOLE_WORKDIR` > cwd) |
 | `CONSOLE_WORKDIR` | cwd | fallback working dir if `LEROBOT_HOME` unset |
 | `CONSOLE_SHELL` | `bash` | shell for the PTY console |
@@ -83,38 +85,39 @@ docker buildx build \
   --output type=image,name=<registry>/lerobot-console:<tag>,push=true,compression=gzip,oci-mediatypes=true \
   .
 
-# One-time: login secret + persistent volumes (Ark key/sessions/skills, and certs)
+# One-time: login secret + a self-signed TLS cert + the hermes PVC
 kubectl create secret generic lerobot-console-auth \
   --from-literal=user=lerobot --from-literal=password='<strong-password>'
-kubectl apply -f k8s/pvc.yaml -f k8s/caddy-pvc.yaml
+openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
+  -keyout tls.key -out tls.crt -subj "/CN=lerobot-console" \
+  -addext "subjectAltName=DNS:lerobot-console"
+kubectl create secret tls lerobot-console-tls --cert=tls.crt --key=tls.key
+kubectl apply -f k8s/pvc.yaml
 
-# Set your domain + ACME email in k8s/deployment.yaml (caddy sidecar env:
-# CONSOLE_DOMAIN, ACME_EMAIL) and your VPC subnet in k8s/service-lb.yaml.
-kubectl apply -f k8s/caddy-config.yaml
-kubectl apply -f k8s/service.yaml          # ClusterIP (for port-forward/debug)
-kubectl apply -f k8s/deployment.yaml       # console + Caddy auto-HTTPS sidecar
-kubectl apply -f k8s/service-lb.yaml       # public L4 LB (443+80 -> Caddy)
+# Set your VPC subnet in k8s/service-lb.yaml, then deploy.
+kubectl apply -f k8s/deployment.yaml       # console serves HTTPS natively (no sidecar)
+kubectl apply -f k8s/service-lb.yaml       # public L4 CLB: 443 -> console:8080
 
-# Point your domain's DNS (A record) at the LB's public IP:
-kubectl get svc lerobot-console-lb -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
-# then open https://<your-domain>  (Caddy auto-issues a Let's Encrypt cert)
+# Get the CLB public IP and open it (self-signed -> accept the browser warning):
+kubectl get svc lerobot-console-clb -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+# open https://<that-ip>/   (login = CONSOLE_USER / CONSOLE_PASSWORD)
 
-# You can still exec into the pod and run anything directly:
-kubectl exec -it deploy/lerobot-console -c console -- bash
+# Exec into the pod and run anything directly:
+kubectl exec -it deploy/lerobot-console -- bash
 ```
 
-**TLS (auto, option A):** a **Caddy sidecar** terminates HTTPS and
-auto-provisions/renews a Let's Encrypt cert for `CONSOLE_DOMAIN` — you just point
-a domain at the LB. The LB is plain **L4** (CLB) passing 443+80 through to Caddy;
-WebSocket + Basic-auth pass through transparently. ACME needs inbound 80/443
-reachable (HTTP-01); on inbound-blocked accounts switch Caddy to a DNS-01 challenge.
-For VKE-managed L7 / a 证书中心 cert instead, see `k8s/ingress-alb.yaml` (option B).
+**TLS (native, recommended):** the console **serves HTTPS itself** from the mounted
+cert (`CONSOLE_TLS_CERT`/`KEY`) — no sidecar. An **L4 CLB** forwards `:443` straight
+to it; WebSocket (wss) works automatically. A self-signed cert is fine (browser
+warns once); no domain needed. This is the only path that's fully **kubectl-only**:
+ALB HTTPS needs a `证书中心` cert-id that can't be created via kubectl, and ALB has
+no auto system-cert through the ingress. For a **trusted** (no-warning) cert, upload
+one to 证书中心 and use an ALB ingress with its cert-id — see `k8s/ingress-alb.yaml`.
 
 **Persistence & auth:** `HERMES_HOME=/opt/data` is a PVC, so the Ark key (entered
-once in the UI), chat sessions, and the `robot_sft` skill survive pod restarts;
-Caddy's certs persist on their own PVC. The whole console is behind single-user
-HTTP Basic auth (`CONSOLE_USER` / `CONSOLE_PASSWORD` via the Secret), and enforces
-a single open session at a time.
+once in the UI), chat sessions, and the `robot_sft` skill survive pod restarts. The
+whole console is behind single-user HTTP Basic auth (`CONSOLE_USER` /
+`CONSOLE_PASSWORD` via the Secret), and enforces a single open session at a time.
 
 > **zstd ↔ VKE note:** the VKE node here runs containerd 1.6.38, whose zstd
 > support is incomplete. Always push this image gzip-compressed. zstd is only
