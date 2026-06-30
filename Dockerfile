@@ -50,8 +50,10 @@ RUN command -v uv >/dev/null 2>&1 || python -m pip install --no-cache-dir uv \
     && ln -sf /opt/hermes/.venv/bin/hermes /usr/local/bin/hermes \
     && hermes acp --check
 
-# --- the console app + its (tiny) deps into the base python ---------------- #
-RUN python -m pip install --no-cache-dir "aiohttp>=3.9" "pyyaml>=6"
+# --- the console app + its (tiny) deps into the lerobot venv --------------- #
+# The lerobot venv (uv venv) has no `pip`, and `python` resolves to it (on PATH),
+# so install with uv targeting that venv. (CMD runs `python server.py` there.)
+RUN VIRTUAL_ENV=/lerobot/.venv uv pip install --native-tls --no-cache-dir "aiohttp>=3.9" "pyyaml>=6"
 WORKDIR /opt/agent-console
 COPY server.py ./
 COPY static ./static
