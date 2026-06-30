@@ -99,9 +99,34 @@ _PLACEHOLDERS = {"", "your-api-key", "changeme", "<set-me>", "null", "none"}
 # --------------------------------------------------------------------------- #
 # hermes config helpers (chat only)                                           #
 # --------------------------------------------------------------------------- #
+def _hermes_home() -> Path:
+    return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+
+
 def _hermes_config_path() -> Path:
-    home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
-    return home / "config.yaml"
+    return _hermes_home() / "config.yaml"
+
+
+def _sql_delete_session(sid: str) -> None:
+    """Delete a chat session from hermes' sqlite store (no ACP delete method).
+
+    hermes keeps sessions+messages in HERMES_HOME/state.db (WAL mode). We open a
+    short-timeout connection and remove the rows; the running agent re-reads the
+    store on the next session/list, so the deletion shows up immediately.
+    """
+    import sqlite3
+
+    db = _hermes_home() / "state.db"
+    if not db.exists():
+        return
+    con = sqlite3.connect(str(db), timeout=5)
+    try:
+        con.execute("PRAGMA busy_timeout=5000")
+        con.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+        con.execute("DELETE FROM sessions WHERE id = ?", (sid,))
+        con.commit()
+    finally:
+        con.close()
 
 
 def _parse_model_block(text: str) -> dict:
@@ -326,7 +351,10 @@ class HermesACP:
         self._pending: dict[int, asyncio.Future] = {}
         self._write_lock = asyncio.Lock()
         self._start_lock = asyncio.Lock()
-        self._first_turn = True
+        # Session ids we've already steered with CHAT_DIRECTIVE. New sessions get it
+        # on their first prompt; loaded (existing) sessions are marked so we never
+        # inject it mid-conversation.
+        self._directive_sent: set[str] = set()
         # Per-turn callbacks (single-user console → one active turn at a time):
         self.on_update = None       # async fn(update dict) — stream notifications
         self.on_permission = None   # async fn(params) -> optionId|None
@@ -336,10 +364,18 @@ class HermesACP:
         return self.proc is not None and self.proc.returncode is None
 
     async def ensure(self) -> None:
+        """Process alive AND a current session selected (creates one if none)."""
         async with self._start_lock:
-            if self.alive and self.session_id:
-                return
-            await self._spawn()
+            if not self.alive:
+                await self._spawn()
+            if not self.session_id:
+                await self._new_locked()
+
+    async def _ensure_proc(self) -> None:
+        """Just the process+handshake (no session) — for list/load/new."""
+        async with self._start_lock:
+            if not self.alive:
+                await self._spawn()
 
     async def restart(self) -> None:
         """Used after the Volcengine key changes (a new session picks it up)."""
@@ -351,7 +387,7 @@ class HermesACP:
                     pass
             self.proc = None
             self.session_id = None
-            self._first_turn = True
+            self._directive_sent.clear()
             await self._spawn()
 
     async def _spawn(self) -> None:
@@ -366,10 +402,42 @@ class HermesACP:
         self._pending = {}
         asyncio.create_task(self._read_loop(self.proc))
         await self._request("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
+        log.info("hermes acp ready")
+
+    async def _new_locked(self) -> str:
+        """Create a fresh session (caller holds _start_lock). Becomes current."""
         res = await self._request("session/new", {"cwd": WORKDIR, "mcpServers": []})
         self.session_id = res.get("sessionId")
-        self._first_turn = True
-        log.info("hermes acp ready: session=%s", self.session_id)
+        log.info("hermes acp new session=%s", self.session_id)
+        return self.session_id
+
+    # ----- session management (new / list / load / delete) -----------------
+    async def new_session(self) -> str:
+        await self._ensure_proc()
+        async with self._start_lock:
+            return await self._new_locked()
+
+    async def list_sessions(self) -> list[dict]:
+        await self._ensure_proc()
+        res = await self._request("session/list", {})
+        return res.get("sessions", []) if isinstance(res, dict) else []
+
+    async def load_session(self, sid: str, on_update) -> None:
+        """Switch to an existing session; replays its history via on_update."""
+        await self._ensure_proc()
+        self.on_update = on_update
+        try:
+            await self._request("session/load", {"sessionId": sid, "cwd": WORKDIR, "mcpServers": []})
+        finally:
+            self.on_update = None
+        self.session_id = sid
+        self._directive_sent.add(sid)  # existing history → never inject the directive
+
+    async def delete_session(self, sid: str) -> None:
+        await asyncio.to_thread(_sql_delete_session, sid)
+        self._directive_sent.discard(sid)
+        if self.session_id == sid:
+            self.session_id = None  # next prompt/ensure() makes a fresh one
 
     async def _write(self, obj: dict) -> None:
         async with self._write_lock:
@@ -429,10 +497,10 @@ class HermesACP:
 
     async def prompt(self, text: str, on_update, on_permission):
         await self.ensure()
-        # Steer the answer format once at the start of the session.
-        if self._first_turn:
+        # Steer the answer format once per session, on its first prompt.
+        if self.session_id not in self._directive_sent:
             text = CHAT_DIRECTIVE + text
-            self._first_turn = False
+            self._directive_sent.add(self.session_id)
         self.on_update = on_update
         self.on_permission = on_permission
         try:
@@ -457,6 +525,45 @@ class HermesACP:
 def _chunk_text(update: dict) -> str:
     c = update.get("content") or {}
     return c.get("text", "") if isinstance(c, dict) else ""
+
+
+def _sess_brief(s: dict) -> dict:
+    return {
+        "id": s.get("sessionId"),
+        "title": s.get("title") or "新会话",
+        "updatedAt": s.get("updatedAt") or s.get("startedAt") or "",
+    }
+
+
+async def _handle_session_op(ws: web.WebSocketResponse, acp: "HermesACP", op: str, payload: dict) -> None:
+    if op == "session_list":
+        items = await acp.list_sessions()
+        items = sorted(items, key=lambda s: s.get("updatedAt") or "", reverse=True)
+        await ws.send_json({"type": "sessions", "items": [_sess_brief(s) for s in items],
+                            "current": acp.session_id})
+    elif op == "session_new":
+        sid = await acp.new_session()
+        await ws.send_json({"type": "session_switched", "id": sid, "title": "新会话", "fresh": True})
+    elif op == "session_delete":
+        sid = payload.get("id") or ""
+        await acp.delete_session(sid)
+        await ws.send_json({"type": "session_deleted", "id": sid})
+    elif op == "session_load":
+        sid = payload.get("id") or ""
+        await ws.send_json({"type": "history_start", "id": sid})
+
+        async def on_hist(u: dict) -> None:
+            kind = u.get("sessionUpdate")
+            if kind == "user_message_chunk":
+                await ws.send_json({"type": "hist", "role": "user", "text": _chunk_text(u)})
+            elif kind == "agent_message_chunk":
+                await ws.send_json({"type": "hist", "role": "assistant", "text": _chunk_text(u)})
+            elif kind in ("tool_call", "tool_call_update"):
+                await ws.send_json({"type": "hist", "role": "tool",
+                                    "title": u.get("title", ""), "status": u.get("status", "")})
+
+        await acp.load_session(sid, on_hist)
+        await ws.send_json({"type": "history_done", "id": sid})
 
 
 async def handle_chat(request: web.Request) -> web.WebSocketResponse:
@@ -522,6 +629,17 @@ async def handle_chat(request: web.Request) -> web.WebSocketResponse:
             if ptype == "stop":
                 # Interrupt the running turn; the prompt resolves with "cancelled".
                 await acp.cancel()
+                continue
+            busy = bool(turn["task"] and not turn["task"].done())
+            if ptype in ("session_list", "session_new", "session_load", "session_delete"):
+                if busy:  # don't switch the active session mid-turn
+                    await ws.send_json({"type": "error", "error": "请先等当前回答结束"})
+                    continue
+                try:
+                    await _handle_session_op(ws, acp, ptype, payload)
+                except Exception as e:  # noqa: BLE001
+                    log.exception("session op failed")
+                    await ws.send_json({"type": "error", "error": str(e)})
                 continue
             if ptype != "msg":
                 continue

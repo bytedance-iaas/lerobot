@@ -11,38 +11,102 @@
   const wsURL = (p) => (location.protocol === "https:" ? "wss://" : "ws://") + location.host + p;
   let sessionActive = false;   // single-session lock: only reconnect WS while we hold it
 
-  /* ----------------------------------------------------------------- terminal */
-  const term = new Terminal({
-    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
-    fontSize: 13.5,
-    theme: { background: "#0b0f17", foreground: "#d6deeb", cursor: "#5aa7ff" },
-    cursorBlink: true, convertEol: true,
-  });
-  const fit = new FitAddon.FitAddon();
-  term.loadAddon(fit);
-  term.open($("terminal"));
-  const refit = () => { try { fit.fit(); sendResize(); } catch (_) {} };
-  refit();
-
-  let termWS;
-  function connectTerm() {
-    termWS = new WebSocket(wsURL("/ws/term"));
-    termWS.binaryType = "arraybuffer";
-    termWS.onopen = () => sendResize();
-    termWS.onmessage = (e) => term.write(typeof e.data === "string" ? e.data : new Uint8Array(e.data));
-    termWS.onclose = () => {
-      if (!sessionActive) return;
-      term.write("\r\n\x1b[33m[console disconnected — reconnecting…]\x1b[0m\r\n");
-      setTimeout(() => sessionActive && connectTerm(), 1500);
+  /* ------------------------------------------------------- terminal (tabbed) */
+  // Each tab is its own PTY: a /ws/term connection forks a fresh shell server-side,
+  // so tabs are fully independent. The manager owns xterm instances + their sockets.
+  const TERM = (() => {
+    const stack = $("term-stack"), tabBar = $("term-tabs");
+    const TERM_OPTS = {
+      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+      fontSize: 13.5,
+      theme: { background: "#0b0f17", foreground: "#d6deeb", cursor: "#5aa7ff" },
+      cursorBlink: true, convertEol: true,
     };
-  }
-  function sendResize() {
-    if (termWS && termWS.readyState === 1)
-      termWS.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
-  }
-  term.onData((d) => { if (termWS && termWS.readyState === 1) termWS.send(JSON.stringify({ type: "input", data: d })); });
-  window.addEventListener("resize", refit);
-  $("term-clear").onclick = () => term.clear();
+    const tabs = new Map();   // id -> { id, term, fit, ws, el, tabEl }
+    let active = null, seq = 0;
+
+    function sendResize(t) {
+      if (t.ws && t.ws.readyState === 1)
+        t.ws.send(JSON.stringify({ type: "resize", cols: t.term.cols, rows: t.term.rows }));
+    }
+    function refit() {
+      const t = tabs.get(active);
+      if (t) try { t.fit.fit(); sendResize(t); } catch (_) {}
+    }
+    function connect(t) {
+      t.ws = new WebSocket(wsURL("/ws/term"));
+      t.ws.binaryType = "arraybuffer";
+      t.ws.onopen = () => sendResize(t);
+      t.ws.onmessage = (e) => t.term.write(typeof e.data === "string" ? e.data : new Uint8Array(e.data));
+      t.ws.onclose = () => {
+        if (!sessionActive || !tabs.has(t.id)) return;
+        t.term.write("\r\n\x1b[33m[console disconnected — reconnecting…]\x1b[0m\r\n");
+        setTimeout(() => { if (sessionActive && tabs.has(t.id)) connect(t); }, 1500);
+      };
+    }
+    function activate(id) {
+      if (!tabs.has(id)) return;
+      active = id;
+      for (const [tid, t] of tabs) {
+        const on = tid === id;
+        t.el.classList.toggle("active", on);
+        t.tabEl.classList.toggle("active", on);
+      }
+      refit();
+      const t = tabs.get(id);
+      if (t) setTimeout(() => t.term.focus(), 0);
+    }
+    function open() {
+      const id = "term" + ++seq;
+      const el = document.createElement("div");
+      el.className = "term-pane";
+      stack.appendChild(el);
+      const term = new Terminal(TERM_OPTS);
+      const fit = new FitAddon.FitAddon();
+      term.loadAddon(fit);
+      term.open(el);
+      term.onData((d) => {
+        const t = tabs.get(id);
+        if (t && t.ws && t.ws.readyState === 1) t.ws.send(JSON.stringify({ type: "input", data: d }));
+      });
+      const tabEl = document.createElement("button");
+      tabEl.className = "term-tab";
+      tabEl.dataset.id = id;
+      tabEl.innerHTML = `<span class="tt-label"></span><span class="tt-close" title="关闭">✕</span>`;
+      tabEl.querySelector(".tt-label").textContent = "终端 " + seq;
+      tabBar.appendChild(tabEl);
+      const t = { id, term, fit, ws: null, el, tabEl };
+      tabs.set(id, t);
+      connect(t);
+      activate(id);
+      return id;
+    }
+    function close(id) {
+      const t = tabs.get(id);
+      if (!t || tabs.size <= 1) return;   // always keep at least one terminal
+      try { t.ws && t.ws.close(); } catch (_) {}
+      try { t.term.dispose(); } catch (_) {}
+      t.el.remove(); t.tabEl.remove(); tabs.delete(id);
+      if (active === id) activate([...tabs.keys()].pop());
+    }
+    tabBar.addEventListener("click", (e) => {
+      const tab = e.target.closest(".term-tab");
+      if (!tab) return;
+      if (e.target.closest(".tt-close")) close(tab.dataset.id);
+      else activate(tab.dataset.id);
+    });
+    $("term-add").onclick = () => open();
+    $("term-clear").onclick = () => { const t = tabs.get(active); if (t) t.term.clear(); };
+    window.addEventListener("resize", refit);
+
+    return {
+      refit,
+      // (re)connect sockets when our session lock is granted; open one if none yet.
+      start() { if (tabs.size === 0) open(); else for (const t of tabs.values()) if (!t.ws || t.ws.readyState > 1) connect(t); },
+      stop() { for (const t of tabs.values()) try { t.ws && t.ws.close(); } catch (_) {} },
+    };
+  })();
+  const refit = () => TERM.refit();
 
   /* ------------------------------------------------------------------- viewer */
   const viewerTabs = $("viewer-tabs"), viewerBody = $("viewer-body"), viewerEmpty = $("viewer-empty");
@@ -297,6 +361,130 @@
     setBusy(false);
   }
 
+  /* ---------------------------------------------------------- chat sessions */
+  const sessMenu = $("sess-menu"), sessList = $("sess-list"), sessTitle = $("chat-session-title"), sessFoot = $("sess-foot");
+  let curSession = null;
+
+  function clearChat() {
+    body.innerHTML = "";
+    curBubble = null; curText = ""; toolEls = {};
+  }
+  function wsSend(o) { if (chatWS && chatWS.readyState === 1) chatWS.send(JSON.stringify(o)); }
+
+  function setTitle(t) { sessTitle.textContent = (t && t.trim()) || "新会话"; }
+
+  function newSession() {
+    if (busy) return;
+    toggleSessMenu(false);
+    wsSend({ type: "session_new" });          // server replies session_switched(fresh)
+  }
+  function loadSession(id, title) {
+    if (busy || id === curSession) { toggleSessMenu(false); return; }
+    toggleSessMenu(false);
+    curSession = id; setTitle(title);          // optimistic; history streams in next
+    wsSend({ type: "session_load", id });       // server replies history_start … history_done
+  }
+  function deleteSession(id) {
+    if (busy) return;
+    wsSend({ type: "session_delete", id });
+  }
+  function refreshSessions() { wsSend({ type: "session_list" }); }
+
+  function onSwitched(id, title, fresh) {
+    curSession = id;
+    setTitle(title);
+    clearChat();
+    if (fresh) addMsg("bot", "新会话已就绪 👋 直接发消息开始吧。");
+    setBusy(false);
+  }
+  function onDeleted(id) {
+    if (id === curSession) { curSession = null; newSession(); }  // deleted the open one → fresh
+    refreshSessions();
+  }
+
+  function renderSessions(items, current) {
+    curSession = current || curSession;
+    const cur = items.find((s) => s.id === current);
+    if (cur) setTitle(cur.title);
+    sessList.innerHTML = "";
+    sessFoot.textContent = "";
+    if (!items.length) { sessList.innerHTML = '<div class="sess-empty">还没有会话</div>'; return; }
+    const now = Date.now(), DAY = 864e5;
+    const bucket = (iso) => {
+      const age = now - (Date.parse(iso) || 0);
+      return age <= DAY ? "1天内" : age <= 7 * DAY ? "一周内" : age <= 30 * DAY ? "一个月内" : "更早";
+    };
+    let lastGroup = null;
+    items.forEach((s) => {
+      const g = bucket(s.updatedAt);
+      if (g !== lastGroup) {
+        lastGroup = g;
+        const h = document.createElement("div");
+        h.className = "sess-group"; h.textContent = g;
+        sessList.appendChild(h);
+      }
+      const row = document.createElement("div");
+      row.className = "sess-item" + (s.id === current ? " active" : "");
+      row.innerHTML = '<div class="si-main"><div class="si-title"></div></div><button class="si-del" title="删除会话">🗑</button>';
+      row.querySelector(".si-title").textContent = s.title || "新会话";
+      row.querySelector(".si-main").onclick = () => loadSession(s.id, s.title);
+      row.querySelector(".si-del").onclick = (e) => {
+        e.stopPropagation();
+        if (confirm("删除会话「" + (s.title || "新会话") + "」？此操作不可撤销。")) deleteSession(s.id);
+      };
+      sessList.appendChild(row);
+    });
+    sessFoot.textContent = "已全部加载完成";
+  }
+
+  // ----- history replay (session_load) -----
+  let histAcc = null;  // { role, text } accumulator; consecutive same-role chunks merge
+  function histStart() { clearChat(); setBusy(true); histAcc = null; }
+  function histFlush() {
+    if (!histAcc) return;
+    const { role, text } = histAcc; histAcc = null;
+    if (role === "user") { if (text.trim()) addMsg("user", text.trim()); return; }
+    const t = extractHtml(text.trim());
+    if (!t) return;
+    if (looksHtml(t)) { const b = addMsg("bot", ""); b.classList.add("html-inline"); b.innerHTML = sanitizeHtml(t); }
+    else addMsg("bot", t);
+  }
+  function histChunk(m) {
+    if (m.role === "tool") {
+      histFlush();
+      const wrap = document.createElement("div");
+      wrap.className = "msg msg-bot";
+      wrap.innerHTML = '<span class="msg-ava tool-ava">⚙</span><div class="bubble tool-bubble tool-done"></div>';
+      wrap.querySelector(".tool-bubble").textContent = "🔧 " + (m.title || "工具") + (m.status ? " · " + m.status : "");
+      body.appendChild(wrap);
+      return;
+    }
+    if (!histAcc || histAcc.role !== m.role) { histFlush(); histAcc = { role: m.role, text: "" }; }
+    histAcc.text += m.text || "";
+  }
+  function histDone() {
+    histFlush();
+    if (!body.children.length) addMsg("bot", "（这个会话还没有消息）");
+    setBusy(false);
+    body.scrollTop = body.scrollHeight;
+  }
+
+  function toggleSessMenu(force) {
+    const show = force !== undefined ? force : sessMenu.hidden;
+    sessMenu.hidden = !show;
+    if (show) {
+      // drop the panel just under the header (left-aligned to the session button)
+      const head = $("chat").querySelector(".chat-head");
+      sessMenu.style.top = head.offsetHeight + 4 + "px";
+      refreshSessions();
+    }
+  }
+  $("sess-toggle").onclick = (e) => { e.stopPropagation(); toggleSessMenu(); };
+  $("sess-new").onclick = () => newSession();
+  document.addEventListener("click", (e) => {
+    if (!sessMenu.hidden && !sessMenu.contains(e.target) && !$("sess-toggle").contains(e.target)) toggleSessMenu(false);
+  });
+
   function connectChat() {
     chatWS = new WebSocket(wsURL("/ws/chat"));
     chatWS.onmessage = (e) => {
@@ -307,9 +495,15 @@
         case "token": appendToken(m.text || ""); break;
         case "tool": addToolLine(m); break;
         case "permission": addPermission(m); break;
-        case "done": finishTurn(); break;
+        case "done": finishTurn(); setTimeout(() => { if (!busy) refreshSessions(); }, 800); break;
         case "error": rm(curBubble); curBubble = null; addMsg("bot", "⚠️ " + m.error); setBusy(false); break;
         case "need_key": rm(curBubble); curBubble = null; setBusy(false); openKeyModal(); break;
+        case "sessions": renderSessions(m.items || [], m.current); break;
+        case "session_switched": onSwitched(m.id, m.title, m.fresh); break;
+        case "session_deleted": onDeleted(m.id); break;
+        case "history_start": histStart(); break;
+        case "hist": histChunk(m); break;
+        case "history_done": histDone(); break;
       }
     };
     chatWS.onclose = () => { if (sessionActive) setTimeout(() => sessionActive && connectChat(), 1500); };
@@ -416,7 +610,7 @@
   function startApp() {
     sessionActive = true;
     sessionMask.hidden = true;
-    if (!termWS || termWS.readyState > 1) connectTerm();
+    TERM.start();
     if (!chatWS || chatWS.readyState > 1) connectChat();
     fetchStatus();
   }
@@ -430,7 +624,7 @@
         showMask("控制台已在其他窗口打开", "为避免冲突，这个控制台同一时间只允许一个窗口。", true);
       } else if (m.type === "evicted") {
         evicted = true; sessionActive = false;
-        try { termWS && termWS.close(); chatWS && chatWS.close(); } catch (_) {}
+        try { TERM.stop(); chatWS && chatWS.close(); } catch (_) {}
         showMask("此会话已被接管", "你已在另一个窗口打开了控制台。", true);
       }
     };
