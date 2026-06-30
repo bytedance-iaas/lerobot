@@ -83,29 +83,38 @@ docker buildx build \
   --output type=image,name=<registry>/lerobot-console:<tag>,push=true,compression=gzip,force-compression=true,oci-mediatypes=true \
   .
 
-# One-time: login secret + persistent volume for the Ark key/sessions/skills
+# One-time: login secret + persistent volumes (Ark key/sessions/skills, and certs)
 kubectl create secret generic lerobot-console-auth \
   --from-literal=user=lerobot --from-literal=password='<strong-password>'
-kubectl apply -f k8s/pvc.yaml
+kubectl apply -f k8s/pvc.yaml -f k8s/caddy-pvc.yaml
 
-# Deploy
-kubectl apply -f k8s/deployment.yaml
-kubectl apply -f k8s/service.yaml
+# Set your domain + ACME email in k8s/deployment.yaml (caddy sidecar env:
+# CONSOLE_DOMAIN, ACME_EMAIL) and your VPC subnet in k8s/service-lb.yaml.
+kubectl apply -f k8s/caddy-config.yaml
+kubectl apply -f k8s/service.yaml          # ClusterIP (for port-forward/debug)
+kubectl apply -f k8s/deployment.yaml       # console + Caddy auto-HTTPS sidecar
+kubectl apply -f k8s/service-lb.yaml       # public L4 LB (443+80 -> Caddy)
 
-# Open it (public inbound is blocked on iaas-test03 — use port-forward).
-# The browser will prompt for the Basic-auth user/password from the Secret.
-kubectl port-forward svc/lerobot-console 8080:8080
-open http://localhost:8080
+# Point your domain's DNS (A record) at the LB's public IP:
+kubectl get svc lerobot-console-lb -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+# then open https://<your-domain>  (Caddy auto-issues a Let's Encrypt cert)
 
 # You can still exec into the pod and run anything directly:
-kubectl exec -it deploy/lerobot-console -- bash
+kubectl exec -it deploy/lerobot-console -c console -- bash
 ```
 
+**TLS (auto, option A):** a **Caddy sidecar** terminates HTTPS and
+auto-provisions/renews a Let's Encrypt cert for `CONSOLE_DOMAIN` — you just point
+a domain at the LB. The LB is plain **L4** (CLB) passing 443+80 through to Caddy;
+WebSocket + Basic-auth pass through transparently. ACME needs inbound 80/443
+reachable (HTTP-01); on inbound-blocked accounts switch Caddy to a DNS-01 challenge.
+For VKE-managed L7 / a 证书中心 cert instead, see `k8s/ingress-alb.yaml` (option B).
+
 **Persistence & auth:** `HERMES_HOME=/opt/data` is a PVC, so the Ark key (entered
-once in the UI), chat sessions, and the `robot_sft` skill survive pod restarts.
-The whole console is behind single-user HTTP Basic auth — set `CONSOLE_USER` /
-`CONSOLE_PASSWORD` (via the Secret). The console also enforces a single open
-session at a time.
+once in the UI), chat sessions, and the `robot_sft` skill survive pod restarts;
+Caddy's certs persist on their own PVC. The whole console is behind single-user
+HTTP Basic auth (`CONSOLE_USER` / `CONSOLE_PASSWORD` via the Secret), and enforces
+a single open session at a time.
 
 > **zstd ↔ VKE note:** the VKE node here runs containerd 1.6.38, whose zstd
 > support is incomplete. Always push this image gzip-compressed. zstd is only
