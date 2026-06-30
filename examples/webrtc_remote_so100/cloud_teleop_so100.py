@@ -49,7 +49,7 @@ import numpy as np
 from PIL import Image
 
 from lerobot.robots.webrtc_proxy.configuration_webrtc_proxy import WebRTCCameraSpec, WebRTCProxyRobotConfig
-from lerobot.robots.webrtc_proxy.proxy_robot import WebRTCProxyRobot
+from lerobot.robots.webrtc_proxy.proxy_robot import CameraLayoutMismatch, WebRTCProxyRobot
 
 SIGNALING_URL = "ws://127.0.0.1:8765/ws"
 SESSION_ID = "so100"
@@ -273,7 +273,19 @@ def main() -> None:
     )
     robot.connect()
     _motors[:] = robot.motors
-    obs = robot.get_observation()
+    try:
+        obs = robot.get_observation()  # first obs validates the camera layout vs the Mac
+    except CameraLayoutMismatch as e:
+        # Friendly, actionable exit instead of a deep cv2.resize traceback.
+        print(f"\n  ✗ {e}\n", file=sys.stderr)
+        print(
+            f"  This side:  --cameras {args.cameras}\n"
+            "  Set the daemon's --cameras to the same names + resolutions (or fix this side),\n"
+            "  then re-run. Tip: a single shared camera is the easiest to get working first.\n",
+            file=sys.stderr,
+        )
+        robot.disconnect()
+        sys.exit(2)
     _targets.update({f"{m}.pos": float(obs[f"{m}.pos"]) for m in _motors})  # hold current pose
 
     server = None
