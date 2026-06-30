@@ -27,7 +27,7 @@ chat, a modal asks for your Ark API key. It is written to the hermes config and
 it any time via the ⚙ button in the chat header.
 
 Endpoint defaults to `https://ark.cn-beijing.volces.com/api/v3`, model
-`doubao-seed-2-0-pro-260215` (both overridable in the modal's *Advanced* section
+`deepseek-v4-pro-260425` (both overridable in the modal's *Advanced* section
 or via `ARK_BASE_URL` / `ARK_MODEL`).
 
 ## Run locally (dev)
@@ -65,28 +65,47 @@ runtime if it is missing.
 
 ## Build & deploy on VKE
 
-The image layers this console on top of a LeRobot image, so one container has
-both the console (`:8080`) and the full LeRobot environment.
+One image / one container = **lerobot + a slim hermes + this console** (`:8080`).
+`kubectl exec` into the pod gives you the same env the console drives.
+
+**hermes is installed slim** (see `Dockerfile`): a git checkout in an isolated
+venv with only the `acp` extra — ACP (stdio) chat + the shell tool. No Node, no
+browser/Chromium, no ffmpeg, no messaging/matrix/voice/web-search/mcp extras, no
+dashboard/TUI. ~100 MB of Python on top of the lerobot base (validated:
+`hermes acp --check` passes). `HERMES_DISABLE_LAZY_INSTALLS=1` stops it from
+pip-installing optional tools at runtime.
 
 ```bash
-# Build ON TOP of your LeRobot image. Push with GZIP — VKE node containerd 1.6.x
-# rejects zstd layers (`number of layers and diffIDs don't match`).
+# Separate pipeline: FROM a known-good GZIP lerobot tag (VKE node containerd 1.6.x
+# rejects zstd — `number of layers and diffIDs don't match`).
 docker buildx build \
-  --build-arg BASE_IMAGE=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot:<tag> \
+  --build-arg BASE_IMAGE=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot:<gzip-tag> \
   --output type=image,name=<registry>/lerobot-console:<tag>,push=true,compression=gzip,force-compression=true,oci-mediatypes=true \
   .
+
+# One-time: login secret + persistent volume for the Ark key/sessions/skills
+kubectl create secret generic lerobot-console-auth \
+  --from-literal=user=lerobot --from-literal=password='<strong-password>'
+kubectl apply -f k8s/pvc.yaml
 
 # Deploy
 kubectl apply -f k8s/deployment.yaml
 kubectl apply -f k8s/service.yaml
 
-# Open it (public inbound is blocked on iaas-test03 — use port-forward)
+# Open it (public inbound is blocked on iaas-test03 — use port-forward).
+# The browser will prompt for the Basic-auth user/password from the Secret.
 kubectl port-forward svc/lerobot-console 8080:8080
 open http://localhost:8080
 
 # You can still exec into the pod and run anything directly:
 kubectl exec -it deploy/lerobot-console -- bash
 ```
+
+**Persistence & auth:** `HERMES_HOME=/opt/data` is a PVC, so the Ark key (entered
+once in the UI), chat sessions, and the `robot_sft` skill survive pod restarts.
+The whole console is behind single-user HTTP Basic auth — set `CONSOLE_USER` /
+`CONSOLE_PASSWORD` (via the Secret). The console also enforces a single open
+session at a time.
 
 > **zstd ↔ VKE note:** the VKE node here runs containerd 1.6.38, whose zstd
 > support is incomplete. Always push this image gzip-compressed. zstd is only

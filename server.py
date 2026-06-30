@@ -81,7 +81,7 @@ HTML_DIRECTIVE = (
 
 # Ark / Volcengine OpenAI-compatible endpoint and a sensible default model.
 DEFAULT_BASE_URL = os.environ.get("ARK_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
-DEFAULT_MODEL = os.environ.get("ARK_MODEL", "doubao-seed-2-0-pro-260215")
+DEFAULT_MODEL = os.environ.get("ARK_MODEL", "deepseek-v4-pro-260425")
 
 # Placeholder values that mean "no real key yet" — treat chat as not-ready.
 _PLACEHOLDERS = {"", "your-api-key", "changeme", "<set-me>", "null", "none"}
@@ -700,8 +700,15 @@ async def _redirect_to_slash(request: web.Request) -> web.Response:
 # --------------------------------------------------------------------------- #
 # Auth (single-user HTTP Basic) + single-session lock                          #
 # --------------------------------------------------------------------------- #
+async def handle_health(_request: web.Request) -> web.Response:
+    return web.Response(text="ok")
+
+
 @web.middleware
 async def auth_middleware(request: web.Request, handler):
+    # /healthz must stay open so LB / k8s health checks don't get 401'd.
+    if request.path == "/healthz":
+        return await handler(request)
     if AUTH_ENABLED:
         hdr = request.headers.get("Authorization", "")
         ok = False
@@ -805,6 +812,7 @@ def build_app() -> web.Application:
     app.on_startup.append(_on_startup)
     app.on_cleanup.append(_on_cleanup)
     app.router.add_get("/", handle_index)
+    app.router.add_get("/healthz", handle_health)   # unauthenticated — for LB/k8s probes
     app.router.add_get("/api/status", handle_status)
     app.router.add_get("/api/services", handle_services)
     app.router.add_post("/api/volcano-key", handle_volcano_key)

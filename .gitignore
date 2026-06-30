@@ -7,3 +7,6 @@ dist/
 build/
 .DS_Store
 *.log
+
+# real secret (never commit)
+k8s/secret.yaml
