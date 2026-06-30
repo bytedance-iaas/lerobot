@@ -18,14 +18,19 @@ if [ ! -s "$HERMES_HOME/config.yaml" ] && [ -d "$SEED" ]; then
   cp -a "$SEED/." "$HERMES_HOME/"
 fi
 
-# Safety net: if the skill still isn't present (e.g. seed missing on an old image),
-# try a local re-copy, then a network install as a last resort.
+# Safety net: ensure the robot_sft skill is present. Prefer offline sources — the
+# baked snapshot, then the vendored copy that's always in the image — and only
+# fall back to a network install (needs GitHub) as a last resort.
 if command -v hermes >/dev/null 2>&1 && ! hermes skills list 2>/dev/null | grep -qi "robot_sft"; then
-  if [ -d "$SEED/skills" ]; then
-    echo "==> restoring robot_sft skill from baked snapshot"
-    mkdir -p "$HERMES_HOME/skills" && cp -a "$SEED/skills/." "$HERMES_HOME/skills/"
+  mkdir -p "$HERMES_HOME/skills"
+  if [ -d "$SEED/skills/robot_sft" ]; then
+    echo "==> restoring robot_sft from baked snapshot (offline)"
+    cp -a "$SEED/skills/robot_sft" "$HERMES_HOME/skills/robot_sft"
+  elif [ -d /opt/agent-console/vendor/robot_sft ]; then
+    echo "==> restoring robot_sft from vendored copy (offline)"
+    cp -a /opt/agent-console/vendor/robot_sft "$HERMES_HOME/skills/robot_sft"
   else
-    echo "==> robot_sft not baked in; attempting network install (needs GitHub)"
+    echo "==> robot_sft not in image; attempting network install (needs GitHub)"
     bash /opt/agent-console/scripts/install_skill.sh || echo "WARN: skill unavailable; chat still works without it"
   fi
 fi

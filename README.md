@@ -53,26 +53,24 @@ Environment knobs:
 
 ## The robot_sft skill (requirement f)
 
-Chat preloads the [`robot_sft`](https://github.com/thesues/robot_sft) skill so
-the agent knows the LeRobot SFT pipeline. Install it into hermes with:
-
-```bash
-./scripts/install_skill.sh           # hermes skills install thesues/robot_sft
-```
-
-The Dockerfile installs it at **build time** (when GitHub is reachable) and bakes
-the result into the image (`/opt/hermes-seed`). At runtime the entrypoint restores
-it into the PVC with a **local copy** — so a running pod never needs GitHub access.
+Chat preloads the [`robot_sft`](https://github.com/thesues/robot_sft) skill so the
+agent knows the LeRobot SFT pipeline. It is **vendored into this repo** at
+`vendor/robot_sft/` (upstream commit in `vendor/robot_sft.SOURCE`), so neither the
+build nor a running pod needs GitHub: the Dockerfile drops it into
+`$HERMES_HOME/skills/` (hermes auto-discovers it) and bakes it into the seed; the
+entrypoint restores it into the PVC with a local copy. Re-vendor when upstream
+changes: `rm -rf vendor/robot_sft && git clone --depth 1 https://github.com/thesues/robot_sft vendor/robot_sft && rm -rf vendor/robot_sft/.git`.
 
 ## Build & deploy on VKE
 
 One image / one container = **lerobot + a slim hermes + this console** (`:8080`).
 `kubectl exec` into the pod gives you the same env the console drives.
 
-**hermes is installed slim** (see `Dockerfile`): a git checkout in an isolated
-venv with only the `acp` extra — ACP (stdio) chat + the shell tool. No Node, no
-browser/Chromium, no ffmpeg, no messaging/matrix/voice/web-search/mcp extras, no
-dashboard/TUI. ~100 MB of Python on top of the lerobot base (validated:
+**hermes is installed slim** (see `Dockerfile`): `pip install "hermes-agent[acp]"`
+from the PyPI mirror (no GitHub) into an isolated venv — ACP (stdio) chat + the
+shell tool. No Node, no browser/Chromium, no ffmpeg, no messaging/matrix/voice/
+web-search/mcp extras, no dashboard/TUI. ~100 MB of Python on top of the lerobot
+base (validated:
 `hermes acp --check` passes). `HERMES_DISABLE_LAZY_INSTALLS=1` stops it from
 pip-installing optional tools at runtime.
 
