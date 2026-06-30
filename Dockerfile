@@ -76,6 +76,14 @@ RUN mkdir -p "${HERMES_HOME}/skills" \
     && hermes skills list | grep -qi robot_sft \
     && cp -a "${HERMES_HOME}" /opt/hermes-seed
 
+# --- assert the runtime wiring at BUILD time (fail fast if a venv is wrong) -- #
+# 1) server.py runs in the lerobot venv → must import aiohttp + yaml and parse.
+# 2) hermes resolves via the symlink → its own venv (separate process).
+RUN python -c "import aiohttp, yaml, ast; ast.parse(open('/opt/agent-console/server.py').read()); print('lerobot venv: console deps + server.py OK')" \
+    && test -x /usr/local/bin/hermes \
+    && hermes --version \
+    && echo "runtime wiring OK (lerobot venv + hermes venv + skill)"
+
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh scripts/install_skill.sh
 
