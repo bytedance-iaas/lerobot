@@ -58,12 +58,13 @@ STATIC = HERE / "static"
 
 PORT = int(os.environ.get("PORT", "8080"))
 SHELL = os.environ.get("CONSOLE_SHELL") or shutil.which("bash") or "/bin/sh"
-# Both the shell console and the hermes agent operate from LEROBOT_HOME (the
-# lerobot install/checkout). Precedence: LEROBOT_HOME > CONSOLE_WORKDIR > cwd.
-# We then export LEROBOT_HOME so every child (shell, hermes acp, lerobot CLIs)
-# sees a consistent value even if only CONSOLE_WORKDIR was provided.
-WORKDIR = os.environ.get("LEROBOT_HOME") or os.environ.get("CONSOLE_WORKDIR") or os.getcwd()
-os.environ["LEROBOT_HOME"] = WORKDIR
+# Working dir for the shell console + hermes agent (the lerobot checkout).
+# Precedence: CONSOLE_WORKDIR > LEROBOT_HOME > cwd.
+# IMPORTANT: LEROBOT_HOME is *lerobot's own* (deprecated) cache var — recent
+# lerobot RAISES if it's set. So we read it for back-compat but then REMOVE it
+# from the environment, so it never leaks to children (shell, hermes, lerobot CLIs).
+WORKDIR = os.environ.get("CONSOLE_WORKDIR") or os.environ.get("LEROBOT_HOME") or os.getcwd()
+os.environ.pop("LEROBOT_HOME", None)
 HERMES_BIN = os.environ.get("HERMES_BIN") or shutil.which("hermes") or "hermes"
 # Single-user HTTP Basic auth, credentials from the environment. When both are
 # set, EVERY route (page, static, WS, proxy) requires them; otherwise the console

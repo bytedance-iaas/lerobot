@@ -45,8 +45,7 @@ Environment knobs:
 | `PORT` | `8080` | listen port (HTTP, or HTTPS when TLS is set) |
 | `CONSOLE_TLS_CERT` / `CONSOLE_TLS_KEY` | unset | if both set + exist, the console serves **HTTPS/wss natively** (no TLS sidecar). Unset → plain HTTP. |
 | `CONSOLE_USER` / `CONSOLE_PASSWORD` | unset | single-user HTTP Basic auth (both required to enable) |
-| `LEROBOT_HOME` | cwd | shell + agent working dir; exported to all child processes (precedence: `LEROBOT_HOME` > `CONSOLE_WORKDIR` > cwd) |
-| `CONSOLE_WORKDIR` | cwd | fallback working dir if `LEROBOT_HOME` unset |
+| `CONSOLE_WORKDIR` | cwd | shell + agent working dir (the lerobot checkout). Do NOT use `LEROBOT_HOME` — that's lerobot's own deprecated cache var; the console removes it from the env so it never breaks lerobot CLIs. |
 | `CONSOLE_SHELL` | `bash` | shell for the PTY console |
 | `HERMES_BIN` | `hermes` | hermes executable |
 | `HERMES_CHAT_SKILL` | `robot_sft` | skill preloaded into chat (empty to disable) |
