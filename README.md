@@ -60,8 +60,9 @@ the agent knows the LeRobot SFT pipeline. Install it into hermes with:
 ./scripts/install_skill.sh           # hermes skills install thesues/robot_sft
 ```
 
-The Dockerfile installs it at build time, and the entrypoint re-installs it at
-runtime if it is missing.
+The Dockerfile installs it at **build time** (when GitHub is reachable) and bakes
+the result into the image (`/opt/hermes-seed`). At runtime the entrypoint restores
+it into the PVC with a **local copy** — so a running pod never needs GitHub access.
 
 ## Build & deploy on VKE
 

@@ -45,14 +45,19 @@ COPY server.py ./
 COPY static ./static
 COPY scripts ./scripts
 
-# --- trim hermes built-in tools to what an ops console needs --------------- #
-# (best-effort: written to $HERMES_HOME; a runtime PVC mount may shadow it, in
-#  which case the entrypoint re-applies — both paths are covered.)
+# --- seed hermes config + bake the robot_sft skill INTO the image ----------- #
+# Installs the skill at BUILD time (GitHub is reachable then) into $HERMES_HOME,
+# then snapshots the whole seeded home to /opt/hermes-seed. At runtime a fresh PVC
+# mount shadows $HERMES_HOME, so the entrypoint restores the skill+config from the
+# baked snapshot with a local copy — NO runtime GitHub access required.
+# (No `|| true`: if the skill can't be baked in, fail the build loudly.)
 RUN mkdir -p "${HERMES_HOME}" \
     && hermes config set model.provider custom \
     && hermes config set model.base_url https://ark.cn-beijing.volces.com/api/v3 \
     && hermes config set model.default deepseek-v4-pro-260425 \
-    && (bash scripts/install_skill.sh || echo "WARN: robot_sft skill install deferred to runtime")
+    && bash scripts/install_skill.sh \
+    && hermes skills list | grep -qi robot_sft \
+    && cp -a "${HERMES_HOME}" /opt/hermes-seed
 
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh scripts/install_skill.sh
