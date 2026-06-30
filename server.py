@@ -684,17 +684,31 @@ async def handle_proxy(request: web.Request) -> web.StreamResponse:
             request.method, target, headers=req_headers, data=body or None,
             allow_redirects=False,
         ) as upstream:
-            raw = await upstream.read()
-            ctype = upstream.headers.get("Content-Type", "")
-            if "text/html" in ctype.lower():
-                raw = _rewrite_html(raw, prefix)
+            ctype = upstream.headers.get("Content-Type", "").lower()
             resp_headers = {k: v for k, v in upstream.headers.items()
                             if k.lower() not in _HOP_BY_HOP}
             # Keep redirects inside the proxy.
             loc = upstream.headers.get("Location")
             if loc and loc.startswith("/") and not loc.startswith("//"):
                 resp_headers["Location"] = prefix + loc[1:]
-            return web.Response(status=upstream.status, body=raw, headers=resp_headers)
+
+            # HTML: buffer + rewrite (inject <base>, fix root-absolute URLs).
+            if "text/html" in ctype:
+                raw = _rewrite_html(await upstream.read(), prefix)
+                return web.Response(status=upstream.status, body=raw, headers=resp_headers)
+
+            # Everything else: STREAM chunk-by-chunk so never-ending responses work
+            # (MJPEG multipart camera feeds, SSE, large downloads) instead of being
+            # buffered to completion — which would hang an infinite stream forever.
+            resp = web.StreamResponse(status=upstream.status, headers=resp_headers)
+            await resp.prepare(request)
+            try:
+                async for chunk in upstream.content.iter_any():
+                    await resp.write(chunk)
+            except (aiohttp.ClientError, ConnectionResetError):
+                pass
+            await resp.write_eof()
+            return resp
     except aiohttp.ClientError as e:
         return web.Response(status=502, text=f"proxy error to localhost:{port}: {e}")
 
