@@ -74,22 +74,6 @@
     return tabEl;
   }
 
-  function addHtmlTab(html, label) {
-    const id = "t" + ++tabSeq;
-    const tabEl = makeTab(id, label || "AI 输出 " + tabSeq);
-    const pane = document.createElement("div");
-    pane.className = "vpane";
-    pane.dataset.pane = id;
-    const iframe = document.createElement("iframe");
-    iframe.setAttribute("sandbox", "allow-scripts allow-same-origin allow-forms allow-popups allow-modals");
-    iframe.srcdoc = html;
-    pane.appendChild(iframe);
-    viewerBody.appendChild(pane);
-    tabs.set(id, { tabEl, paneEl: pane, kind: "html" });
-    activate(id);
-    return id;
-  }
-
   function addServiceTab(port, label) {
     for (const [tid, t] of tabs) if (t.kind === "service" && t.port === port) { activate(tid); return tid; }
     const id = "t" + ++tabSeq;
@@ -197,9 +181,26 @@
   const looksHtml = (s) =>
     /<(html|body|div|table|section|article|main|header|h[1-6]|ul|ol|li|p|span|canvas|svg|img|pre|code|style|script|button|form|iframe)[\s>/]/i.test(s);
 
-  function htmlTitle(html) {
-    const t = html.match(/<title[^>]*>([^<]+)<\/title>/i) || html.match(/<h[1-3][^>]*>([^<]+)<\/h[1-3]>/i);
-    return t ? t[1].trim().slice(0, 26) : null;
+  // Models sometimes wrap HTML in a ```html … ``` fence despite the directive;
+  // unwrap it so the bubble gets clean markup instead of literal backticks.
+  function extractHtml(s) {
+    const fence = s.match(/```(?:html)?\s*([\s\S]*?)```/i);
+    return (fence ? fence[1] : s).trim();
+  }
+  // The answer is rendered with innerHTML in a chat bubble, so drop anything
+  // executable: <script>/<style>, inline on* handlers, and javascript: URLs.
+  function sanitizeHtml(s) {
+    const tpl = document.createElement("template");
+    tpl.innerHTML = s;
+    tpl.content.querySelectorAll("script, style, iframe, object, embed, link, meta").forEach((n) => n.remove());
+    tpl.content.querySelectorAll("*").forEach((el) => {
+      [...el.attributes].forEach((a) => {
+        const v = (a.value || "").replace(/\s+/g, "").toLowerCase();
+        if (/^on/i.test(a.name) || ((a.name === "href" || a.name === "src") && v.startsWith("javascript:")))
+          el.removeAttribute(a.name);
+      });
+    });
+    return tpl.innerHTML;
   }
 
   function addMsg(role, text) {
@@ -215,11 +216,6 @@
     body.appendChild(wrap);
     body.scrollTop = body.scrollHeight;
     return bubble;
-  }
-  function addRenderedNote(label) {
-    const b = addMsg("bot", "已在左侧面板渲染：" + label + "  ↖");
-    b.style.color = "#2563eb";
-    b.style.cursor = "default";
   }
   function setBusy(b) {
     busy = b;
@@ -285,23 +281,17 @@
     body.scrollTop = body.scrollHeight;
   }
   function finishTurn() {
-    const txt = curText.trim();
-    if (txt && looksHtml(txt)) {
-      if (htmlToViewer()) {
-        const label = htmlTitle(txt) || "AI 输出";
-        addHtmlTab(txt, label);
-        rm(curBubble);               // rendered in the left panel instead
-        addRenderedNote(label);
-      } else {
-        // toggle off → render the HTML inline in the chat bubble
-        curBubble.classList.remove("thinking");
-        curBubble.classList.add("html-inline");
-        curBubble.innerHTML = txt;
-      }
-    } else if (!txt) {
+    const txt = extractHtml(curText.trim());   // unwrap any ```html fence
+    if (!txt) {
       rm(curBubble);                 // tool-only turn: drop the empty answer bubble
+    } else if (looksHtml(txt)) {
+      // answer carries simple inline HTML (tables/lists) → render it in the bubble
+      curBubble.classList.remove("thinking");
+      curBubble.classList.add("html-inline");
+      curBubble.innerHTML = sanitizeHtml(txt);
     } else {
       curBubble.classList.remove("thinking");
+      curBubble.textContent = txt;   // plain text reply
     }
     curBubble = null;
     setBusy(false);
@@ -324,12 +314,6 @@
     };
     chatWS.onclose = () => { if (sessionActive) setTimeout(() => sessionActive && connectChat(), 1500); };
   }
-
-  // HTML-render toggle: ON → answers render in the left viewer; OFF → inline in chat.
-  const htmlToggle = $("html-toggle");
-  htmlToggle.checked = localStorage.getItem("htmlToViewer") !== "0";
-  htmlToggle.onchange = () => localStorage.setItem("htmlToViewer", htmlToggle.checked ? "1" : "0");
-  function htmlToViewer() { return htmlToggle.checked; }
 
   function send() {
     const text = textEl.value.trim();

@@ -157,16 +157,6 @@ body {
 .chat-status { margin-left: auto; }
 .chat-gear { border: 0; background: transparent; cursor: pointer; font-size: 17px; color: var(--muted); }
 .chat-gear:hover { color: var(--ink); }
-.html-toggle { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
-.html-toggle input { position: absolute; opacity: 0; pointer-events: none; }
-.ht-track { width: 30px; height: 17px; border-radius: 999px; background: #d3d7df; position: relative;
-  transition: background .15s ease; flex: 0 0 auto; }
-.ht-thumb { position: absolute; top: 2px; left: 2px; width: 13px; height: 13px; border-radius: 50%;
-  background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.25); transition: left .15s ease; }
-.html-toggle input:checked + .ht-track { background: var(--orange); }
-.html-toggle input:checked + .ht-track .ht-thumb { left: 15px; }
-.html-toggle input:focus-visible + .ht-track { outline: 2px solid #cfe0ff; }
-.ht-label { font-size: 11.5px; color: var(--muted); white-space: nowrap; }
 
 /* single-session lock overlay */
 .session-mask { position: fixed; inset: 0; background: rgba(243,244,246,.92); backdrop-filter: blur(3px);
@@ -186,7 +176,7 @@ body {
 .msg-user { flex-direction: row-reverse; }
 .msg-user .bubble { background: #eef3ff; }
 .msg-user .msg-ava { background: #2b3040; }
-.bubble.html-inline { background: #fff; border: 1px solid var(--line); max-width: 100%; overflow-x: auto; }
+.bubble.html-inline { background: #fff; border: 1px solid var(--line); max-width: 100%; overflow-x: auto; white-space: normal; }
 .bubble.html-inline table { border-collapse: collapse; font-size: 12.5px; }
 .bubble.html-inline th, .bubble.html-inline td { border: 1px solid var(--line); padding: 4px 8px; }
 .bubble.html-inline h1, .bubble.html-inline h2, .bubble.html-inline h3 { font-size: 15px; margin: 6px 0; }

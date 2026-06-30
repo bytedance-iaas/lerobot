@@ -80,10 +80,12 @@ TLS_KEY = os.environ.get("CONSOLE_TLS_KEY") or ""
 # Skill to preload so the agent knows how to drive LeRobot SFT (requirement f).
 CHAT_SKILL = os.environ.get("HERMES_CHAT_SKILL", "robot_sft")
 
-# One-time steer (first turn of a session) so answers render in the left viewer.
-HTML_DIRECTIVE = (
-    "[System] 请用一个自包含的 HTML 片段作答（可含内联 CSS/JS，不要 markdown 代码围栏），"
-    "以便直接在面板中渲染。普通问答用简洁排版即可；涉及数据/表格/状态时尽量结构化展示。\n\n"
+# One-time steer (first turn of a session). Answers render directly in the chat
+# bubble — plain text, with simple inline HTML (tables/lists) for structured data.
+CHAT_DIRECTIVE = (
+    "[System] 请用简洁的纯文本作答；需要展示结构化数据（对比、列表、状态、表格）时，"
+    "可使用简单的内联 HTML 标签（如 <table>/<tr>/<td>/<ul>/<li>/<b>/<br>，无需 CSS、"
+    "不要 <script>/<style>、不要完整 HTML 页面、不要 markdown 代码围栏）。\n\n"
 )
 
 # Ark / Volcengine OpenAI-compatible endpoint and a sensible default model.
@@ -427,9 +429,9 @@ class HermesACP:
 
     async def prompt(self, text: str, on_update, on_permission):
         await self.ensure()
-        # Steer the agent to answer in HTML once at the start of the session.
+        # Steer the answer format once at the start of the session.
         if self._first_turn:
-            text = HTML_DIRECTIVE + text
+            text = CHAT_DIRECTIVE + text
             self._first_turn = False
         self.on_update = on_update
         self.on_permission = on_permission
