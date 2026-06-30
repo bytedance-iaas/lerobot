@@ -120,15 +120,50 @@ a single open session at a time.
 > support is incomplete. Always push this image gzip-compressed. zstd is only
 > safe on nodes with containerd ≥ 1.7.
 
+## Remote robot teleop (self-hosted LiveKit)
+
+To drive a SO-100 (or any lerobot robot) on your **home Mac** from the cloud, add a
+self-hosted **LiveKit SFU** (`k8s/livekit/`). Both ends dial **out** to the SFU, so
+it works behind home/cloud NAT.
+
+```
+  HOME Mac (SO-100 + cameras)                 VKE cloud
+    mac_daemon ──dial OUT──► livekit-clb (public CLB, 7880/7881 TCP + 7882 UDP)
+                                  │  ──► LiveKit SFU ◄── controller (runs IN the console pod,
+                                  │                       started from the console terminal)
+                                  ▼
+    panel served on localhost:8088 in the pod ──► shown in the console viewer via /proxy
+```
+
+The **console pod is the controller host** — run `cloud_teleop_so100.py` from the
+console terminal; its web panel is shown in the left viewer ("+ 打开" → 8088) over
+the console's existing HTTPS, so **no separate web CLB is needed** (only LiveKit's CLB).
+
+```bash
+# Set the subnet-id in k8s/livekit/service-clb.yaml, then:
+KUBECONFIG=~/Downloads/kube.conf ./scripts/deploy-livekit.sh
+# It prints the Mac mac_daemon command + the in-console controller command.
+```
+
+The controller dials the **internal** `ws://livekit-clb:7880` (ClusterIP, no public
+dep); the Mac dials the **public** `ws://<livekit-clb-ip>:7880`. Needs the webrtc
+deps in the image (`aiortc livekit livekit-api`); recent lerobot images bake them via
+`uv sync --extra all`. Full walkthrough + verification:
+`examples/webrtc_remote_so100/deploy/README.md` in the lerobot repo.
+
 ## Endpoints
 
 | route | purpose |
 |---|---|
 | `GET /` | the single-page UI |
+| `GET /healthz` | unauthenticated health check (for LB/k8s probes) |
 | `GET /api/status` | `{chat_ready, model, base_url, skill, workdir}` |
 | `POST /api/volcano-key` | set the Ark api key for chat (`{api_key, base_url?, model?}`) |
+| `GET /api/services` | discovered local services for the viewer |
 | `WS /ws/term` | PTY shell bridge |
-| `WS /ws/chat` | one hermes turn per message, with session continuity |
+| `WS /ws/chat` | one hermes turn per message (streaming, ACP) |
+| `WS /ws/control` | single-session presence lock |
+| `ANY /proxy/{port}/…` | reverse-proxy to an in-pod service (HTTP + WS) |
 
 ## License
 
