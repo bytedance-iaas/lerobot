@@ -56,6 +56,17 @@ from .transport import Transport, make_transport
 logger = logging.getLogger(__name__)
 
 
+class CameraLayoutMismatch(ValueError):
+    """The Mac's tiled video frame doesn't fit this end's camera specs.
+
+    Cameras are tiled into one track and sliced back purely by the (name-sorted)
+    specs — there is no per-frame metadata — so the two ends must declare the SAME
+    camera set (same names AND per-camera WxH). When they disagree the slices are
+    wrong, and a too-short frame would otherwise crash deep in ``cv2.resize`` on an
+    empty tile. We raise this instead, with an actionable message.
+    """
+
+
 class _ProxyEndpoint:
     """Cloud answerer: receives state + video, sends actions, drives the control plane.
 
@@ -173,6 +184,7 @@ class WebRTCProxyRobot(Robot):
         self._last_obs: RobotObservation | None = None  # last coherent obs (held on camera lag)
         self._last_obs_seq = -1  # seq of the most recent obs returned (action provenance)
         self._connected = False
+        self._frame_checked = False  # one-time camera-layout sanity check (see get_observation)
 
     # ----- schema (callable whether connected or not) ----------------------
     @cached_property
@@ -289,6 +301,9 @@ class WebRTCProxyRobot(Robot):
         # one capture instant. A dropped frame/state just means that seq is skipped.
         aligned = self._buffer.assemble()
         if aligned is not None:
+            if not self._frame_checked:
+                self._frame_checked = True
+                self._check_frame_layout(aligned.frame)
             self._last_obs_seq = aligned.seq  # actions sent next derive from this obs
             obs: RobotObservation = dict(aligned.joints)
             # The Mac tiled all cameras into one frame; slice it back per camera (same
@@ -304,6 +319,35 @@ class WebRTCProxyRobot(Robot):
             logger.warning("no state+frame pair yet; holding last obs")
             return dict(self._last_obs)
         raise RuntimeError("no observation available yet")
+
+    def _check_frame_layout(self, frame: np.ndarray) -> None:
+        """Verify the Mac's first tiled frame matches this end's camera specs.
+
+        Both ends slice the single video track by the same name-sorted specs, so a
+        size disagreement means the two ``--cameras`` sets differ. A frame shorter
+        than the stacked specs would leave empty tiles and crash ``cv2.resize``;
+        raise :class:`CameraLayoutMismatch` with a fix-it message instead. A taller/
+        wider frame still de-tiles (each tile is re-fit), so warn rather than fail.
+        """
+        exp_h, exp_w = tiling.tiled_size(self._specs)
+        fh, fw = frame.shape[:2]
+        if (fh, fw) == (exp_h, exp_w):
+            return
+        names = [n for n, _, _ in self._specs]
+        per_cam = ", ".join(f"{n}:{w}x{h}" for n, h, w in self._specs)
+        if fh < exp_h or fw < exp_w:
+            raise CameraLayoutMismatch(
+                f"camera set mismatch: this end is configured for {len(names)} camera(s) "
+                f"[{per_cam}] — expecting a {exp_w}x{exp_h} tiled frame — but the Mac daemon "
+                f"is streaming a {fw}x{fh} frame (too small to hold them). Both ends must use "
+                f"the SAME --cameras: identical names AND per-camera WxH. Update --cameras on "
+                f"the Mac daemon or here so they match."
+            )
+        logger.warning(
+            "camera frame is %dx%d but this end's --cameras [%s] expect %dx%d; "
+            "de-tiling may be misaligned — make both ends use the same --cameras.",
+            fw, fh, per_cam, exp_w, exp_h,
+        )
 
     def send_action(self, action: RobotAction) -> RobotAction:
         if not self._connected or self._endpoint is None or self._loop is None:
