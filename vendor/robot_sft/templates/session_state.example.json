@@ -1,22 +1,23 @@
 {
-  "session_id": "sess-20260604-101500",
-  "created_at": "2026-06-04T10:15:00",
-  "updated_at": "2026-06-04T12:40:10",
+  "session_id": "sess-20260701-101500",
+  "created_at": "2026-07-01T10:15:00",
+  "updated_at": "2026-07-01T12:40:10",
   "status": "in_progress",
   "current_stage": "train",
-  "goal": "Fine-tune GR00T-N1.7-3B on SO100 pick-place data and validate open-loop",
+  "goal": "Fine-tune an ACT policy on SO-101 pick-place data and validate open-loop",
   "config": {
-    "entrypoint": "examples/finetune.sh",
-    "embodiment_tag": "NEW_EMBODIMENT"
+    "entrypoint": "lerobot-train",
+    "policy_type": "act",
+    "dataset_repo_id": "user/so101_pick_place"
   },
   "stages": {
-    "overview": {"status": "done", "summary": "entrypoint=finetune.sh; risks: gated backbone, steps>>data", "updated_at": "2026-06-04T10:20:00"},
-    "dataset_explore": {"status": "done", "summary": "v3.0, 50 eps/19631 frames, cameras top+wrist, needs convert + modality fix", "updated_at": "2026-06-04T10:35:00"},
-    "preprocess": {"status": "done", "summary": "converted v3->v2; modality front->observation.images.top", "updated_at": "2026-06-04T10:55:00"},
-    "training_plan": {"status": "done", "summary": "18881 samples, 6 epochs -> 3540 steps, batch 32, workers 4", "updated_at": "2026-06-04T11:05:00"},
-    "train": {"status": "in_progress", "summary": "run-001 training under watchdog", "updated_at": "2026-06-04T11:06:00"}
+    "overview": {"status": "done", "summary": "entrypoint=lerobot-train, policy=act; risks: steps>>data, output_dir must be on /opt/data", "updated_at": "2026-07-01T10:20:00"},
+    "dataset_explore": {"status": "done", "summary": "v3.0, 52 eps/19631 frames, cameras front+wrist, state/action dim 6", "updated_at": "2026-07-01T10:35:00"},
+    "preprocess": {"status": "done", "summary": "held out 5/52 episodes for eval (seed 42); train=47", "updated_at": "2026-07-01T10:55:00"},
+    "training_plan": {"status": "done", "summary": "~17100 frames, 6 epochs -> 6414 steps, batch 16, save_freq 600, workers 4", "updated_at": "2026-07-01T11:05:00"},
+    "train": {"status": "in_progress", "summary": "run-001 training under watchdog", "updated_at": "2026-07-01T11:06:00"}
   },
   "runs": [
-    {"run_id": "run-001", "status": "running", "restarts": 1, "last_step": 2200, "last_loss": 0.42}
+    {"run_id": "run-001", "status": "running", "restarts": 1, "last_step": 2200, "last_loss": 0.42, "checkpoint": "002000"}
   ]
 }

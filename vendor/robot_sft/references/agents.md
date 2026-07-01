@@ -5,6 +5,11 @@ through `scripts/session.py` + its own JSON artifact. Keep each agent narrow: it
 stage, validates, writes, marks the stage `done`, returns a 2–3 line summary. The
 orchestrator (main loop in SKILL.md) decides what runs next.
 
+Environment (console pod): the lerobot checkout is **/lerobot** — run all lerobot commands
+from there (`cd /lerobot && uv run ...`). All big artifacts (session state, checkpoints,
+HF caches) live on **/opt/data** (the roomy persistent volume); `session.py` and
+`plan_training.py` default there already.
+
 Artifact convention: every stage writes `<stage>.json` with at least
 `{"stage": ..., "status": "done|blocked", "summary": "...", ...stage-specific...}` and then
 calls `session.py set-stage <stage> done` (or `blocked`).
@@ -14,19 +19,22 @@ calls `session.py set-stage <stage> done` (or `blocked`).
 ## a. overview — review & gate
 
 **Goal:** understand intent + the user's current training setup, review it, and gate the
-session. **Inputs:** the conversation/request, the repo, any training script the user
-points to. **Steps:**
-1. Locate the training **entrypoint** (e.g. `examples/finetune.sh`, a `launch_*.py`, or a
-   command the user gave). **If none exists, write `overview.json` with `status:"blocked"`,
-   reason "no training entrypoint", and STOP the session** — do not scaffold one.
-2. Extract the resolved **goal**, **embodiment tag**, **dataset reference**, **base model**,
-   and the **parameters present vs missing** (batch, lr, steps, output dir, modality config…).
-3. Produce a **review** (requirement #1): walk `references/lessons_learned.md` against this
-   setup and call out risks (gated backbone? shm? steps vs dataset size? save_only_model?
-   camera keys?), plus general SFT advice (freeze the VLM for small data, augmentation,
-   open-loop eval to pick checkpoints). Be concrete and prioritized.
+session. **Inputs:** the conversation/request, the lerobot checkout, any training command
+the user points to. **Steps:**
+1. Resolve the training **entrypoint**. The default here is lerobot's own
+   `lerobot-train` — if the user has a dataset and names (or we can infer) a policy type,
+   that IS the entrypoint; nothing needs scaffolding. Only mark `blocked` if the request
+   needs a training path lerobot doesn't provide (e.g. a custom trainer they haven't
+   written) — report that and STOP; do not invent one.
+2. Extract the resolved **goal**, **dataset reference** (`repo_id` / local root),
+   **policy** (fresh `--policy.type` vs finetune `--policy.path`), and the **parameters
+   present vs missing** (batch, steps, output dir, device…).
+3. Produce a **review**: walk `references/lessons_learned.md` against this setup and call
+   out risks (Hub auth for gated policy bases? shm? steps vs dataset size? output_dir on
+   the big disk? camera-key match for --policy.path?), plus general SFT advice (small data
+   → modest epochs, held-out eval to pick checkpoints). Be concrete and prioritized.
 
-**Output `overview.json`:** `{goal, entrypoint, base_model, embodiment_tag,
+**Output `overview.json`:** `{goal, entrypoint:"lerobot-train", policy_type|policy_path,
 dataset_ref, params_found:{}, params_missing:[], review:[{risk, severity, fix}], status}`.
 
 ---
@@ -35,50 +43,48 @@ dataset_ref, params_found:{}, params_missing:[], review:[{risk, severity, fix}],
 
 **Trigger:** the user names a dataset / path, OR is vague about it (either way, run this).
 **Goal:** know the data cold before planning. **Steps:**
-1. Resolve the dataset location (local path or HF repo id). If HF, note whether it needs
-   downloading.
-2. Read `meta/info.json`: `codebase_version` (v2.1 vs v3.0 → conversion?), `robot_type`,
-   `fps`, `total_episodes`, `total_frames`, and `features` (every `observation.images.*`
-   camera key, `observation.state` shape, `action` shape).
-3. Derive **num training samples** (≈ total_frames, modulo the action-horizon windowing the
-   trainer uses) for the step computation in stage d.
-4. Determine the **modality mapping** needed: which GR00T modality keys (`front`, `wrist`,
-   `single_arm`, `gripper`, …) map to which real columns, and whether the existing
-   `modality.json` matches (catch the `front`-vs-`top` class of bug here).
-5. Flag anything off: missing cameras, dim mismatch, weird fps, tiny dataset (warn that
-   pure-public data won't cross the calibration/viewpoint gap to a real robot).
+1. Resolve the dataset location: local dir (`--dataset.root`) or HF repo id (cached under
+   `$HF_LEROBOT_HOME`, which in the pod resolves onto /opt/data via `HOME`). If HF, note
+   whether it needs downloading.
+2. Read `meta/info.json`: `codebase_version` (this lerobot expects **v3.0**; v2.x needs
+   converting with lerobot's dataset conversion tooling first), `robot_type`, `fps`,
+   `total_episodes`, `total_frames`, and `features` (every `observation.images.*` camera
+   key, `observation.state` shape, `action` shape).
+3. Derive **num training frames** (≈ total_frames minus the frames of episodes that will be
+   held out) for the step computation in stage d.
+4. If **finetuning a pretrained policy** (`--policy.path`), diff the dataset features
+   against the policy's `config.json` input/output features — camera names and state/action
+   dims must line up (lessons_learned #6). Fresh `--policy.type` training self-derives
+   features from the dataset, so this check is a no-op there.
+5. Flag anything off: missing cameras, dim mismatch, weird fps, tiny dataset (warn that a
+   handful of episodes won't generalize).
 
 **Output `dataset_explore.json`:** `{path_or_repo, version, needs_conversion:bool,
 robot_type, fps, total_episodes, total_frames, est_samples, cameras:[], state_dim,
-action_dim, modality_ok:bool, modality_fixes:[], warnings:[]}`.
+action_dim, feature_match_ok:bool, warnings:[]}`.
 
 ---
 
 ## c. data_preprocess — conversion (if needed) + train/eval split (always, unless opted out)
 
-**Trigger:** runs whenever a conversion/modality fix is needed OR a train/eval split is wanted
-(the default). **Steps:**
-1. If conversion needed (e.g. LeRobot v3.0→v2.1), run the project's converter; ensure build
-   deps are present first (e.g. `pythonX.Y-dev` headers — lessons_learned #10).
-2. Author/place the corrected `modality.json` in the dataset `meta/` so camera keys + state/
-   action slices match the real columns (lessons_learned #6).
-3. **Train/eval split (lessons_learned #13):** GR00T's sharded finetune path can't do in-loop
-   eval, so hold out episodes **before** training. For each dataset, reserve ≈10% of episodes
-   (min 1; warn if too tiny) into a sibling `eval/` dataset dir and keep the rest in `train/`.
-   A LeRobot v2.1 split = copy the chosen `data/chunk-*/episode_*.parquet` + matching
-   `videos/chunk-*/<cam>/episode_*.mp4`, then **rebuild `meta/` for BOTH** dirs with
-   contiguous re-indexed episode ids: `episodes.jsonl`, `tasks.jsonl`, `info.json`
-   (`total_episodes`, `total_frames`), and copy `modality.json` into each. Use the same RNG
-   seed each run so the split is reproducible/resumable. The training launch then points
-   `--dataset-path` at the `train/` dirs; eval (stage e) points `open_loop_eval.py` at the
-   `eval/` dirs with the held-out ids.
-4. **Verify** structure of every resulting dir: `meta/` (info/episodes/tasks/modality),
-   `data/chunk-*` parquet per episode, `videos/chunk-*/<camera>/` mp4; confirm train∩eval
-   episode sets are empty and counts add up. Don't trust the converter/splitter blindly.
+**Trigger:** runs whenever a conversion is needed OR a train/eval split is wanted (the
+default). **Steps:**
+1. If conversion needed (v2.x dataset → v3.0), run lerobot's converter; ensure build deps
+   are present first (lessons_learned #10).
+2. **Train/eval split (lessons_learned #13):** real-robot data has no simulator, so in-loop
+   eval is off (`--eval_freq=0`) and generalization is judged on **held-out episodes**.
+   lerobot subsets episodes natively (`--dataset.episodes='[...]'`), so the split is just
+   two deterministic id lists — run
+   `python scripts/split_train_eval.py --dataset-repo-id <id> [--dataset-root <dir>]
+   --out <session>/preprocess.json` (default ≈10% holdout, min 1, seeded → reproducible).
+   **No physical dataset copy is needed.**
+3. **Verify:** train∩eval is empty, counts add up, and the ids are < total_episodes.
 
-**Output `preprocess.json`:** `{status, actions_taken:[], verified:bool, split_done:bool,
-holdout_frac, per_dataset:[{repo, train_path, eval_path, train_eps, eval_eps, eval_traj_ids:[]}]}`.
-If the user opted out of a split, set `eval_path = train_path` and `split_done:false`.
+**Output `preprocess.json`:** the split_train_eval.py output —
+`{dataset_repo_id, dataset_root, total_episodes, holdout_frac, seed,
+train_episodes:[], eval_episodes:[]}` (+ `warning` when the dataset is tiny). If the user
+opted out of a split, set `eval_episodes: []` and note that eval will only sanity-check
+learning, not generalization.
 
 ---
 
@@ -88,28 +94,31 @@ If the user opted out of a split, set `eval_path = train_path` and `split_done:f
 1. Run `python scripts/check_hardware.py --json`. Read GPUs (idle ones), free disk per
    candidate volume, and `/dev/shm` size.
 2. **Resolve dataloader workers:** if `/dev/shm` < a few GB and you want workers>0, try to
-   remediate (remount; re-check it actually grew) or set `num_workers=0` and record why.
-3. **Pick checkpoint storage:** a volume with `save_total_limit × ~12 GB` headroom (GR00T
-   checkpoints are big). Not a near-full root.
-4. Run `python scripts/plan_training.py --samples <est> --gpus <n> --gpu-mem-gb <g>
-   [--epochs E] [--global-batch B]`. It computes `steps_per_epoch`, a sane `max_steps`,
-   `per_device_batch`, `save_steps`, and prints a ready launch command. Adjust if the user
-   has preferences; never silently keep a hardcoded default that ignores dataset size
-   (lessons_learned #7).
-5. **Guarantee resumability:** ensure `--save_only_model` is NOT in the command, and that
-   `save_steps`/`save_total_limit` keep enough checkpoints to pick the best by eval.
-6. **Preflight the gated backbone / HF auth** (lessons_learned #1): confirm weights are
-   reachable (local paths preferred) before committing to a long run.
+   remediate (remount; re-check it actually grew) or set `--num_workers=0` and record why.
+3. **Pick checkpoint storage:** `--output_dir` on the big volume (pod: `/opt/data/...`).
+   lerobot keeps EVERY checkpoint (no rotation), so budget `(steps/save_freq) × ckpt_size`
+   (lessons_learned #5).
+4. Run `python scripts/plan_training.py --samples <est> --policy-type <t>
+   --dataset-repo-id <id> [--dataset-root <dir>] --episodes-file <session>/preprocess.json
+   [--gpus N --gpu-mem-gb G] [--epochs E] [--batch-size B] [--cuda IDS]`. It computes
+   `steps_per_epoch`, a sane `--steps`, `--batch_size`, `--save_freq`, inlines the train
+   episode list, and prints both the launch command AND the resume command. Never silently
+   keep lerobot's default `--steps=100000` (lessons_learned #7).
+5. **Resumability is built in** — every lerobot checkpoint carries full training state
+   (there is no save_only_model to mis-set); just make sure `save_freq` yields enough
+   checkpoints for the eval curve to pick from.
+6. **Preflight Hub auth** (lessons_learned #1): for `--policy.path` bases or Hub datasets,
+   confirm access (`hf auth whoami`) or local paths before committing to a long run.
+7. **Smoke-test the plan**: `python scripts/preflight.py --session <dir> --steps 2`. It runs
+   the real command for ~2 steps (including one checkpoint save) in a temp output dir and
+   classifies the result. If it returns a `fatal` classification (auth, feature mismatch,
+   missing data, bad flag…), **fix that before stage e**. It also measures peak GPU memory
+   and may emit a `batch_suggestion` (lessons_learned #16) — apply, re-run preflight,
+   recompute the plan. Record the verdict in the plan notes.
 
-**Output `training_plan.json`:** `{launch_command, output_dir, cuda_visible_devices,
-global_batch_size, per_device_batch, num_workers, max_steps, steps_per_epoch, epochs,
-save_steps, save_total_limit, shm_ok:bool, notes:[]}`.
-
-7. **Smoke-test the plan** (cheap insurance, idea from ml-intern): run
-   `python scripts/preflight.py --session <dir> --steps 2`. It runs the real command for ~2
-   steps in a temp output dir and classifies the result. If it returns non-zero with a
-   `fatal` classification (gated repo, camera-key, missing data…), **fix that before stage e**
-   — it would otherwise recur minutes into the real run. Record the verdict in the plan notes.
+**Output `training_plan.json`:** plan_training.py's `--json` output (launch_command,
+resume_command, output_dir, dataset_repo_id/root, train/eval_episodes, batch_size, steps,
+save_freq, num_workers, repo, cuda_visible_devices, ...) + `{shm_ok:bool, notes:[]}`.
 
 ---
 
@@ -118,63 +127,64 @@ save_steps, save_total_limit, shm_ok:bool, notes:[]}`.
 1. `session.py add-run` → get `run-NNN`. Record the launch command from `training_plan.json`
    into `run.json`.
 2. Start dashboard (background): `python scripts/monitor_server.py --session <dir>
-   [--port 8770]`. Tell the user the URL. It's TensorBoard-like — it plots the **loss curve**
-   (from `train.log`) and the **open-loop eval curve** (mean MSE/checkpoint from
-   `eval/eval_results.jsonl`) with dependency-free `<canvas>`.
+   [--port 8770]`. Tell the user the URL (in the console UI it appears in the viewer via
+   "+ 打开" → port 8770). It plots the **loss curve** (from `train.log`) and the **held-out
+   eval curve** (mean MSE/checkpoint from `eval/eval_results.jsonl`).
 3. Start watchdog (background): `python scripts/watchdog.py --session <dir> --run <run-NNN>`.
-4. Start the eval watcher (background) on an **idle** GPU (not the training GPUs):
+4. Start the eval watcher (background), on an idle GPU if one exists:
    `python scripts/eval_watcher.py --session <dir> --run <run-NNN> --gpu <idle>`. It scores
-   every new complete `checkpoint-N` on the held-out `eval/` dirs and appends to
-   `eval/eval_results.jsonl` — giving an eval curve *during* training despite GR00T having no
-   in-loop eval (lessons_learned #13). Resumable; one eval GPU keeps it off the training path.
+   every new complete `checkpoints/<step>` on the held-out episodes with
+   `offline_eval.py` and appends to `eval/eval_results.jsonl` — the eval curve *during*
+   training (lessons_learned #13). On a single-GPU pod it shares the training GPU; evals
+   run between checkpoints and exit, so contention is brief — keep `--eval-timeout` set.
 5. Either poll `runs/<run-NNN>/run.json` periodically, or use `/loop` to check on a cadence.
    Report status changes (resuming, early-stopped, failed, done) to the user concisely.
-6. **When the run finishes, verify it** (idea from ml-intern's VERIFY.md): run
-   `python scripts/verify_run.py --session <dir> --run <run-NNN>`. It writes `VERIFY.md` +
-   `verify.json` with independent pass/fail verdicts (progress, loss decreased, loss finite,
-   checkpoint exists, resumable, inference-ready, no fatal signature). Surface the overall
-   PASS/FAIL — a clean exit code alone is not evidence of success.
+6. **When the run finishes, verify it**: `python scripts/verify_run.py --session <dir>
+   --run <run-NNN>`. It writes `VERIFY.md` + `verify.json` with independent pass/fail
+   verdicts (progress, loss decreased, loss finite, checkpoint exists, resumable,
+   inference-ready, no fatal signature). Surface the overall PASS/FAIL — a clean exit code
+   alone is not evidence of success.
 7. **Pick the best checkpoint from the eval curve.** By the end, `eval_watcher` has scored
-   every checkpoint, so `eval/eval_results.jsonl` already holds the held-out MSE/MAE curve —
-   pick the lowest mean MSE (also shown on the dashboard eval chart). To (re)score one
-   checkpoint manually: `python gr00t/eval/open_loop_eval.py --dataset-path <eval_path>
-   --embodiment-tag <tag> --model-path <output_dir>/checkpoint-N --traj-ids <ids>
-   --action-horizon 16` (do NOT pass `--modality-config-path` — read from the checkpoint's
-   `experiment_cfg`, lessons_learned #11). Held-out ⇒ real generalization signal; still ≠
-   closed-loop success.
+   every checkpoint, so `eval/eval_results.jsonl` holds the held-out MSE/MAE curve — pick
+   the lowest mean MSE (also on the dashboard). To (re)score one checkpoint manually:
+   `cd /lerobot && uv run python <skill>/scripts/offline_eval.py
+   --model-path <output_dir>/checkpoints/<N>/pretrained_model
+   --dataset-repo-id <id> [--dataset-root <dir>] --episodes <held-out ids>`.
+   Held-out ⇒ real generalization signal; still ≠ closed-loop success (lessons #11).
 
 ### Watchdog algorithm (what `watchdog.py` does; preserve this contract)
 
 ```
 load training_plan + run.json
 restarts = 0
-launch training subprocess (CUDA_VISIBLE_DEVICES, cmd) → tee to train.log
+launch training subprocess → tee to train.log
+  (first launch uses launch_command; if a resumable checkpoint already exists, resume_command)
 loop every POLL seconds (POLL ≤ 300):
-    parse train.log tail → last_step, last_loss, last_ckpt
-    write run.json {status:"running", last_step, last_loss, throughput, restarts, ts}
+    parse train.log tail → last_step (tqdm N/M), last_loss ("loss:x"), last_ckpt
+    write run.json {status:"running", last_step, last_loss, restarts, assessment, ts}
     # --- trouble detection ---
     if last_loss is NaN/Inf
-       or diverged (loss > divergence_threshold sustained over a window)
+       or diverged (loss > divergence_threshold)
        or stalled (no step increase for STALL_TIMEOUT):
         record reason; terminate subprocess gracefully  → treat as a stop
     # --- process exit handling ---
     if subprocess exited:
         if exit looked clean AND reached target step → status:"done"; break
-        ck = latest_resumable_checkpoint(output_dir)   # see gr00t_resume.md predicate
-        if restarts >= MAX_RESTARTS:
-            status:"failed"; write reason; break
-        if ck is None:
-            note "no resumable checkpoint — restart would be from scratch"
-        sleep backoff = min(BACKOFF_CAP, BASE * 2**restarts)
-        restarts += 1
-        relaunch SAME command, SAME --output-dir  # auto-resumes from ck if present
+        classify log (error_patterns): fatal → status:"failed", DON'T retry
+        if restarts >= MAX_RESTARTS: status:"failed"; break
+        ck = latest_resumable_checkpoint(output_dir)   # lerobot_resume.md predicate
+        if ck: relaunch with resume_command            # --resume=true --config_path=.../last/...
+        else if checkpoints/ empty: clear output_dir, relaunch original command
+        else: status:"failed" (non-resumable checkpoints present — don't wipe them)
+        sleep backoff = min(BACKOFF_CAP, BASE * 2**restarts); restarts += 1
 write final run.json status
 ```
 
-Notes: only crash/early-stop restarts use backoff; a deliberate stop-at-step is a separate
-path that waits for `trainer_state.json` before SIGTERM (lessons_learned #4). The watchdog
-never edits training internals — it only starts/stops the process and reads files, so it is
-itself crash-safe and resumable (re-running it re-reads `run.json`).
+Notes: only crash/early-stop restarts use backoff; a deliberate stop is the STOP-file path,
+which waits for the checkpoint's `training_state/` to be complete before SIGTERM
+(lessons_learned #4). The watchdog never edits training internals — it only starts/stops
+the process and reads files, so it is itself crash-safe and resumable (re-running it
+re-reads `run.json`, and it resumes rather than fresh-launches when a checkpoint exists).
 
 Each poll the watchdog also writes a human-readable `assessment` to `run.json` (loss trend,
 plateau length, eval-curve state, `stop_recommended`) so the dashboard always shows a current

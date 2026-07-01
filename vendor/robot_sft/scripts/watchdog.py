@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""Self-healing training watchdog for robot_sft.
+"""Self-healing training watchdog for robot_sft (lerobot edition).
 
-Owns the training subprocess and keeps it alive across crashes WITHOUT losing progress.
-It only starts/stops the process and reads files, so it is itself crash-safe: re-running
-it re-reads run.json. See references/agents.md (watchdog contract) and
-references/gr00t_resume.md (why resume = relaunch-same-command-same-output-dir).
+Owns the `lerobot-train` subprocess and keeps it alive across crashes WITHOUT losing
+progress. It only starts/stops the process and reads files, so it is itself crash-safe:
+re-running it re-reads run.json. See references/agents.md (watchdog contract) and
+references/lerobot_resume.md (checkpoint anatomy + why resume = --resume=true).
 
-It reads the launch command + output_dir from <session>/training_plan.json, writes live
-status to <session>/runs/<run>/run.json (which monitor_server.py serves), and:
+It reads the launch/resume commands + output_dir from <session>/training_plan.json,
+writes live status to <session>/runs/<run>/run.json (which monitor_server.py serves), and:
   - parses the train log for step/loss at least every --poll seconds (default 60, <=300)
   - early-stops on NaN/Inf loss, divergence, or a stall (no step progress)
-  - on any stop, checks the latest checkpoint is RESUMABLE before relaunching, then
-    relaunches the same command (GR00T auto-resumes); never restarts from scratch silently
+  - on any stop, checks the latest checkpoint is RESUMABLE, then relaunches with
+    `--resume=true --config_path=.../checkpoints/last/pretrained_model/train_config.json`;
+    never restarts from scratch silently
   - applies capped exponential backoff to crash/early-stop restarts and caps total restarts
 
 Usage:
@@ -27,6 +28,7 @@ import json
 import math
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -35,9 +37,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import error_patterns  # noqa: E402
 
-STEP_RE = re.compile(r"(\d+)\s*/\s*(\d+)\s*\[")          # tqdm "4000/10000 ["
-LOSS_RE = re.compile(r"'loss':\s*([0-9.eE+-]+|nan|inf|-inf)")
-CKPT_RE = re.compile(r"checkpoint-(\d+)$")
+STEP_RE = re.compile(r"(\d+)\s*/\s*(\d+)\s*\[")          # tqdm "4000/10000 [" (exact step)
+LOSS_RE = re.compile(r"\bloss:([0-9.eE+-]+|nan|inf|-inf)")  # lerobot tracker "loss:0.123"
 
 
 def now() -> float:
@@ -58,47 +59,39 @@ def write_json(path: str, data: dict) -> None:
 
 
 def is_resumable(ckpt_dir: str) -> bool:
-    """A checkpoint can resume only with full trainer state. trainer_state.json is written last,
-    so its presence also means the save finished. Optimizer state comes in TWO formats and we
-    must accept both: HF-native `optimizer.pt`, OR DeepSpeed ZeRO — a `latest` file pointing at a
-    `global_step*/` dir of `*_optim_states.pt` shards. GR00T trains with DeepSpeed, so requiring
-    `optimizer.pt` would wrongly call every checkpoint non-resumable. See gr00t_resume.md."""
+    """lerobot checkpoint = <step>/{pretrained_model,training_state}. Resume needs the FULL
+    training_state (optimizer + rng + step; scheduler optional) AND loadable weights.
+    training_state is written after pretrained_model, so training_step.json's presence also
+    means the save finished (not truncated). See lerobot_resume.md."""
+    pm = os.path.join(ckpt_dir, "pretrained_model")
+    ts = os.path.join(ckpt_dir, "training_state")
     try:
-        names = set(os.listdir(ckpt_dir))
+        pm_names = set(os.listdir(pm))
+        ts_names = set(os.listdir(ts))
     except OSError:
         return False
-    if "trainer_state.json" not in names:
-        return False
-    has_rng = any(n.startswith("rng_state") for n in names)
-    has_weights = (any(n.endswith(".safetensors") for n in names)
-                   or any(n.endswith("model_states.pt") for n in names))
-    hf_optim = "optimizer.pt" in names
-    ds_optim = False
-    if "latest" in names:
-        try:
-            tag = open(os.path.join(ckpt_dir, "latest")).read().strip()
-            gdir = os.path.join(ckpt_dir, tag)
-            ds_optim = os.path.isdir(gdir) and any(
-                f.endswith("optim_states.pt") for f in os.listdir(gdir))
-        except OSError:
-            ds_optim = False
-    return has_rng and has_weights and (hf_optim or ds_optim)
+    has_weights = "model.safetensors" in pm_names and "config.json" in pm_names
+    has_train_cfg = "train_config.json" in pm_names
+    has_state = ("optimizer_state.safetensors" in ts_names
+                 and "training_step.json" in ts_names
+                 and any(n.startswith("rng_state") for n in ts_names))
+    return has_weights and has_train_cfg and has_state
 
 
 def latest_resumable_checkpoint(output_dir: str):
-    """Highest-step resumable checkpoint-N, or None (None => a restart would be from zero)."""
+    """Highest-step resumable checkpoint dir under <output_dir>/checkpoints/, or None."""
     best, best_step = None, -1
+    ckpts = os.path.join(output_dir, "checkpoints")
     try:
-        entries = os.listdir(output_dir)
+        entries = os.listdir(ckpts)
     except OSError:
         return None
     for name in entries:
-        m = CKPT_RE.match(name)
-        if not m:
-            continue
-        d = os.path.join(output_dir, name)
+        if not name.isdigit():
+            continue  # skip the 'last' symlink
+        d = os.path.join(ckpts, name)
         if os.path.isdir(d) and is_resumable(d):
-            step = int(m.group(1))
+            step = int(name)
             if step > best_step:
                 best, best_step = d, step
     return best
@@ -130,7 +123,7 @@ def assess(step, max_step, loss, best_loss, best_loss_step, evals):
     """Produce a human-readable training conclusion for the dashboard each poll.
 
     Train-loss plateau is NOT 'done' — behaviour-cloning loss bottoms out early. The real
-    selection signal is the open-loop EVAL curve, so a stop is only *recommended* once loss is
+    selection signal is the held-out EVAL curve, so a stop is only *recommended* once loss is
     flat AND there are >=2 eval points whose MSE has stopped improving (lessons_learned #14)."""
     plateau_steps = (step - best_loss_step) if (step and best_loss_step is not None) else 0
     flat_thresh = max(1500, int(0.1 * max_step)) if max_step else 1500
@@ -142,11 +135,11 @@ def assess(step, max_step, loss, best_loss, best_loss_step, evals):
         best_eval_step, best_eval = min(evals, key=lambda x: x[1])
         last_step, last_mse = evals[-1]
         if len(evals) < 2:
-            eval_txt = f"only 1 eval point (ckpt-{last_step} mse={last_mse:.2f}); need >=2 to judge"
+            eval_txt = f"only 1 eval point (ckpt-{last_step} mse={last_mse:.4f}); need >=2 to judge"
         else:
             improving = last_mse <= best_eval * 1.001
             eval_txt = (f"eval MSE {'still improving' if improving else 'plateaued'}; "
-                        f"best ckpt-{best_eval_step} mse={best_eval:.2f}")
+                        f"best ckpt-{best_eval_step} mse={best_eval:.4f}")
             stop = loss_flat and not improving
     else:
         eval_txt = "no eval points yet"
@@ -175,7 +168,8 @@ def assess(step, max_step, loss, best_loss, best_loss_step, evals):
 
 
 def tail_metrics(log_path: str, max_bytes: int = 200_000):
-    """Return (last_step, max_step, last_loss, loss_is_bad) from the log tail."""
+    """Return (last_step, max_step, last_loss, loss_is_bad) from the log tail.
+    Step comes from tqdm's exact "N/M [" (lerobot's tracker line rounds step to K)."""
     try:
         size = os.path.getsize(log_path)
         with open(log_path, "rb") as f:
@@ -204,10 +198,10 @@ def tail_metrics(log_path: str, max_bytes: int = 200_000):
 
 
 def launch(cmd: str, log_path: str) -> subprocess.Popen:
-    """Run the plan's launch command under bash, teeing stdout+stderr to the log."""
+    """Run a launch/resume command under bash, teeing stdout+stderr to the log."""
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     logf = open(log_path, "ab", buffering=0)
-    logf.write(f"\n===== watchdog launch @ {time.ctime()} =====\n".encode())
+    logf.write(f"\n===== watchdog launch @ {time.ctime()} =====\n{cmd}\n".encode())
     return subprocess.Popen(["bash", "-lc", cmd], stdout=logf, stderr=subprocess.STDOUT,
                             start_new_session=True)
 
@@ -247,6 +241,9 @@ def main() -> None:
     plan = read_json(os.path.join(session, "training_plan.json"))
     cmd = plan["launch_command"]
     output_dir = plan["output_dir"]
+    resume_cmd = plan.get("resume_command") or (
+        f"cd {plan.get('repo', '/lerobot')} && uv run lerobot-train --resume=true "
+        f"--config_path={output_dir}/checkpoints/last/pretrained_model/train_config.json")
     run_dir = os.path.join(session, "runs", args.run)
     run_json = os.path.join(run_dir, "run.json")
     log_path = os.path.join(run_dir, "train.log")
@@ -258,7 +255,10 @@ def main() -> None:
         write_json(run_json, run)
 
     restarts = run.get("restarts", 0)
-    proc = launch(cmd, log_path)
+    # If a resumable checkpoint already exists (watchdog itself restarted), resume — the
+    # fresh-launch command would die on "output directory already exists".
+    first_cmd = resume_cmd if latest_resumable_checkpoint(output_dir) else cmd
+    proc = launch(first_cmd, log_path)
     update(status="running", pid=proc.pid, restarts=restarts, log=log_path,
            output_dir=output_dir, started_at=time.ctime())
 
@@ -282,8 +282,8 @@ def main() -> None:
                assessment=assessment)
 
         # graceful manual stop: `touch <run_dir>/STOP`. We stop and KEEP the latest complete
-        # checkpoint (trainer_state.json written last => not truncated, lessons_learned #4);
-        # we do NOT restart. Progress since the last save is lost but no checkpoint is corrupted.
+        # checkpoint (training_state written last => not truncated); we do NOT restart.
+        # Progress since the last save is lost but no checkpoint is corrupted.
         if os.path.exists(stop_file) and proc.poll() is None:
             stop_requested = True
             update(status="stopping", reason="manual STOP file — stopping at last complete checkpoint")
@@ -351,16 +351,31 @@ def main() -> None:
             return
 
         ckpt = latest_resumable_checkpoint(output_dir)
-        resume_note = (f"resuming from {os.path.basename(ckpt)}" if ckpt
-                       else "NO resumable checkpoint — restart will be from scratch")
+        if ckpt:
+            next_cmd = resume_cmd  # --resume=true from checkpoints/last (lerobot_resume.md)
+            resume_note = f"resuming from {os.path.basename(ckpt)} via --resume=true"
+        else:
+            # No checkpoint yet. lerobot-train refuses an existing output_dir without
+            # --resume, so a from-scratch relaunch must clear it — safe ONLY when there is
+            # nothing resumable inside to lose.
+            ckpts_dir = os.path.join(output_dir, "checkpoints")
+            has_any = os.path.isdir(ckpts_dir) and any(
+                n.isdigit() for n in os.listdir(ckpts_dir))
+            if has_any:
+                update(status="failed", reason="checkpoints exist but none is resumable "
+                       "(truncated save?)", fix="inspect the newest step dir; see lerobot_resume.md")
+                print("[watchdog] FAILED: non-resumable checkpoints present — not wiping them")
+                return
+            shutil.rmtree(output_dir, ignore_errors=True)
+            next_cmd = cmd
+            resume_note = "no checkpoint yet — cleared output_dir, restarting from scratch"
         backoff = min(args.backoff_cap, args.base_backoff * (2 ** restarts))
         restarts += 1
         update(status="restarting", reason=trouble or f"exit code {rc}",
                resume=resume_note, backoff_s=backoff, restarts=restarts)
         print(f"[watchdog] restart {restarts}/{args.max_restarts} in {backoff}s — {resume_note}")
         time.sleep(backoff)
-        # relaunch SAME command + SAME output_dir => GR00T auto-resumes if ckpt exists
-        proc = launch(cmd, log_path)
+        proc = launch(next_cmd, log_path)
         update(status="running", pid=proc.pid, restarts=restarts)
         last_progress_step, last_progress_time = step, now()
 

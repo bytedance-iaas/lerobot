@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared training-log error classifier for robot_sft.
+"""Shared training-log error classifier for robot_sft (lerobot edition).
 
 Not all non-zero exits should be auto-retried (SkyPilot's principle). Some failures are
 *configuration* problems that will recur identically on every restart — retrying them just
@@ -12,7 +12,7 @@ classifies a training log tail into one of:
     "ok"         -> no known error signature found
 
 Used by preflight.py (classify a smoke-test) and watchdog.py (decide restart strategy).
-The patterns come straight from lessons_learned.md — real GR00T/LeRobot failure signatures.
+The patterns target `lerobot-train` failure signatures (see lessons_learned.md).
 """
 from __future__ import annotations
 
@@ -20,36 +20,51 @@ import re
 
 # (regex, reason, fix) — checked in order; first match wins within a category.
 FATAL = [
-    (r"gated repo|Access to model .* is restricted|401 Client Error",
-     "gated backbone / HF auth",
-     "Accept the gated repo's license and `hf auth login`, or pass local model paths."),
-    (r"Unrecognized (processing|configuration) class|Can't instantiate a processor",
-     "checkpoint missing processor/config files",
-     "Copy processor/ + experiment_cfg/ from a complete sibling checkpoint (lessons #4)."),
-    (r"KeyError: .*observation\.images|modality.*not.*found|original_key",
-     "camera/modality key mismatch",
-     "Fix modality.json original_key to match meta/info.json features (lessons #6)."),
-    (r"FileNotFoundError.*(dataset|parquet|episode_)|No such file or directory.*data/",
-     "dataset path / files missing",
-     "Re-check the dataset path and that conversion produced data/ + videos/."),
+    (r"gated repo|Access to model .* is restricted|401 Client Error|403 Forbidden.*huggingface",
+     "gated/unauthorized Hub model or dataset",
+     "Accept the repo's license on huggingface.co and `hf auth login` (pi0's PaliGemma and "
+     "some bases are gated), or point at a local path."),
+    (r"Output directory .* already exists and resume is (False|false)",
+     "output_dir exists but --resume not set",
+     "Re-launch with --resume=true --config_path=<output_dir>/checkpoints/last/"
+     "pretrained_model/train_config.json, or pick a fresh --output_dir."),
+    (r"A config_path is expected when resuming",
+     "--resume=true without --config_path",
+     "Pass --config_path=<output_dir>/checkpoints/last/pretrained_model/train_config.json."),
+    (r"KeyError: ['\"]observation\.images|KeyError: ['\"]observation\.state|"
+     r"Missing key.*observation\.|does not match.*input_features",
+     "feature/camera key mismatch between policy and dataset",
+     "The policy's input_features must match the dataset's keys (meta/info.json `features`). "
+     "Check camera names (observation.images.<cam>) and state/action dims (lessons #6)."),
+    (r"RepositoryNotFoundError|Repository Not Found|"
+     r"FileNotFoundError.*(info\.json|meta/|\.parquet)|No such file or directory.*(data/|meta/)",
+     "dataset not found / files missing",
+     "Re-check --dataset.repo_id / --dataset.root; the dataset needs meta/info.json + data/. "
+     "For local datasets pass --dataset.root=<path>."),
+    (r"is not a valid EpisodeIndex|episodes.*out of range|Invalid episode",
+     "episode index out of range",
+     "The --dataset.episodes list references episodes the dataset doesn't have; re-run the "
+     "split against this dataset's actual meta/info.json total_episodes."),
     (r"Python\.h: No such file|fatal error:.*\.h: No such file",
      "missing build headers",
-     "Install pythonX.Y-dev system headers, then re-sync deps (lessons #10)."),
-    (r"global_batch_size must be divisible by num_gpus|AssertionError.*batch.*gpus",
-     "batch/gpu config invalid",
-     "Make global_batch_size divisible by num_gpus (lessons #8)."),
+     "Install pythonX.Y-dev system headers, then re-sync deps."),
+    (r"draccus.*(error|invalid)|unrecognized arguments|invalid choice",
+     "bad CLI arguments",
+     "A lerobot-train flag is misspelled or has a bad value; re-check the launch command "
+     "against `lerobot-train --help`."),
 ]
 
 OOM = [
     (r"CUDA out of memory|torch\.cuda\.OutOfMemoryError|CUBLAS_STATUS_ALLOC_FAILED",
      "CUDA OOM",
-     "Lower global_batch_size (or per-device batch), then resume from the last checkpoint."),
+     "Lower --batch_size, then resume from the last checkpoint."),
 ]
 
 RETRYABLE = [
-    (r"Bus error|out of shared memory|unable to write.*No space left.*torch_",
-     "/dev/shm exhausted (dataloader workers)",
-     "Enlarge /dev/shm or set num_workers=0, then resume (lessons #2)."),
+    (r"Bus error|out of shared memory|unable to write.*No space left.*torch_|"
+     r"DataLoader worker.*(killed|exited unexpectedly)",
+     "/dev/shm exhausted or dataloader worker died",
+     "Enlarge /dev/shm or set --num_workers=0, then resume (lessons #2)."),
     (r"NCCL.*(timeout|error|unhandled)|Socket Timeout|Connection reset",
      "transient distributed/NCCL error",
      "Resume from the last checkpoint; if it recurs, check interconnect."),

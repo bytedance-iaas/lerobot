@@ -27,10 +27,12 @@ import re
 
 SESSION_DIR = ""  # set in main
 
+# lerobot-train logs: tqdm gives the exact step ("4000/10000 ["); the MetricsTracker
+# line carries the loss ("... loss:0.123 grdn:...").
 STEP_RE = re.compile(r"(\d+)\s*/\s*(\d+)\s*\[")
-LOSS_RE = re.compile(r"'loss':\s*([0-9.eE+-]+)")
+LOSS_RE = re.compile(r"\bloss:([0-9.eE+-]+)")
 # one combined scan so each loss is tagged with the most recent tqdm step
-TOKEN_RE = re.compile(r"(\d+)\s*/\s*\d+\s*\[|'loss':\s*([0-9.eE+-]+)")
+TOKEN_RE = re.compile(r"(\d+)\s*/\s*\d+\s*\[|\bloss:([0-9.eE+-]+)")
 
 _loss_cache: dict = {}
 

@@ -1,1 +1,8 @@
-https://github.com/thesues/robot_sft @ 07c131b93e704f65a5bb7106fc58bc76aa101b56
+Originated from https://github.com/thesues/robot_sft @ 07c131b93e704f65a5bb7106fc58bc76aa101b56
+(an Isaac GR00T SFT orchestrator).
+
+Ported in-place to target HuggingFace lerobot's `lerobot-train` end to end: launch/resume
+commands, checkpoint anatomy (checkpoints/<step>/{pretrained_model,training_state} + last),
+held-out episode split via --dataset.episodes (no dataset copy), and open-loop offline eval
+(scripts/offline_eval.py) instead of GR00T's open_loop_eval.py. Maintained here directly —
+this is no longer a verbatim mirror of the upstream repo.

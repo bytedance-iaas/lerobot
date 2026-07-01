@@ -20,7 +20,7 @@ below, grouped by the part of the design they informed.
 ## Closest Claude-skill precedents (ML training as a skill)
 These are the nearest existing *Claude skills* to robot_sft — general ML training, not
 robot/VLA-specific. robot_sft borrows their best ideas and adds the robot-SFT domain layer
-(embodiment tags, modality.json camera mapping, GR00T's auto-resume, open-loop eval).
+(lerobot dataset/feature handling, checkpoint-anatomy-aware resume, held-out open-loop eval).
 - **AlexWortega/claude-ml-intern-skill** — https://github.com/AlexWortega/claude-ml-intern-skill
   — an "autonomous ML intern" skill: **smoke-test before training** (instantiate + forward
   pass on tiny input), train with a **NaN guard** + checkpointing, then **self-verify into a
@@ -70,8 +70,8 @@ robot/VLA-specific. robot_sft borrows their best ideas and adds the robot-SFT do
   these map to the watchdog's NaN/divergence early-stop.
 - **HF Trainer resume** —
   https://huggingface.co/docs/transformers/en/main_classes/trainer — `resume_from_checkpoint`
-  semantics and the RNG/optimizer/scheduler state restored; basis for the
-  resumable-checkpoint anatomy in `gr00t_resume.md`.
+  semantics and the RNG/optimizer/scheduler state restored; the same doctrine behind the
+  resumable-checkpoint anatomy in `lerobot_resume.md`.
 - **SkyPilot issue #2805** — https://github.com/skypilot-org/skypilot/issues/2805 — argues
   against exponential backoff for up-waits; hence robot_sft applies capped backoff only to
   crash-restarts, not to all retries.

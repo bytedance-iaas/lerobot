@@ -5,7 +5,8 @@ The session directory is the single source of truth, so any stage can be resumed
 crash or context reset. All sub-agents read/write state ONLY through this script — never
 hand-edit the JSON, so the schema stays consistent.
 
-Layout (under --root, default ./.robot_sft):
+Layout (under --root; default $ROBOT_SFT_HOME, else /opt/data/robot_sft when /opt/data
+exists — the console pod's big persistent volume — else ./.robot_sft):
     sessions/<session_id>/session.json     master state
     sessions/<session_id>/<stage>.json     per-stage artifacts (written by the agents)
     sessions/<session_id>/runs/<run_id>/run.json
@@ -29,7 +30,20 @@ import os
 import sys
 
 STAGES = ["overview", "dataset_explore", "preprocess", "training_plan", "train"]
-DEFAULT_ROOT = ".robot_sft"
+
+
+def _default_root() -> str:
+    """State root. Big artifacts (sessions, checkpoints, logs) must NOT land in the code
+    checkout: in the console pod /lerobot is the repo but /opt/data is the roomy PVC."""
+    env = os.environ.get("ROBOT_SFT_HOME")
+    if env:
+        return env
+    if os.path.isdir("/opt/data"):
+        return "/opt/data/robot_sft"
+    return ".robot_sft"
+
+
+DEFAULT_ROOT = _default_root()
 
 
 def _now() -> str:

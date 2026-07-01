@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Post-run self-verification for robot_sft (idea from ml-intern's VERIFY.md).
+"""Post-run self-verification for robot_sft (lerobot edition).
 
-`exit 0` is not proof a run succeeded — in real GR00T runs we twice got a clean exit code
-from a run that had actually failed (gated repo, truncated checkpoint). This produces a set
-of INDEPENDENT verdicts about whether the run genuinely worked, written to VERIFY.md +
-verify.json in the run dir, so success is verified rather than assumed.
+`exit 0` is not proof a run succeeded — real runs have exited cleanly after silently
+failing (auth error, truncated checkpoint). This produces a set of INDEPENDENT verdicts
+about whether the run genuinely worked, written to VERIFY.md + verify.json in the run dir,
+so success is verified rather than assumed.
 
 Checks (each pass/fail/warn, independently):
   1. progress       — training reached a meaningful step (>= --min-step, or its max_step)
   2. loss_decreased — last loss is meaningfully below the early loss
   3. loss_finite    — no NaN/Inf in the loss trace
-  4. checkpoint     — a checkpoint exists
-  5. resumable      — latest checkpoint has full trainer state (optimizer/scheduler/rng/trainer_state)
-  6. inference_ready— latest checkpoint has processor/ + config for loading/eval
+  4. checkpoint     — a checkpoint exists under <output_dir>/checkpoints/
+  5. resumable      — latest checkpoint has full training_state (optimizer/rng/step)
+  6. inference_ready— latest checkpoint's pretrained_model/ loads (config + weights)
   7. no_fatal       — the log has no fatal error signature (error_patterns)
 
 Usage:
@@ -30,9 +30,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import error_patterns  # noqa: E402
 import watchdog as wd  # reuse is_resumable / latest checkpoint helpers  # noqa: E402
 
-STEP_RE = re.compile(r"(\d+)\s*/\s*(\d+)\s*\[")
-LOSS_RE = re.compile(r"'loss':\s*([0-9.eE+-]+|nan|inf|-inf)")
-CKPT_RE = re.compile(r"checkpoint-(\d+)$")
+STEP_RE = re.compile(r"(\d+)\s*/\s*(\d+)\s*\[")               # tqdm exact step
+LOSS_RE = re.compile(r"\bloss:([0-9.eE+-]+|nan|inf|-inf)")    # lerobot tracker
 
 
 def read_tail(path: str, max_bytes: int = 400_000) -> str:
@@ -46,25 +45,37 @@ def read_tail(path: str, max_bytes: int = 400_000) -> str:
 
 
 def latest_checkpoint_any(output_dir: str):
+    """Highest-step dir under checkpoints/ regardless of completeness."""
     best, step = None, -1
     try:
-        for n in os.listdir(output_dir):
-            m = CKPT_RE.match(n)
-            if m and os.path.isdir(os.path.join(output_dir, n)) and int(m.group(1)) > step:
-                best, step = os.path.join(output_dir, n), int(m.group(1))
+        for n in os.listdir(os.path.join(output_dir, "checkpoints")):
+            d = os.path.join(output_dir, "checkpoints", n)
+            if n.isdigit() and os.path.isdir(d) and int(n) > step:
+                best, step = d, int(n)
     except OSError:
         pass
     return best
 
 
+def checkpoint_step(ckpt: str):
+    """Exact saved step from training_state/training_step.json (None if unreadable)."""
+    try:
+        d = json.load(open(os.path.join(ckpt, "training_state", "training_step.json")))
+        return int(d["step"])
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def inference_ready(ckpt: str) -> bool:
+    """pretrained_model/ must be loadable for eval: policy config + weights (+ train cfg)."""
     if not ckpt:
         return False
-    names = set(os.listdir(ckpt))
-    has_proc = "processor_config.json" in names or os.path.isdir(os.path.join(ckpt, "processor"))
-    has_cfg = "config.json" in names and "experiment_cfg" in names
-    has_weights = any(n.endswith(".safetensors") for n in names)
-    return has_proc and has_cfg and has_weights
+    pm = os.path.join(ckpt, "pretrained_model")
+    try:
+        names = set(os.listdir(pm))
+    except OSError:
+        return False
+    return "config.json" in names and "model.safetensors" in names
 
 
 def main() -> None:
@@ -90,11 +101,13 @@ def main() -> None:
         except ValueError:
             losses.append(float("nan"))
 
-    last_step = max(steps) if steps else 0
-    target = maxsteps[-1] if maxsteps else None
-    cls = error_patterns.classify(text)
     ckpt = latest_checkpoint_any(output_dir)
     resumable_ck = wd.latest_resumable_checkpoint(output_dir)
+    # the checkpoint's own recorded step is authoritative (tqdm may be truncated from the tail)
+    ck_step = checkpoint_step(resumable_ck or ckpt) if (resumable_ck or ckpt) else None
+    last_step = max([s for s in steps] + ([ck_step] if ck_step else []) or [0])
+    target = maxsteps[-1] if maxsteps else None
+    cls = error_patterns.classify(text)
 
     def v(name, ok, detail):
         return {"check": name, "verdict": "pass" if ok else "fail", "detail": detail}
@@ -115,10 +128,11 @@ def main() -> None:
     checks.append(v("checkpoint", ckpt is not None, ckpt or "no checkpoint found"))
     checks.append(v("resumable", resumable_ck is not None,
                     (os.path.basename(resumable_ck) if resumable_ck else "no resumable checkpoint "
-                     "(missing optimizer/scheduler/trainer_state — truncated?)")))
+                     "(missing training_state optimizer/rng/step — truncated?)")))
     checks.append(v("inference_ready", inference_ready(ckpt),
-                    "has processor/+config+weights" if inference_ready(ckpt)
-                    else "latest checkpoint missing processor/ or experiment_cfg (repair before eval)"))
+                    "pretrained_model/ has config+weights" if inference_ready(ckpt)
+                    else "latest checkpoint missing pretrained_model/config.json or "
+                         "model.safetensors (repair before eval)"))
     checks.append(v("no_fatal", cls["category"] != "fatal",
                     "no fatal signature" if cls["category"] != "fatal" else f"{cls['reason']}: {cls['fix']}"))
 

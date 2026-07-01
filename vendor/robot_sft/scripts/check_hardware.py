@@ -68,10 +68,13 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--shm-min-gb", type=float, default=4.0)
-    ap.add_argument("--ckpt-gb", type=float, default=12.0,
-                    help="approx size of one checkpoint (GR00T-3B ~11-12 GB)")
-    ap.add_argument("--save-limit", type=int, default=5)
-    ap.add_argument("--paths", nargs="*", default=["/data", "/tmp", "."])
+    ap.add_argument("--ckpt-gb", type=float, default=2.0,
+                    help="approx size of one checkpoint incl. training_state "
+                         "(ACT/diffusion ~0.5-2 GB; VLA policies like pi0 ~15-30 GB — set accordingly)")
+    ap.add_argument("--save-limit", type=int, default=5,
+                    help="how many checkpoints you expect to keep (lerobot keeps ALL saves; "
+                         "prune old step dirs yourself if space is tight)")
+    ap.add_argument("--paths", nargs="*", default=["/opt/data", "/tmp", "."])
     args = ap.parse_args()
 
     g = gpus()
@@ -95,8 +98,9 @@ def main() -> None:
     if not good_vols:
         warnings.append(
             f"No candidate volume has >= {headroom:.0f} GB free for "
-            f"{args.save_limit} checkpoints; checkpoint saving may fail. Free space or lower "
-            f"save_total_limit.")
+            f"~{args.save_limit} checkpoints; checkpoint saving may fail. lerobot keeps EVERY "
+            f"save (no rotation) — use a bigger volume (pod: /opt/data), raise --save_freq, or "
+            f"prune old step dirs during the run.")
 
     report = {
         "gpus": g,

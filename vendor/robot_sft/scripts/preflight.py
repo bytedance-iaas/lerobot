@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Pre-flight smoke test before a long robot_sft run (idea from ml-intern's smoke-test).
+"""Pre-flight smoke test before a long robot_sft run (lerobot edition).
 
-A full GR00T run takes hours and loads an ~11 GB model before it even touches data — so the
-gated-backbone, /dev/shm, and camera-key failures we keep hitting only surface minutes in,
-after real cost. This runs the SAME launch command for just a few steps in a throwaway
-output dir, then classifies the result. ~1-3 minutes to catch a bug that would otherwise
-waste a multi-hour run.
+A full run costs GPU-hours, and the classic failures (gated Hub model, dataset/feature
+key mismatch, /dev/shm, bad CLI flag) only surface minutes in. This runs the SAME
+`lerobot-train` command for just a few steps in a throwaway output dir, then classifies
+the result. ~1-3 minutes to catch a bug that would otherwise waste a multi-hour run.
 
-It MUTATES the plan command for the smoke run only: overrides MAX_STEPS/SAVE_STEPS to tiny
-values and redirects --output-dir to a temp dir, so it never touches the real run.
+It MUTATES the plan command for the smoke run only: overrides --steps/--save_freq to tiny
+values, --log_freq=1, and redirects --output_dir to a temp dir, so it never touches the
+real run. It also samples peak GPU memory during the smoke run and, when there is headroom,
+suggests a bigger --batch_size (re-run preflight after applying it to confirm the fit).
 
 Usage:
     python preflight.py --session <session_dir> [--steps 2] [--timeout 900]
@@ -30,7 +31,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import error_patterns  # noqa: E402
 
-STEP_RE = re.compile(r"(\d+)\s*/\s*(\d+)\s*\[")
+STEP_RE = re.compile(r"(\d+)\s*/\s*(\d+)\s*\[")   # tqdm "1/2 ["
 CUDA_RE = re.compile(r"CUDA_VISIBLE_DEVICES=([0-9,]+)")
 
 
@@ -55,37 +56,39 @@ def sample_gpu_mem(ids: str):
         return 0, 0
 
 
-def suggest_batch(per_device, num_gpus, peak_mb, total_mb, frac):
-    """Conservatively scale per-device batch to use ~frac of GPU memory. Assuming memory is
+def suggest_batch(batch, gpus, peak_mb, total_mb, frac):
+    """Conservatively scale --batch_size to use ~frac of GPU memory. Assuming memory is
     purely linear in batch UNDER-estimates true capacity (real runs have fixed overhead), so
     this is a safe lower bound — always re-run preflight at the new batch to confirm."""
-    if not (per_device and peak_mb and total_mb):
+    if not (batch and peak_mb and total_mb):
         return None
     factor = (frac * total_mb) / peak_mb
-    new_pd = int(per_device * factor)
-    new_pd = max(per_device, (new_pd // 1) or per_device)
-    if new_pd <= per_device:
+    new_b = int(batch * factor)
+    if new_b <= batch:
         return None
-    return {"per_device_batch": new_pd, "global_batch_size": new_pd * max(1, num_gpus),
-            "from_per_device": per_device, "headroom_factor": round(factor, 2),
+    return {"batch_size": new_b, "global_batch_size": new_b * max(1, gpus),
+            "from_batch_size": batch, "headroom_factor": round(factor, 2),
             "note": "estimate — set this batch, RE-RUN preflight to confirm it fits, then "
-                    "consider scaling LR with batch and recomputing max_steps/save_steps."}
+                    "consider scaling LR with batch and recomputing steps/save_freq."}
+
+
+def _override_flag(cmd: str, flag: str, value) -> str:
+    """Replace `--flag=X` / `--flag X` (draccus style) or append the flag if absent."""
+    pat = re.compile(rf"--{re.escape(flag)}[= ]\S+")
+    if pat.search(cmd):
+        return pat.sub(f"--{flag}={value}", cmd)
+    return cmd + f" --{flag}={value}"
 
 
 def smoke_command(cmd: str, real_output_dir: str, tmp_dir: str, steps: int) -> str:
     """Force tiny steps + temp output dir for the smoke run only."""
-    # override env-style MAX_STEPS/SAVE_STEPS (finetune.sh reads these from the environment)
-    cmd = re.sub(r"MAX_STEPS=\d+", f"MAX_STEPS={steps}", cmd)
-    cmd = re.sub(r"SAVE_STEPS=\d+", f"SAVE_STEPS={steps}", cmd)
-    if "MAX_STEPS=" not in cmd:
-        cmd = f"MAX_STEPS={steps} " + cmd
-    if "SAVE_STEPS=" not in cmd:
-        cmd = f"SAVE_STEPS={steps} " + cmd
-    # redirect the output dir
+    cmd = _override_flag(cmd, "steps", steps)
+    cmd = _override_flag(cmd, "save_freq", steps)   # exercise a checkpoint save too
+    cmd = _override_flag(cmd, "log_freq", 1)
     if real_output_dir and real_output_dir in cmd:
         cmd = cmd.replace(real_output_dir, tmp_dir)
     else:
-        cmd = re.sub(r"(--output-dir\s+)\S+", r"\1" + tmp_dir, cmd)
+        cmd = _override_flag(cmd, "output_dir", tmp_dir)
     return cmd
 
 
@@ -109,10 +112,12 @@ def main() -> None:
     else:
         ap.error("provide --session or --command")
 
-    tmp_dir = tempfile.mkdtemp(prefix="robot_sft_preflight_")
-    log_path = os.path.join(tmp_dir, "preflight.log")
+    tmp_root = tempfile.mkdtemp(prefix="robot_sft_preflight_")
+    # lerobot-train refuses a pre-existing output_dir; give it a fresh subdir.
+    tmp_dir = os.path.join(tmp_root, "out")
+    log_path = os.path.join(tmp_root, "preflight.log")
     smoke = smoke_command(cmd, real_out, tmp_dir, args.steps)
-    print(f"[preflight] smoke run ({args.steps} steps) -> {tmp_dir}")
+    print(f"[preflight] smoke run ({args.steps} steps) -> {tmp_root}")
 
     gpu_ids = gpu_ids_from_cmd(cmd)
     peak_mb, total_mb = 0, 0
@@ -140,17 +145,21 @@ def main() -> None:
     cls = error_patterns.classify(text)
     steps_seen = [int(m.group(1)) for m in STEP_RE.finditer(text)]
     progressed = bool(steps_seen) and max(steps_seen) >= 1
+    # a checkpoint save is part of the smoke test (save_freq == steps)
+    saved_ckpt = os.path.isdir(os.path.join(tmp_dir, "checkpoints"))
     rc = proc.poll()
 
     verdict = {
-        "ok": False, "rc": rc, "timed_out": timed_out, "steps_seen": max(steps_seen) if steps_seen else 0,
-        "classification": cls, "smoke_output_dir": tmp_dir, "log": log_path,
+        "ok": False, "rc": rc, "timed_out": timed_out,
+        "steps_seen": max(steps_seen) if steps_seen else 0,
+        "checkpoint_saved": saved_ckpt,
+        "classification": cls, "smoke_output_dir": tmp_root, "log": log_path,
         "peak_gpu_mem_mb": peak_mb or None, "gpu_total_mb": total_mb or None,
     }
-    # memory headroom -> suggest a bigger batch (H200 etc. are usually far from full at the
-    # planner's default batch). Only when the smoke run actually progressed and we have a plan.
+    # memory headroom -> suggest a bigger batch. Only when the smoke run actually
+    # progressed and we have a plan to compare against.
     if plan and peak_mb and total_mb:
-        sug = suggest_batch(plan.get("per_device_batch"), plan.get("num_gpus") or plan.get("gpus") or 1,
+        sug = suggest_batch(plan.get("batch_size"), plan.get("gpus") or 1,
                             peak_mb, total_mb, args.mem_frac)
         if sug:
             verdict["batch_suggestion"] = sug
@@ -160,13 +169,15 @@ def main() -> None:
         verdict["message"] = f"OOM at smoke scale: {cls['fix']}"
     elif progressed and (rc == 0 or timed_out):
         verdict["ok"] = True
-        msg = f"Training stepped ({verdict['steps_seen']} step(s)) with no fatal signature — safe to launch."
+        msg = f"Training stepped ({verdict['steps_seen']} step(s)) with no fatal signature"
+        msg += " and saved a checkpoint" if saved_ckpt else " (no checkpoint dir seen)"
+        msg += " — safe to launch."
         if peak_mb and total_mb:
             msg += f" GPU mem {peak_mb}/{total_mb} MB ({100*peak_mb//total_mb}%)."
             if verdict.get("batch_suggestion"):
                 s = verdict["batch_suggestion"]
-                msg += (f" Headroom: try per_device_batch {s['from_per_device']}→{s['per_device_batch']} "
-                        f"(global {s['global_batch_size']}) and re-run preflight to confirm.")
+                msg += (f" Headroom: try --batch_size {s['from_batch_size']}→{s['batch_size']} "
+                        f"and re-run preflight to confirm.")
         verdict["message"] = msg
     elif not progressed:
         verdict["message"] = ("No training step completed; model/data init likely failed. "
