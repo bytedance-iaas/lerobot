@@ -46,6 +46,7 @@ from .language import (
     STYLE_REGISTRY,
     column_for_style,
 )
+from .fsspec_dataset import FsspecLeRobotDataset
 from .lerobot_dataset import LeRobotDataset
 from .multi_dataset import MultiLeRobotDataset
 from .pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
@@ -65,6 +66,7 @@ __all__ = [
     "DEFAULT_QUANTILES",
     "EVENT_ONLY_STYLES",
     "EpisodeAwareSampler",
+    "FsspecLeRobotDataset",
     "LANGUAGE_EVENTS",
     "LANGUAGE_PERSISTENT",
     "LeRobotDataset",
