@@ -39,6 +39,7 @@ from .dataset_tools import (
 from .factory import make_dataset, make_train_eval_datasets, resolve_delta_timestamps
 from .image_writer import safe_stop_image_writer
 from .io_utils import load_episodes, write_stats
+from .fsspec_dataset import FsspecLeRobotDataset
 from .language import EVENT_ONLY_STYLES, PERSISTENT_STYLES, STYLE_REGISTRY, column_for_style
 from .lerobot_dataset import LeRobotDataset
 from .multi_dataset import MultiLeRobotDataset
@@ -61,6 +62,7 @@ __all__ = [
     "DEFAULT_QUANTILES",
     "EVENT_ONLY_STYLES",
     "EpisodeAwareSampler",
+    "FsspecLeRobotDataset",
     "LeRobotDataset",
     "LeRobotDatasetMetadata",
     "MultiLeRobotDataset",
