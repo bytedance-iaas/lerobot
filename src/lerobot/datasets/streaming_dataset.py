@@ -552,6 +552,16 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
 
         return query_timestamps
 
+    def _get_video_path(self, ep_idx: int, video_key: str) -> str:
+        """Resolve where a video file is fetched from (Hub URL or local path).
+
+        Extracted as a seam so subclasses can source videos elsewhere (e.g.
+        :class:`~lerobot.datasets.fsspec_dataset.FsspecLeRobotDataset` supplies an
+        fsspec object-store URL); the decode logic stays shared.
+        """
+        root = self.meta.url_root if self.streaming and not self.streaming_from_local else self.root
+        return f"{root}/{self.meta.get_video_file_path(ep_idx, video_key)}"
+
     def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict:
         """Note: When using data workers (e.g. DataLoader with num_workers>0), do not call this function
         in the main process (e.g. by using a second Dataloader with num_workers=0). It will result in a
@@ -561,8 +571,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
 
         item = {}
         for video_key, query_ts in query_timestamps.items():
-            root = self.meta.url_root if self.streaming and not self.streaming_from_local else self.root
-            video_path = f"{root}/{self.meta.get_video_file_path(ep_idx, video_key)}"
+            video_path = self._get_video_path(ep_idx, video_key)
             frames = decode_video_frames_torchcodec(
                 video_path,
                 query_ts,
