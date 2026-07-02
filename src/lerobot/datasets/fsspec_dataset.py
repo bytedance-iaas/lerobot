@@ -16,25 +16,26 @@
 """Stream a LeRobot v3.0 dataset from an fsspec object store (Volcengine TOS, S3, GCS…).
 
 :class:`StreamingLeRobotDataset` streams only from the HF Hub or a local dir: it wraps
-``root`` in ``Path`` (so ``tos://…`` / ``s3://…`` URLs break), passes no ``storage_options``
-to ``load_dataset``, and decodes video from ``{root}/…mp4`` — a path torchcodec can only
-open when it is local or HTTPS. :class:`FsspecLeRobotDataset` subclasses it and swaps in the
-three fsspec-aware seams:
+``root`` in ``Path`` (so ``tos://…`` / ``s3://…`` URLs break) and passes no
+``storage_options`` to ``load_dataset``. :class:`FsspecLeRobotDataset` subclasses it and
+adds the two fsspec-aware seams — everything runs over standard ``fsspec``, so it is
+backend-agnostic (no per-provider code):
 
 1. **metadata** — the small ``meta/`` tree is mirrored to a local temp dir via fsspec, then
    read by :class:`LeRobotDatasetMetadata` (a few MB; not ``data/`` or ``videos/``).
 2. **low-dim data** — ``load_dataset("parquet", data_files="<url>/data/*/*.parquet",
    storage_options=…, streaming=True)`` streams the parquet shards over fsspec.
-3. **video** — ``_query_videos`` is overridden to hand torchcodec a short-lived **presigned
-   HTTPS URL** (``fs.sign``) so it range-reads only the bytes it needs.
 
-Everything else (the Backtrackable buffer for ``delta_timestamps``, buffer-shuffle, sharding,
-per-item construction) is inherited unchanged.
+Video needs no special handling: lerobot's video decoder already opens each mp4 with
+``fsspec.open(...)`` and lets torchcodec range-read it, so we just point it at the full
+``<url>/videos/…mp4`` fsspec URL. Since ``fsspec.open`` takes no credentials, we register the
+backend's ``storage_options`` as fsspec defaults for the protocol (``fsspec.config.conf``) so
+the decoder can authenticate.
 
 You build the ``tos://`` (or ``s3://``) URL yourself and pass credentials via
-``storage_options`` — same connection as the ``tosfs`` fsspec impl
-(``fsspec.filesystem("tos", key, secret, region, endpoint)``). Install ``tosfs`` (or
-``tosfsspec``) for the ``tos://`` protocol. Never hardcode secrets — read them from the env.
+``storage_options`` — same connection as ``fsspec.filesystem("tos", key, secret, region,
+endpoint)``. Install ``tosfs`` (or ``tosfsspec``) for the ``tos://`` protocol. Never hardcode
+secrets — read them from the environment.
 
 Example::
 
@@ -58,7 +59,6 @@ from __future__ import annotations
 
 import os
 import tempfile
-import time
 
 import fsspec
 import numpy as np
@@ -82,8 +82,6 @@ class FsspecLeRobotDataset(StreamingLeRobotDataset):
         *,
         storage_options: dict | None = None,
         fs: fsspec.AbstractFileSystem | None = None,
-        video_url_resolver=None,
-        video_url_expiry: int = 3600,
         episodes: list[int] | None = None,
         image_transforms=None,
         delta_timestamps: dict | None = None,
@@ -102,10 +100,8 @@ class FsspecLeRobotDataset(StreamingLeRobotDataset):
             repo_id: optional label only (metadata is read from the mirrored ``meta/``, never the
                 Hub). Defaults to the last path segment of ``url``.
             storage_options: fsspec kwargs for the backend (TOS: ``key``/``secret``/``endpoint``/``region``).
+                Registered as the protocol default so the video decoder's ``fsspec.open`` authenticates.
             fs: a prebuilt fsspec filesystem (else built from the url protocol + ``storage_options``).
-            video_url_resolver: optional ``fn(rel_mp4_path) -> https_url`` overriding the default
-                presign (``fs.sign``).
-            video_url_expiry: presigned-URL lifetime in seconds (and the memo TTL).
             episodes: restrict to these episode ids (streaming filter) — for train/eval splits.
             (remaining args mirror :class:`StreamingLeRobotDataset`.)
         """
@@ -116,13 +112,16 @@ class FsspecLeRobotDataset(StreamingLeRobotDataset):
         self._url = url.rstrip("/")
         self._protocol, self._rpath = fsspec.core.split_protocol(self._url)
         self._rpath = (self._rpath or "").rstrip("/")
-        # repo_id is only a label (metadata comes from the mirrored meta/); derive from the URL.
-        self.repo_id = repo_id or (self._rpath.rsplit("/", 1)[-1] or "dataset")
         self.storage_options = dict(storage_options or {})
         self._fs = fs or fsspec.filesystem(self._protocol, **self.storage_options)
-        self._video_url_resolver = video_url_resolver
-        self._video_expiry = video_url_expiry
-        self._video_url_cache: dict[str, tuple[float, str]] = {}
+        # repo_id is only a label (metadata comes from the mirrored meta/); derive from the URL.
+        self.repo_id = repo_id or (self._rpath.rsplit("/", 1)[-1] or "dataset")
+
+        # Make the credentials the default for this protocol, so the video decoder's bare
+        # ``fsspec.open("<url>/…mp4")`` (which passes no storage_options) can authenticate.
+        if self._protocol and self.storage_options:
+            conf = fsspec.config.conf.setdefault(self._protocol, {})
+            conf.update(self.storage_options)
 
         self.image_transforms = image_transforms
         self.episodes = episodes
@@ -132,14 +131,14 @@ class FsspecLeRobotDataset(StreamingLeRobotDataset):
         self.rng = rng if rng is not None else np.random.default_rng(seed)
         self.shuffle = shuffle
         self.streaming = True
-        self.streaming_from_local = False  # our _query_videos handles the video path, not self.root
+        self.streaming_from_local = False  # our _query_videos supplies the fsspec video URL
         self.buffer_size = buffer_size
         self._return_uint8 = return_uint8
         self.video_decoder_cache = None
 
         # 1) metadata: mirror the small meta/ tree locally so LeRobotDatasetMetadata reads it.
         self._meta_root = self._mirror_meta(meta_cache_dir)
-        self.meta = LeRobotDatasetMetadata(repo_id, root=self._meta_root, revision=None)
+        self.meta = LeRobotDatasetMetadata(repo_id or self.repo_id, root=self._meta_root, revision=None)
         self.root = self.meta.root
         check_version_compatibility(self.repo_id, self.meta._version, CODEBASE_VERSION)
 
@@ -181,51 +180,15 @@ class FsspecLeRobotDataset(StreamingLeRobotDataset):
             )
         return dst
 
-    # ---- video: presigned HTTPS URLs torchcodec can range-read ----------
-    def _video_url(self, rel: str) -> str:
-        if self._video_url_resolver is not None:
-            return self._video_url_resolver(rel)
-        # local backends (file:// or a FUSE mount): torchcodec reads the path directly.
-        if self._protocol in (None, "", "file", "local"):
-            return f"{self._rpath}/{rel}"
-        now = time.time()
-        cached = self._video_url_cache.get(rel)
-        if cached and cached[0] > now:
-            return cached[1]
-        key = f"{self._rpath}/{rel}"  # bucket/prefix/videos/.../file.mp4  (no protocol)
-        url = None
-        # (a) fsspec-standard signing (s3fs implements it; tosfs inherits the base stub → raises)
-        try:
-            url = self._fs.sign(key, expiration=self._video_expiry)
-        except (NotImplementedError, AttributeError):
-            url = None
-        # (b) TOS: presign via the `tos` SDK (bundled with tosfs/tosfsspec)
-        if url is None and self._protocol.startswith("tos"):
-            url = self._tos_presign(key)
-        if url is None:
-            raise NotImplementedError(
-                f"backend '{self._protocol}' cannot presign video URLs; pass video_url_resolver=fn(rel)->https"
-            )
-        self._video_url_cache[rel] = (now + self._video_expiry - 60, url)
-        return url
-
-    def _tos_presign(self, bucket_key: str) -> str:
-        import tos
-
-        bucket, _, obj_key = bucket_key.partition("/")
-        so = self.storage_options
-        client = tos.TosClientV2(so["key"], so["secret"], so["endpoint"], so.get("region"))
-        out = client.pre_signed_url(
-            tos.HttpMethodType.Http_Method_Get, bucket, obj_key, expires=self._video_expiry
-        )
-        return out.signed_url
-
+    # ---- video: decoded straight off fsspec (no download, no presign) ----
     def _query_videos(self, query_timestamps: dict, ep_idx: int) -> dict:
         item = {}
         for video_key, query_ts in query_timestamps.items():
             rel = str(self.meta.get_video_file_path(ep_idx, video_key))
+            # lerobot's decoder opens this with fsspec.open(...) and lets torchcodec range-read it.
+            video_url = f"{self._url}/{rel}"
             frames = decode_video_frames_torchcodec(
-                self._video_url(rel),
+                video_url,
                 query_ts,
                 self.tolerance_s,
                 decoder_cache=self.video_decoder_cache,
