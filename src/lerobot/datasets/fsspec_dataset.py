@@ -26,9 +26,10 @@ points it at any ``fsspec`` URL instead, with no per-provider code:
    streaming=True)`` streams the parquet shards over fsspec. Also applies the ``episodes``
    filter (useful for held-out train/eval splits).
 3. **video** — lerobot's decoder already opens each mp4 with ``fsspec.open(...)`` and lets
-   torchcodec range-read it, so ``_query_videos`` just supplies the full ``<url>/…mp4``
-   fsspec URL. ``storage_options`` are registered as protocol defaults
-   (``fsspec.config.conf``) so that bare ``fsspec.open`` can authenticate.
+   torchcodec range-read it, so overriding the parent's ``_get_video_path`` seam to return
+   the full ``<url>/…mp4`` fsspec URL is enough; the depth/rgb decode logic stays shared.
+   ``storage_options`` are registered as protocol defaults (``fsspec.config.conf``) so that
+   bare ``fsspec.open`` can authenticate.
 
 Everything else — the shuffle buffer, sharding, delta-timestamp windows, per-item
 construction — is inherited from the parent constructor untouched.
@@ -65,7 +66,6 @@ import fsspec
 from datasets import load_dataset
 
 from .streaming_dataset import StreamingLeRobotDataset
-from .video_utils import decode_video_frames_torchcodec
 
 
 class FsspecLeRobotDataset(StreamingLeRobotDataset):
@@ -145,17 +145,6 @@ class FsspecLeRobotDataset(StreamingLeRobotDataset):
         return ds
 
     # ---- video: decoded straight off fsspec (no download) ----------------
-    def _query_videos(self, query_timestamps: dict, ep_idx: int) -> dict:
-        item = {}
-        for video_key, query_ts in query_timestamps.items():
-            rel = str(self.meta.get_video_file_path(ep_idx, video_key))
-            # lerobot's decoder opens this with fsspec.open(...) and lets torchcodec range-read it.
-            frames = decode_video_frames_torchcodec(
-                f"{self._url}/{rel}",
-                query_ts,
-                self.tolerance_s,
-                decoder_cache=self.video_decoder_cache,
-                return_uint8=self._return_uint8,
-            )
-            item[video_key] = frames.squeeze(0) if len(query_ts) == 1 else frames
-        return item
+    def _get_video_path(self, ep_idx: int, video_key: str) -> str:
+        # lerobot's decoder opens this with fsspec.open(...) and lets torchcodec range-read it.
+        return f"{self._url}/{self.meta.get_video_file_path(ep_idx, video_key)}"
