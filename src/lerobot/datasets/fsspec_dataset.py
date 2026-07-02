@@ -13,29 +13,29 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Stream a LeRobot v3.0 dataset from an fsspec object store (Volcengine TOS, S3, GCS…).
+"""Stream a LeRobot v3.0 dataset from an fsspec object store (S3, GCS, Volcengine TOS…).
 
-:class:`StreamingLeRobotDataset` streams only from the HF Hub or a local dir: it wraps
-``root`` in ``Path`` (so ``tos://…`` / ``s3://…`` URLs break) and passes no
-``storage_options`` to ``load_dataset``. :class:`FsspecLeRobotDataset` subclasses it and
-adds the two fsspec-aware seams — everything runs over standard ``fsspec``, so it is
-backend-agnostic (no per-provider code):
+:class:`StreamingLeRobotDataset` streams from the HF Hub or a local dir. This subclass
+points it at any ``fsspec`` URL instead, with no per-provider code:
 
-1. **metadata** — the small ``meta/`` tree is mirrored to a local temp dir via fsspec, then
-   read by :class:`LeRobotDatasetMetadata` (a few MB; not ``data/`` or ``videos/``).
-2. **low-dim data** — ``load_dataset("parquet", data_files="<url>/data/*/*.parquet",
-   storage_options=…, streaming=True)`` streams the parquet shards over fsspec.
+1. **metadata** — the small ``meta/`` tree is mirrored to a local dir via fsspec and handed
+   to the parent as ``root``, so the stock metadata path runs unchanged (a few MB; ``data/``
+   and ``videos/`` are never downloaded).
+2. **low-dim data** — overrides the parent's ``_load_hf_dataset`` seam:
+   ``load_dataset("parquet", data_files="<url>/data/*/*.parquet", storage_options=…,
+   streaming=True)`` streams the parquet shards over fsspec. Also applies the ``episodes``
+   filter (useful for held-out train/eval splits).
+3. **video** — lerobot's decoder already opens each mp4 with ``fsspec.open(...)`` and lets
+   torchcodec range-read it, so ``_query_videos`` just supplies the full ``<url>/…mp4``
+   fsspec URL. ``storage_options`` are registered as protocol defaults
+   (``fsspec.config.conf``) so that bare ``fsspec.open`` can authenticate.
 
-Video needs no special handling: lerobot's video decoder already opens each mp4 with
-``fsspec.open(...)`` and lets torchcodec range-read it, so we just point it at the full
-``<url>/videos/…mp4`` fsspec URL. Since ``fsspec.open`` takes no credentials, we register the
-backend's ``storage_options`` as fsspec defaults for the protocol (``fsspec.config.conf``) so
-the decoder can authenticate.
+Everything else — the shuffle buffer, sharding, delta-timestamp windows, per-item
+construction — is inherited from the parent constructor untouched.
 
-You build the ``tos://`` (or ``s3://``) URL yourself and pass credentials via
-``storage_options`` — same connection as ``fsspec.filesystem("tos", key, secret, region,
-endpoint)``. Install ``tosfs`` (or ``tosfsspec``) for the ``tos://`` protocol. Never hardcode
-secrets — read them from the environment.
+You build the fsspec URL yourself and pass credentials via ``storage_options`` (read them
+from the environment; never hardcode secrets). For Volcengine TOS install ``tosfs`` to get
+the ``tos://`` protocol.
 
 Example::
 
@@ -60,15 +60,11 @@ from __future__ import annotations
 import os
 import tempfile
 
+import datasets
 import fsspec
-import numpy as np
-import torch
 from datasets import load_dataset
 
-from .dataset_metadata import CODEBASE_VERSION, LeRobotDatasetMetadata
-from .feature_utils import get_delta_indices
 from .streaming_dataset import StreamingLeRobotDataset
-from .utils import check_version_compatibility
 from .video_utils import decode_video_frames_torchcodec
 
 
@@ -81,93 +77,46 @@ class FsspecLeRobotDataset(StreamingLeRobotDataset):
         repo_id: str | None = None,
         *,
         storage_options: dict | None = None,
-        fs: fsspec.AbstractFileSystem | None = None,
-        episodes: list[int] | None = None,
-        image_transforms=None,
-        delta_timestamps: dict | None = None,
-        tolerance_s: float = 1e-4,
-        buffer_size: int = 1000,
-        max_num_shards: int = 16,
-        seed: int = 42,
-        rng: np.random.Generator | None = None,
-        shuffle: bool = True,
-        return_uint8: bool = False,
         meta_cache_dir: str | None = None,
+        **kwargs,
     ):
         """
         Args:
             url: dataset root on the backend, e.g. ``tos://bucket/prefix`` or ``s3://bucket/prefix``.
-            repo_id: optional label only (metadata is read from the mirrored ``meta/``, never the
-                Hub). Defaults to the last path segment of ``url``.
-            storage_options: fsspec kwargs for the backend (TOS: ``key``/``secret``/``endpoint``/``region``).
-                Registered as the protocol default so the video decoder's ``fsspec.open`` authenticates.
-            fs: a prebuilt fsspec filesystem (else built from the url protocol + ``storage_options``).
-            episodes: restrict to these episode ids (streaming filter) — for train/eval splits.
-            (remaining args mirror :class:`StreamingLeRobotDataset`.)
+            repo_id: optional label only (metadata is read from the mirrored ``meta/``, never
+                the Hub). Defaults to the last path segment of ``url``.
+            storage_options: fsspec kwargs for the backend (TOS: ``key``/``secret``/``endpoint``/
+                ``region``). Also registered as the protocol default so the video decoder's bare
+                ``fsspec.open`` authenticates.
+            meta_cache_dir: where to mirror ``meta/`` (default: a temp dir).
+            **kwargs: forwarded to :class:`StreamingLeRobotDataset` (``episodes``,
+                ``delta_timestamps``, ``image_transforms``, ``tolerance_s``, ``buffer_size``,
+                ``max_num_shards``, ``seed``, ``shuffle``, ``return_uint8``, …).
         """
-        # NOTE: intentionally does NOT call super().__init__ — it would Path-mangle the URL and
-        # load_dataset without storage_options. We replicate its setup with the fsspec seams.
-        torch.utils.data.IterableDataset.__init__(self)
-
         self._url = url.rstrip("/")
         self._protocol, self._rpath = fsspec.core.split_protocol(self._url)
         self._rpath = (self._rpath or "").rstrip("/")
         self.storage_options = dict(storage_options or {})
-        self._fs = fs or fsspec.filesystem(self._protocol, **self.storage_options)
-        # repo_id is only a label (metadata comes from the mirrored meta/); derive from the URL.
-        self.repo_id = repo_id or (self._rpath.rsplit("/", 1)[-1] or "dataset")
+        # instance-cached by fsspec, so this is the same object load_dataset/fsspec.open resolve.
+        self._fs = fsspec.filesystem(self._protocol, **self.storage_options)
 
         # Make the credentials the default for this protocol, so the video decoder's bare
         # ``fsspec.open("<url>/…mp4")`` (which passes no storage_options) can authenticate.
         if self._protocol and self.storage_options:
-            conf = fsspec.config.conf.setdefault(self._protocol, {})
-            conf.update(self.storage_options)
+            fsspec.config.conf.setdefault(self._protocol, {}).update(self.storage_options)
 
-        self.image_transforms = image_transforms
-        self.episodes = episodes
-        self.tolerance_s = tolerance_s
-        self.revision = CODEBASE_VERSION
-        self.seed = seed
-        self.rng = rng if rng is not None else np.random.default_rng(seed)
-        self.shuffle = shuffle
-        self.streaming = True
-        self.streaming_from_local = False  # our _query_videos supplies the fsspec video URL
-        self.buffer_size = buffer_size
-        self._return_uint8 = return_uint8
-        self.video_decoder_cache = None
-
-        # 1) metadata: mirror the small meta/ tree locally so LeRobotDatasetMetadata reads it.
-        self._meta_root = self._mirror_meta(meta_cache_dir)
-        self.meta = LeRobotDatasetMetadata(repo_id or self.repo_id, root=self._meta_root, revision=None)
-        self.root = self.meta.root
-        check_version_compatibility(self.repo_id, self.meta._version, CODEBASE_VERSION)
-
-        # 2) delta-timestamp windows (inherited validator + index math)
-        self.delta_timestamps = None
-        self.delta_indices = None
-        if delta_timestamps is not None:
-            self._validate_delta_timestamp_keys(delta_timestamps)
-            self.delta_timestamps = delta_timestamps
-            self.delta_indices = get_delta_indices(self.delta_timestamps, self.fps)
-
-        # 3) low-dim data: stream the parquet shards straight off the backend via fsspec.
-        self.hf_dataset = load_dataset(
-            "parquet",
-            data_files=f"{self._url}/data/*/*.parquet",
-            storage_options=self.storage_options,
-            split="train",
-            streaming=True,
-        )
-        if episodes is not None:
-            keep = {int(e) for e in episodes}
-            # the stock streaming class ignores `episodes`; apply a lazy per-frame filter here.
-            self.hf_dataset = self.hf_dataset.filter(lambda x, k=keep: int(x["episode_index"]) in k)
-        self.num_shards = min(self.hf_dataset.num_shards, max_num_shards)
+        # repo_id is only a label (metadata comes from the mirrored meta/); derive from the URL.
+        repo_id = repo_id or (self._rpath.rsplit("/", 1)[-1] or "dataset")
+        # Mirror meta/ locally and hand it to the parent as `root`: the stock metadata,
+        # version-check, delta-timestamp and shuffle/shard setup then run unchanged. The
+        # parent's data loading goes through the `_load_hf_dataset` seam overridden below.
+        meta_root = self._mirror_meta(meta_cache_dir, repo_id)
+        super().__init__(repo_id, root=meta_root, **kwargs)
 
     # ---- metadata mirror -------------------------------------------------
-    def _mirror_meta(self, cache_dir: str | None) -> str:
+    def _mirror_meta(self, cache_dir: str | None, repo_id: str) -> str:
         local = cache_dir or tempfile.mkdtemp(prefix="fsspec_lerobot_")
-        dst = os.path.join(local, self.repo_id.replace("/", "__"))
+        dst = os.path.join(local, repo_id.replace("/", "__"))
         meta_dst = os.path.join(dst, "meta")
         if not os.path.exists(os.path.join(meta_dst, "info.json")):
             os.makedirs(dst, exist_ok=True)
@@ -180,15 +129,29 @@ class FsspecLeRobotDataset(StreamingLeRobotDataset):
             )
         return dst
 
-    # ---- video: decoded straight off fsspec (no download, no presign) ----
+    # ---- low-dim data: stream the parquet shards off the backend ---------
+    def _load_hf_dataset(self) -> datasets.IterableDataset:
+        ds = load_dataset(
+            "parquet",
+            data_files=f"{self._url}/data/*/*.parquet",
+            storage_options=self.storage_options,
+            split="train",
+            streaming=True,
+        )
+        if self.episodes is not None:
+            keep = {int(e) for e in self.episodes}
+            # the parent ignores `episodes` when streaming; apply a lazy per-frame filter here.
+            ds = ds.filter(lambda x: int(x["episode_index"]) in keep)
+        return ds
+
+    # ---- video: decoded straight off fsspec (no download) ----------------
     def _query_videos(self, query_timestamps: dict, ep_idx: int) -> dict:
         item = {}
         for video_key, query_ts in query_timestamps.items():
             rel = str(self.meta.get_video_file_path(ep_idx, video_key))
             # lerobot's decoder opens this with fsspec.open(...) and lets torchcodec range-read it.
-            video_url = f"{self._url}/{rel}"
             frames = decode_video_frames_torchcodec(
-                video_url,
+                f"{self._url}/{rel}",
                 query_ts,
                 self.tolerance_s,
                 decoder_cache=self.video_decoder_cache,

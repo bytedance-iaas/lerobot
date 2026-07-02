@@ -314,15 +314,24 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             self.delta_timestamps = delta_timestamps
             self.delta_indices = get_delta_indices(self.delta_timestamps, self.fps)
 
-        self.hf_dataset: datasets.IterableDataset = load_dataset(
+        self.hf_dataset: datasets.IterableDataset = self._load_hf_dataset()
+
+        self.num_shards = min(self.hf_dataset.num_shards, max_num_shards)
+
+    def _load_hf_dataset(self) -> datasets.IterableDataset:
+        """Build the streaming HF dataset over the low-dim parquet shards.
+
+        Extracted as a seam so subclasses can source the shards elsewhere (e.g.
+        :class:`~lerobot.datasets.fsspec_dataset.FsspecLeRobotDataset` streams them
+        from an fsspec object store).
+        """
+        return load_dataset(
             self.repo_id if not self.streaming_from_local else str(self.root),
             split="train",
             streaming=self.streaming,
             data_files="data/*/*.parquet",
             revision=self.revision,
         )
-
-        self.num_shards = min(self.hf_dataset.num_shards, max_num_shards)
 
     @property
     def num_frames(self):
