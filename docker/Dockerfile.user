@@ -54,15 +54,16 @@ ENV HOME=/home/user_lerobot \
     TORCH_HOME=/home/user_lerobot/.cache/torch \
     TRITON_CACHE_DIR=/home/user_lerobot/.cache/triton
 
-# Use the Aliyun PyPI mirror for `uv sync` below. This must be a Dockerfile ENV
-# (not a pipeline variable): Volcengine CP discontinued injecting pipeline env vars
-# into Dockerfile builds, so a UV_DEFAULT_INDEX pipeline variable never reaches this
-# RUN layer. We use Aliyun rather than the Volcengine in-cloud mirror (mirrors.volces.com)
-# because the latter is missing wheels — e.g. livekit's manylinux_2_28 wheels 404 — whereas
-# Aliyun is a complete PyPI mirror and is reachable from the build cluster (same as the
-# pytorch-cu128 index). This must match the index uv.lock was generated against, since
-# `uv sync --locked` downloads from the URLs recorded in the lockfile.
-ENV UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple/
+# Use the official PyPI index for `uv sync` below. Set explicitly as a Dockerfile ENV
+# to override any UV_DEFAULT_INDEX inherited from the build environment (Volcengine CP
+# discontinued injecting pipeline env vars into Dockerfile builds anyway). We source from
+# PyPI directly rather than a regional mirror because the mirrors have wheel gaps — the
+# Volcengine mirror 404s livekit's manylinux wheels, the Aliyun mirror 404s num2words —
+# and playing whack-a-mole per missing package isn't worth it; PyPI is authoritative and
+# complete. This must match the URLs recorded in uv.lock (files.pythonhosted.org), which
+# `uv sync --locked` downloads from. (torch/torchvision still use the pytorch-cu128 index
+# pinned in pyproject.toml — the CUDA wheels aren't on PyPI.)
+ENV UV_DEFAULT_INDEX=https://pypi.org/simple
 
 # Create the virtual environment
 # We use a virtual environment inside the container—even though the container itself \
