@@ -437,14 +437,25 @@ lerobot-policy-server="lerobot.scripts.lerobot_policy_server:main"
 
 # ---------------- Tool Configurations ----------------
 
-# torchcodec comes from the CPU index (upstream); torch/torchvision come from the Aliyun
-# cu128 mirror, because download.pytorch.org serves wheels via Cloudflare R2 and is slow
-# from China. Other CUDA variants: see docs/source/installation.mdx.
+# torchcodec comes from the CPU index (upstream). Everything else prefers the Aliyun PyPI
+# mirror (fast from the CN build cluster) with official PyPI as a fallback for wheels Aliyun
+# hasn't synced (e.g. num2words); unsafe-best-match lets uv pick from whichever index has the
+# needed version instead of stopping at the first index that lists the name. `uv sync --locked`
+# downloads from the exact URLs in uv.lock, so re-lock after changing these.
+[tool.uv]
+index-strategy = "unsafe-best-match"
+
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
+[[tool.uv.index]]
+name = "aliyun"
+url = "https://mirrors.aliyun.com/pypi/simple/"
+
+# torch/torchvision come from the Aliyun cu128 mirror: download.pytorch.org serves wheels via
+# Cloudflare R2 and is slow from China. Other CUDA variants: docs/source/installation.mdx.
 [[tool.uv.index]]
 name = "pytorch-cu128"
 # Aliyun mirror (flat layout) -- actually hosts the cu128 wheel files in China.

@@ -61,6 +61,14 @@ ENV HOME=/home/user_lerobot \
     TORCH_HOME=/home/user_lerobot/.cache/torch \
     TRITON_CACHE_DIR=/home/user_lerobot/.cache/triton
 
+# Index config lives in pyproject.toml: the Aliyun PyPI mirror (fast from the CN build
+# cluster) is the primary index, with official PyPI as the fallback for the few wheels
+# Aliyun hasn't synced (e.g. num2words). uv.lock records the resolved per-package URLs
+# (mostly mirrors.aliyun.com, a couple files.pythonhosted.org). Pin the default/fallback
+# index to official PyPI here too, so an injected UV_DEFAULT_INDEX in the build env can't
+# repoint it. `uv sync --locked` downloads the exact URLs in uv.lock.
+ENV UV_DEFAULT_INDEX=https://pypi.org/simple
+
 # Create the virtual environment
 # We use a virtual environment inside the container—even though the container itself \
 # provides isolation—to closely resemble local development and allow users to \
@@ -68,9 +76,7 @@ ENV HOME=/home/user_lerobot \
 RUN uv venv
 
 # Only the dependency manifests — NOT src/ — so this layer (and the heavy uv sync below)
-# stays cached across application source changes. torch/torchvision come from the
-# pytorch-cu128 index pinned in pyproject.toml; everything else from PyPI as recorded in
-# uv.lock (files.pythonhosted.org URLs).
+# stays cached across application source changes.
 COPY --chown=user_lerobot:user_lerobot setup.py pyproject.toml uv.lock README.md MANIFEST.in ./
 
 # Install all dependencies (every extra) but NOT the lerobot project itself — that is
