@@ -359,6 +359,19 @@ lerobot-rollout="lerobot.scripts.lerobot_rollout:main"
 
 # ---------------- Tool Configurations ----------------
 
+# Prefer the Aliyun PyPI mirror (fast from the CN build cluster) but keep the official
+# PyPI index as a fallback for wheels Aliyun hasn't synced (e.g. num2words). unsafe-best-match
+# lets uv pick a package from whichever index has the needed version instead of stopping at
+# the first index that lists the name — required for the fallback to actually kick in. Both
+# indexes are public PyPI mirrors, so cross-index selection is safe here. `uv sync --locked`
+# downloads from the exact URLs recorded in uv.lock, so re-lock after changing these.
+[tool.uv]
+index-strategy = "unsafe-best-match"
+
+[[tool.uv.index]]
+name = "aliyun"
+url = "https://mirrors.aliyun.com/pypi/simple/"
+
 # cu128 wheels keep broad hardware reach; the driver floor is 570.86.
 # To use a different CUDA variant, reinstall torch with an explicit index, e.g.:
 #   uv pip install --force-reinstall torch torchvision \
