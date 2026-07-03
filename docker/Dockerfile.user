@@ -54,14 +54,15 @@ ENV HOME=/home/user_lerobot \
     TORCH_HOME=/home/user_lerobot/.cache/torch \
     TRITON_CACHE_DIR=/home/user_lerobot/.cache/triton
 
-# Use the Volcengine in-cloud PyPI mirror for `uv sync` below. This must be a
-# Dockerfile ENV (not a pipeline variable): Volcengine CP discontinued injecting
-# pipeline env vars into Dockerfile builds, so a UV_DEFAULT_INDEX pipeline variable
-# never reaches this RUN layer. mirrors.ivolces.com is the internal address (same
-# network as the build cluster — no public egress). This must match the index
-# uv.lock was generated against (re-lock with the same UV_DEFAULT_INDEX), since
+# Use the Aliyun PyPI mirror for `uv sync` below. This must be a Dockerfile ENV
+# (not a pipeline variable): Volcengine CP discontinued injecting pipeline env vars
+# into Dockerfile builds, so a UV_DEFAULT_INDEX pipeline variable never reaches this
+# RUN layer. We use Aliyun rather than the Volcengine in-cloud mirror (mirrors.volces.com)
+# because the latter is missing wheels — e.g. livekit's manylinux_2_28 wheels 404 — whereas
+# Aliyun is a complete PyPI mirror and is reachable from the build cluster (same as the
+# pytorch-cu128 index). This must match the index uv.lock was generated against, since
 # `uv sync --locked` downloads from the URLs recorded in the lockfile.
-ENV UV_DEFAULT_INDEX=https://mirrors.volces.com/pypi/simple/
+ENV UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple/
 
 # Create the virtual environment
 # We use a virtual environment inside the container—even though the container itself \
