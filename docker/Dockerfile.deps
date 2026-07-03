@@ -12,13 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# This Dockerfile is designed for a lerobot user who wants to
-# experiment with the project. It starts from an Python Slim base image.
-
-# docker build -f docker/Dockerfile.user -t lerobot-user .
-# docker run -it --rm lerobot-user
-
-# With USB physical access : docker run -it --device=/dev/ -v /dev/:/dev/ --rm lerobot-user
+# Dependency base image for lerobot.
+#
+# This builds the *slow* part of the image — system libraries plus the entire Python
+# dependency set (`uv sync --locked --extra all`, torch/CUDA included) — as a standalone,
+# rarely-changing base so that docker/Dockerfile.user can `FROM` it and rebuild in seconds
+# on source-only changes.
+#
+# Crucially it installs dependencies ONLY (`--no-install-project`) and never copies `src/`,
+# so this image is independent of the application source: it caches across every code change
+# and needs rebuilding only when `pyproject.toml` or `uv.lock` change. Dockerfile.user
+# installs the `lerobot` package itself on top (deps already present -> fast).
+#
+#   docker build -f docker/Dockerfile.deps -t lerobot-deps .
+#   # then in docker/Dockerfile.user:  FROM lerobot-deps
 
 # Configure the base image
 ARG PYTHON_VERSION=3.12
@@ -60,15 +67,14 @@ ENV HOME=/home/user_lerobot \
 # run other Python projects in the same container without dependency conflicts.
 RUN uv venv
 
-# Install Python dependencies for caching
+# Only the dependency manifests — NOT src/ — so this layer (and the heavy uv sync below)
+# stays cached across application source changes. torch/torchvision come from the
+# pytorch-cu128 index pinned in pyproject.toml; everything else from PyPI as recorded in
+# uv.lock (files.pythonhosted.org URLs).
 COPY --chown=user_lerobot:user_lerobot setup.py pyproject.toml uv.lock README.md MANIFEST.in ./
-COPY --chown=user_lerobot:user_lerobot src/ src/
 
-RUN uv sync --locked --extra all --no-cache
+# Install all dependencies (every extra) but NOT the lerobot project itself — that is
+# installed by Dockerfile.user on top of this image once the source is present.
+RUN uv sync --locked --extra all --no-install-project --no-cache
 
-# Copy the rest of the application code
-# Make sure to have the git-LFS files for testing
-COPY --chown=user_lerobot:user_lerobot . .
-
-# Set the default command
 CMD ["/bin/bash"]
