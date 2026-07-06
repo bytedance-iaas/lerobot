@@ -692,7 +692,7 @@
   function fetchStatus() {
     fetch("/api/status").then((r) => r.json()).then((s) => {
       chatReady = !!s.chat_ready;
-      if (s.model) $("chat-model").textContent = s.model;
+      if (s.model) $("chat-model").value = s.model;
       $("chat-status").style.background = chatReady ? "" : "#c2c7d2";
       // Small warning when the console is served over plain HTTP (unencrypted).
       // Prefer the server's answer; fall back to the page protocol on older servers.
@@ -703,11 +703,34 @@
 
   /* -------------------------------------------------------------- start up */
   // No presence lock — multiple windows/users may be open at once.
+  // Model dropdown: populate from /api/models, switch model on change.
+  function loadModels() {
+    fetch("/api/models").then((r) => r.json()).then((d) => {
+      const sel = $("chat-model");
+      sel.innerHTML = "";
+      (d.models || []).forEach((m) => {
+        const o = document.createElement("option");
+        o.value = m;
+        o.textContent = m;
+        sel.appendChild(o);
+      });
+      if (d.current) sel.value = d.current;
+    }).catch(() => {});
+  }
+  $("chat-model").addEventListener("change", (e) => {
+    fetch("/api/model", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: e.target.value }),
+    }).then((r) => r.json()).then((d) => { if (d.model) $("chat-model").value = d.model; }).catch(() => {});
+  });
+
   function startApp() {
     sessionActive = true;
     TERM.start();
     if (!chatWS || chatWS.readyState > 1) connectChat();
     fetchStatus();
+    loadModels();
   }
   startApp();
 })();

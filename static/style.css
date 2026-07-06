@@ -193,6 +193,9 @@ body {
 .st-caret { flex: 0 0 auto; color: var(--muted); font-size: 11px; }
 .chat-status { flex: 0 0 auto; }
 .chat-model-mini { flex: 0 0 auto; color: var(--muted); font-size: 11.5px; max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-model-sel { flex: 0 1 auto; min-width: 0; max-width: 170px; color: var(--muted); font-size: 11.5px;
+  background: transparent; border: 1px solid var(--line); border-radius: 8px; padding: 3px 6px; cursor: pointer; }
+.chat-model-sel:hover { color: var(--ink); border-color: #d9dbe2; }
 .chat-gear { flex: 0 0 auto; border: 0; background: transparent; cursor: pointer; font-size: 17px; color: var(--muted); }
 .chat-gear:hover { color: var(--ink); }
 

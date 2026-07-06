@@ -98,6 +98,13 @@ CHAT_DIRECTIVE = (
 # Ark / Volcengine OpenAI-compatible endpoint and a sensible default model.
 DEFAULT_BASE_URL = os.environ.get("ARK_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
 DEFAULT_MODEL = os.environ.get("ARK_MODEL", "deepseek-v4-pro-260425")
+# Models offered in the chat header dropdown. All must be reachable at DEFAULT_BASE_URL
+# (Volcengine Ark) — doubao-* / deepseek-*. Override for your account with the ARK_MODELS
+# env (comma-separated). The currently-configured model is always added to the list.
+_DEFAULT_MODELS = [
+    "deepseek-v4-pro-260425",
+    "doubao-seed-2-0-pro-260215",
+]
 
 # Placeholder values that mean "no real key yet" — treat chat as not-ready.
 _PLACEHOLDERS = {"", "your-api-key", "changeme", "<set-me>", "null", "none"}
@@ -238,6 +245,41 @@ def _versions() -> dict:
 
 async def handle_version(_request: web.Request) -> web.Response:
     return web.json_response(_versions())
+
+
+def _model_choices() -> list:
+    env = os.environ.get("ARK_MODELS", "").strip()
+    models = [m.strip() for m in env.split(",") if m.strip()] if env else list(_DEFAULT_MODELS)
+    cur = read_chat_config().get("model")
+    if cur and cur not in models:  # always offer the currently-configured model
+        models = [cur, *models]
+    return models
+
+
+async def handle_models(_request: web.Request) -> web.Response:
+    return web.json_response({"models": _model_choices(), "current": read_chat_config().get("model")})
+
+
+async def handle_set_model(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid JSON"}, status=400)
+    model = (body.get("model") or "").strip()
+    if not model:
+        return web.json_response({"ok": False, "error": "model is required"}, status=400)
+    try:
+        await _hermes_config_set("model.default", model)  # chat-only; base_url/key unchanged
+    except Exception as e:  # noqa: BLE001
+        log.exception("failed to set model")
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
+    acp: HermesACP = request.app.get("acp")
+    if acp:
+        try:
+            await acp.restart()  # so the next chat turn uses the new model
+        except Exception as e:  # noqa: BLE001
+            log.warning("acp restart after model change failed: %s", e)
+    return web.json_response({"ok": True, **read_chat_config()})
 
 
 # Whitelisted markdown docs served straight from the lerobot checkout baked into the image
@@ -985,6 +1027,8 @@ def build_app() -> web.Application:
     app.router.add_get("/healthz", handle_health)   # unauthenticated — for LB/k8s probes
     app.router.add_get("/api/status", handle_status)
     app.router.add_get("/api/version", handle_version)
+    app.router.add_get("/api/models", handle_models)
+    app.router.add_post("/api/model", handle_set_model)
     app.router.add_get(r"/api/lerobot-doc/{name}", handle_lerobot_doc)
     app.router.add_get("/api/services", handle_services)
     app.router.add_post("/api/volcano-key", handle_volcano_key)
