@@ -878,7 +878,14 @@ async def auth_middleware(request: web.Request, handler):
                 status=401, text="Authentication required",
                 headers={"WWW-Authenticate": 'Basic realm="LeRobot Agent Console"'},
             )
-    return await handler(request)
+    resp = await handler(request)
+    # The UI assets (index.html, app.js, style.css, release_note.md) change on every
+    # redeploy; without this the browser serves a stale cached bundle and the user has to
+    # hard-refresh to see updates. `no-cache` = revalidate on each load (conditional GET →
+    # cheap 304 via Last-Modified when unchanged), not `no-store`, so it stays fast.
+    if request.path == "/" or request.path.startswith("/static/"):
+        resp.headers["Cache-Control"] = "no-cache"
+    return resp
 
 
 async def handle_control(request: web.Request) -> web.WebSocketResponse:
