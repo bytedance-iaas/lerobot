@@ -31,14 +31,25 @@ for item in ds:
 
 ## 2. 云端直连机器人 · LiveKit 传输
 
-云端 GPU 与机器人往往**不在同一张网里**，也很难直接互联（内网隔离、家用 NAT）。我们让 `WebRTCProxyRobot` 支持 **LiveKit（SFU）** 传输：机器人与云端各自**主动拨出**连到 LiveKit，借此穿透 NAT，**无需机器人侧暴露任何公网入站**。
+云端 GPU 与机器人往往**不在同一张网里**，也很难直接互联（内网隔离、家用 NAT）。我们让 `WebRTCProxyRobot` 支持 **LiveKit（SFU）** 传输：机器人与云端各自**主动拨出**连到 LiveKit，借此穿透 NAT，**无需机器人侧暴露任何公网入站**。云端拿到的就是一个普通的 lerobot `Robot`——`get_observation()` 取远端关节 + 摄像头，`send_action()` 驱动远端电机，record / teleop / eval 全部无改动即可用；机器人侧内置安全看门狗，链路中断自动 safe-stop。
 
-- **云端就是一个普通 `Robot`**：`get_observation()` 拿到远端关节 + 摄像头，`send_action()` 直接驱动远端电机——record / teleop / eval 全部无改动即可用。
-- **内网推荐 `aiortc`**：点对点直连，延迟最低，自带信令中继，无需任何外部服务。
-- **公网推荐 `livekit`**：经 SFU 中转，自动处理 NAT 穿透 / TURN，适合跨公网、多并发、规模化。
-- **实时且安全**：状态与动作走 WebRTC DataChannel，摄像头走媒体轨（每帧带采集序号做对齐）；机器人侧内置安全看门狗，链路中断自动 safe-stop，绝不让机械臂卡在危险姿态。
+**大概怎么用：**
 
-在本控制台里，启动 `webrtc_remote_so100` 远程遥操作后，它的 web 操作面板会作为一个新标签页直接在这里打开。
+- 机器人侧（接着 SO-100 的那台机器）跑采集守护进程，拨出连到 LiveKit：
+
+```bash
+python examples/webrtc_remote_so100/robot_daemon_so100.py
+```
+
+- 云端 / 控制侧跑控制脚本，连同一个 LiveKit，就能看到远端摄像头并遥操作：
+
+```bash
+python examples/webrtc_remote_so100/cloud_teleop_so100.py
+```
+
+- 用 `--transport livekit` 选择该传输后端，并配置 `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET`。在本控制台里，启动后它的 web 操作面板会作为一个新标签页直接在这里打开。
+
+更详细的配置、传输后端与设计说明，见 [lerobot webrtc_proxy README](https://github.com/thesues/lerobot/blob/remote_robot/src/lerobot/robots/webrtc_proxy/README.md)。
 
 ---
 
