@@ -244,6 +244,20 @@ body {
 .bubble.html-inline table { border-collapse: collapse; font-size: 12.5px; }
 .bubble.html-inline th, .bubble.html-inline td { border: 1px solid var(--line); padding: 4px 8px; }
 .bubble.html-inline h1, .bubble.html-inline h2, .bubble.html-inline h3 { font-size: 15px; margin: 6px 0; }
+/* markdown-rendered chat bubble */
+.bubble.md-chat { white-space: normal; }
+.bubble.md-chat > :first-child { margin-top: 0; }
+.bubble.md-chat > :last-child { margin-bottom: 0; }
+.bubble.md-chat p { margin: 7px 0; }
+.bubble.md-chat ul, .bubble.md-chat ol { margin: 7px 0; padding-left: 20px; }
+.bubble.md-chat li { margin: 3px 0; }
+.bubble.md-chat h1, .bubble.md-chat h2, .bubble.md-chat h3 { font-size: 1.05em; font-weight: 700; margin: 10px 0 6px; }
+.bubble.md-chat a { color: var(--blue); }
+.bubble.md-chat code { background: rgba(20,24,40,.07); border-radius: 5px; padding: 1px 5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .9em; }
+.bubble.md-chat pre { background: #1f2430; color: #e6e8ee; border-radius: 10px; padding: 10px 12px;
+  overflow-x: auto; margin: 8px 0; }
+.bubble.md-chat pre code { background: transparent; padding: 0; color: inherit; }
 .bubble.thinking { color: var(--muted); }
 .bubble.thinking::after { content: "▋"; animation: blink 1s steps(2) infinite; }
 @keyframes blink { 50% { opacity: 0; } }

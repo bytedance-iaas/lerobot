@@ -372,12 +372,39 @@
     curBubble.classList.add("thinking");
     curBubble.textContent = booting ? "正在启动 Agent" : "思考中";
   }
+  // Render a bubble's raw text: full HTML artifacts via sanitize, otherwise markdown — so
+  // **bold** / `code` / lists render *live* while streaming, not as raw text that only snaps
+  // to rendered at the end of the turn.
+  function renderBubble(bubble, raw) {
+    const txt = extractHtml(raw);
+    if (looksHtml(txt)) {
+      bubble.classList.remove("md-chat");
+      bubble.classList.add("html-inline");
+      bubble.innerHTML = sanitizeHtml(txt);
+    } else {
+      bubble.classList.remove("html-inline");
+      bubble.classList.add("md-chat");
+      bubble.innerHTML = mdToHtml(txt);
+    }
+  }
+  // Coalesce streamed tokens to one render per frame (~60fps) so we don't re-parse the whole
+  // bubble on every token.
+  let _renderPending = false;
+  function scheduleRender() {
+    if (_renderPending) return;
+    _renderPending = true;
+    requestAnimationFrame(() => {
+      _renderPending = false;
+      if (!curBubble) return;
+      renderBubble(curBubble, curText);
+      body.scrollTop = body.scrollHeight;
+    });
+  }
   function appendToken(t) {
     if (!curBubble) startTurn();
     curBubble.classList.remove("thinking");
     curText += t;
-    curBubble.textContent = curText;
-    body.scrollTop = body.scrollHeight;
+    scheduleRender();
   }
   function addToolLine(u) {
     const id = u.id || Math.random();
@@ -426,14 +453,9 @@
       } else {
         rm(curBubble);
       }
-    } else if (looksHtml(txt)) {
-      // answer carries simple inline HTML (tables/lists) → render it in the bubble
-      curBubble.classList.remove("thinking");
-      curBubble.classList.add("html-inline");
-      curBubble.innerHTML = sanitizeHtml(txt);
     } else {
       curBubble.classList.remove("thinking");
-      curBubble.textContent = txt;   // plain text reply
+      renderBubble(curBubble, curText.trim());   // same render path as live streaming
     }
     curBubble = null;
     setBusy(false);
@@ -530,8 +552,7 @@
     if (role === "user") { const u = stripSystemPrefix(text).trim(); if (u) addMsg("user", u); return; }
     const t = extractHtml(text.trim());
     if (!t) return;
-    if (looksHtml(t)) { const b = addMsg("bot", ""); b.classList.add("html-inline"); b.innerHTML = sanitizeHtml(t); }
-    else addMsg("bot", t);
+    renderBubble(addMsg("bot", ""), t);
   }
   function histChunk(m) {
     if (m.role === "tool") {
