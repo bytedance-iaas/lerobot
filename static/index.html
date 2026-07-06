@@ -33,33 +33,11 @@
         </div>
 
         <div class="viewer-body" id="viewer-body">
-          <!-- empty state (no tabs) = default landing page: release notes -->
+          <!-- empty state (no tabs): an inline-browser "new tab" page -->
           <div class="viewer-empty" id="viewer-empty">
-            <div class="release">
-              <span class="rel-badge">Release Notes</span>
-              <h2 class="rel-title">我们给 LeRobot 的增强</h2>
-              <p class="rel-sub">在标准 LeRobot 之上，LeRobot Agent Console 带来了两项能力增强：</p>
-              <ul class="rel-list">
-                <li class="rel-item">
-                  <span class="rel-ic rel-ic-orange">📦</span>
-                  <div class="rel-b">
-                    <div class="rel-h">直接访问 TOS 上的数据集</div>
-                    <div class="rel-d"><code>fsspec_dataset.py</code> —— 无需下载，直接以流式方式读取对象存储（<b>TOS</b>）上 <b>LeRobot v3 格式</b>的数据集，可直接用于训练 / 评估。</div>
-                  </div>
-                </li>
-                <li class="rel-item">
-                  <span class="rel-ic rel-ic-blue">🤖</span>
-                  <div class="rel-b">
-                    <div class="rel-h">云端直连机器人</div>
-                    <div class="rel-d">支持用 <b>LiveKit</b> 从云端（GPU 侧）直接访问 / 遥操作机器人，穿透 NAT，无需机器人侧暴露公网入站。</div>
-                  </div>
-                </li>
-              </ul>
-              <div class="rel-foot">
-                <button class="ve-open" id="viewer-empty-open">＋ 打开服务 / 网址</button>
-                <span class="rel-hint">Agent 的 HTML 输出、或在下方控制台里启动的 web 服务，都会作为标签页在这里打开。</span>
-              </div>
-            </div>
+            <div class="ve-icon">🗂️</div>
+            <p>这里是一个内嵌页面浏览器。<br/>Agent 的 HTML 输出，或在下方控制台里启动的 web 服务（如 web-so100 远程遥操作、训练监控面板），都会作为标签页在这里打开。</p>
+            <button class="ve-open" id="viewer-empty-open">＋ 打开服务 / 网址</button>
           </div>
           <!-- dynamic panes (iframes for html artifacts / proxied services) injected here -->
         </div>

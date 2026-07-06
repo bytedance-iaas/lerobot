@@ -170,6 +170,60 @@
     return id;
   }
 
+  // A "doc" tab renders a markdown file (e.g. the Release Notes welcome page) into a
+  // scrollable pane — no iframe, just fetch + a tiny markdown -> HTML pass.
+  function mdToHtml(src) {
+    const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    const inline = (s) =>
+      esc(s)
+        .replace(/`([^`]+)`/g, (_m, c) => "<code>" + c + "</code>")
+        .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+        .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    const lines = src.replace(/\r\n/g, "\n").split("\n");
+    let html = "", i = 0, list = null;
+    const closeList = () => { if (list) { html += "</" + list + ">"; list = null; } };
+    while (i < lines.length) {
+      const ln = lines[i];
+      if (ln.startsWith("```")) {
+        closeList(); i++; let code = "";
+        while (i < lines.length && !lines[i].startsWith("```")) code += esc(lines[i++]) + "\n";
+        i++; html += "<pre><code>" + code + "</code></pre>"; continue;
+      }
+      const h = ln.match(/^(#{1,4})\s+(.*)$/);
+      if (h) { closeList(); const n = h[1].length; html += "<h" + n + ">" + inline(h[2]) + "</h" + n + ">"; i++; continue; }
+      if (/^---+\s*$/.test(ln)) { closeList(); html += "<hr/>"; i++; continue; }
+      const ul = ln.match(/^[-*]\s+(.*)$/);
+      if (ul) { if (list !== "ul") { closeList(); html += "<ul>"; list = "ul"; } html += "<li>" + inline(ul[1]) + "</li>"; i++; continue; }
+      const ol = ln.match(/^\d+\.\s+(.*)$/);
+      if (ol) { if (list !== "ol") { closeList(); html += "<ol>"; list = "ol"; } html += "<li>" + inline(ol[1]) + "</li>"; i++; continue; }
+      if (/^\s*$/.test(ln)) { closeList(); i++; continue; }
+      closeList();
+      let para = inline(ln); i++;
+      while (i < lines.length && !/^\s*$/.test(lines[i]) && !/^(#{1,4}\s|[-*]\s|\d+\.\s|```|---)/.test(lines[i])) para += " " + inline(lines[i++]);
+      html += "<p>" + para + "</p>";
+    }
+    closeList();
+    return html;
+  }
+
+  function addDocTab(id, label, url) {
+    if (tabs.has(id)) { activate(id); return id; }
+    const tabEl = makeTab(id, label);
+    const pane = document.createElement("div");
+    pane.className = "vpane vpane-doc";
+    pane.dataset.pane = id;
+    const doc = document.createElement("div");
+    doc.className = "md-body";
+    doc.innerHTML = '<p class="md-loading">加载中…</p>';
+    pane.appendChild(doc);
+    viewerBody.appendChild(pane);
+    tabs.set(id, { tabEl, paneEl: pane, kind: "doc" });
+    fetch(url).then((r) => r.text()).then((t) => { doc.innerHTML = mdToHtml(t); })
+      .catch(() => { doc.innerHTML = '<p class="md-loading">无法加载 ' + url + "</p>"; });
+    activate(id);
+    return id;
+  }
+
   function closeTab(id) {
     const t = tabs.get(id);
     if (!t) return;
@@ -623,6 +677,8 @@
     TERM.start();
     if (!chatWS || chatWS.readyState > 1) connectChat();
     fetchStatus();
+    // Default landing page: open the Release Notes as a tab.
+    addDocTab("welcome", "更新说明", "/static/release_note.md");
   }
   startApp();
 })();
