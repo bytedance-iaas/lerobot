@@ -14,7 +14,7 @@
 #     --build-arg BASE_IMAGE=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot:<lerobot-tag> \
 #     --output type=image,name=<registry>/lerobot-console:<tag>,push=true,compression=gzip,oci-mediatypes=true \
 #     .
-ARG BASE_IMAGE=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot:00370ca7ffea5b3c8ecb05e098e910b9559ba6e7
+ARG BASE_IMAGE=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot:f5bc4aef835d4b7b2013a103434916976d81e078
 FROM ${BASE_IMAGE}
 
 # lerobot's Dockerfile.user ends with `USER user_lerobot` (non-root). The build

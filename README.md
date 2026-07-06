@@ -80,7 +80,7 @@ pip-installing optional tools at runtime.
 # Separate pipeline. Push gzip (VKE node containerd 1.6.x rejects zstd). The
 # lerobot base images are gzip, so the console image is gzip too.
 docker buildx build \
-  --build-arg BASE_IMAGE=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot:00370ca7ffea5b3c8ecb05e098e910b9559ba6e7 \
+  --build-arg BASE_IMAGE=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot:f5bc4aef835d4b7b2013a103434916976d81e078 \
   --output type=image,name=<registry>/lerobot-console:<tag>,push=true,compression=gzip,oci-mediatypes=true \
   .
 
