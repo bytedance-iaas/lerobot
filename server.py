@@ -87,12 +87,14 @@ def _tls_enabled() -> bool:
 # Skill to preload so the agent knows how to drive LeRobot SFT (requirement f).
 CHAT_SKILL = os.environ.get("HERMES_CHAT_SKILL", "robot_sft")
 
-# One-time steer (first turn of a session). Answers render directly in the chat
-# bubble — plain text, with simple inline HTML (tables/lists) for structured data.
+# One-time steer (first turn of a session). Answers render as Markdown in the chat bubble
+# (via marked + DOMPurify), which is what models emit most reliably.
 CHAT_DIRECTIVE = (
-    "[System] 请用简洁的纯文本作答；需要展示结构化数据（对比、列表、状态、表格）时，"
-    "可使用简单的内联 HTML 标签（如 <table>/<tr>/<td>/<ul>/<li>/<b>/<br>，无需 CSS、"
-    "不要 <script>/<style>、不要完整 HTML 页面、不要 markdown 代码围栏）。\n\n"
+    "[System] 请用简洁的 Markdown 作答：用 **加粗**、`行内代码`、有序/无序列表、表格等呈现"
+    "结构化信息；代码或命令放进 ``` 代码块。不要输出完整 HTML 页面或 <script>/<style>。\n"
+    "运行环境：lerobot 源码在 `/lerobot`，Python 依赖由 uv 管理（虚拟环境 `/lerobot/.venv`）。"
+    "在终端执行 lerobot / python 相关命令前，先激活虚拟环境："
+    "`source /lerobot/.venv/bin/activate`；或在 `/lerobot` 目录下用 `uv run <命令>` 前缀。\n\n"
 )
 
 # Ark / Volcengine OpenAI-compatible endpoint and a sensible default model.

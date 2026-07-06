@@ -172,38 +172,9 @@
 
   // A "doc" tab renders a markdown file (e.g. the Release Notes welcome page) into a
   // scrollable pane — no iframe, just fetch + a tiny markdown -> HTML pass.
-  function mdToHtml(src) {
-    const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    const inline = (s) =>
-      esc(s)
-        .replace(/`([^`]+)`/g, (_m, c) => "<code>" + c + "</code>")
-        .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-        .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
-    const lines = src.replace(/\r\n/g, "\n").split("\n");
-    let html = "", i = 0, list = null;
-    const closeList = () => { if (list) { html += "</" + list + ">"; list = null; } };
-    while (i < lines.length) {
-      const ln = lines[i];
-      if (ln.startsWith("```")) {
-        closeList(); i++; let code = "";
-        while (i < lines.length && !lines[i].startsWith("```")) code += esc(lines[i++]) + "\n";
-        i++; html += "<pre><code>" + code + "</code></pre>"; continue;
-      }
-      const h = ln.match(/^(#{1,4})\s+(.*)$/);
-      if (h) { closeList(); const n = h[1].length; html += "<h" + n + ">" + inline(h[2]) + "</h" + n + ">"; i++; continue; }
-      if (/^---+\s*$/.test(ln)) { closeList(); html += "<hr/>"; i++; continue; }
-      const ul = ln.match(/^[-*]\s+(.*)$/);
-      if (ul) { if (list !== "ul") { closeList(); html += "<ul>"; list = "ul"; } html += "<li>" + inline(ul[1]) + "</li>"; i++; continue; }
-      const ol = ln.match(/^\d+\.\s+(.*)$/);
-      if (ol) { if (list !== "ol") { closeList(); html += "<ol>"; list = "ol"; } html += "<li>" + inline(ol[1]) + "</li>"; i++; continue; }
-      if (/^\s*$/.test(ln)) { closeList(); i++; continue; }
-      closeList();
-      let para = inline(ln); i++;
-      while (i < lines.length && !/^\s*$/.test(lines[i]) && !/^(#{1,4}\s|[-*]\s|\d+\.\s|```|---)/.test(lines[i])) para += " " + inline(lines[i++]);
-      html += "<p>" + para + "</p>";
-    }
-    closeList();
-    return html;
+  // Render markdown (and any inline HTML the model emits) to safe HTML via marked + DOMPurify.
+  function renderMD(src) {
+    return DOMPurify.sanitize(marked.parse(src || "", { gfm: true, breaks: true }));
   }
 
   function addDocTab(id, label, url) {
@@ -234,7 +205,7 @@
           '<div class="md-ver">当前部署版本 · lerobot <code>' + short(ver.lerobot) +
           '</code> · console <code>' + short(ver.console) + "</code></div>";
       }
-      doc.innerHTML = banner + mdToHtml(md);
+      doc.innerHTML = banner + renderMD(md);
     });
     activate(id);
     return id;
@@ -312,31 +283,6 @@
   const body = $("chat-body"), textEl = $("chat-text"), sendBtn = $("chat-send");
   let chatWS, busy = false, chatReady = false, pendingText = null;
 
-  const looksHtml = (s) =>
-    /<(html|body|div|table|section|article|main|header|h[1-6]|ul|ol|li|p|span|canvas|svg|img|pre|code|style|script|button|form|iframe)[\s>/]/i.test(s);
-
-  // Models sometimes wrap HTML in a ```html … ``` fence despite the directive;
-  // unwrap it so the bubble gets clean markup instead of literal backticks.
-  function extractHtml(s) {
-    const fence = s.match(/```(?:html)?\s*([\s\S]*?)```/i);
-    return (fence ? fence[1] : s).trim();
-  }
-  // The answer is rendered with innerHTML in a chat bubble, so drop anything
-  // executable: <script>/<style>, inline on* handlers, and javascript: URLs.
-  function sanitizeHtml(s) {
-    const tpl = document.createElement("template");
-    tpl.innerHTML = s;
-    tpl.content.querySelectorAll("script, style, iframe, object, embed, link, meta").forEach((n) => n.remove());
-    tpl.content.querySelectorAll("*").forEach((el) => {
-      [...el.attributes].forEach((a) => {
-        const v = (a.value || "").replace(/\s+/g, "").toLowerCase();
-        if (/^on/i.test(a.name) || ((a.name === "href" || a.name === "src") && v.startsWith("javascript:")))
-          el.removeAttribute(a.name);
-      });
-    });
-    return tpl.innerHTML;
-  }
-
   function addMsg(role, text) {
     const wrap = document.createElement("div");
     wrap.className = "msg " + (role === "user" ? "msg-user" : "msg-bot");
@@ -376,16 +322,8 @@
   // **bold** / `code` / lists render *live* while streaming, not as raw text that only snaps
   // to rendered at the end of the turn.
   function renderBubble(bubble, raw) {
-    const txt = extractHtml(raw);
-    if (looksHtml(txt)) {
-      bubble.classList.remove("md-chat");
-      bubble.classList.add("html-inline");
-      bubble.innerHTML = sanitizeHtml(txt);
-    } else {
-      bubble.classList.remove("html-inline");
-      bubble.classList.add("md-chat");
-      bubble.innerHTML = mdToHtml(txt);
-    }
+    bubble.classList.add("md-chat");
+    bubble.innerHTML = renderMD(raw);   // marked renders markdown + passes inline HTML; DOMPurify sanitizes
   }
   // Coalesce streamed tokens to one render per frame (~60fps) so we don't re-parse the whole
   // bubble on every token.
@@ -442,7 +380,7 @@
     body.scrollTop = body.scrollHeight;
   }
   function finishTurn() {
-    const txt = extractHtml(curText.trim());   // unwrap any ```html fence
+    const txt = curText.trim();
     if (!txt) {
       // No final text. If the agent ran tools, show a subtle "done" marker so the
       // turn doesn't look frozen; otherwise drop the empty bubble.
@@ -550,7 +488,7 @@
     if (!histAcc) return;
     const { role, text } = histAcc; histAcc = null;
     if (role === "user") { const u = stripSystemPrefix(text).trim(); if (u) addMsg("user", u); return; }
-    const t = extractHtml(text.trim());
+    const t = text.trim();
     if (!t) return;
     renderBubble(addMsg("bot", ""), t);
   }
