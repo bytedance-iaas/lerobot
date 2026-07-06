@@ -101,6 +101,13 @@ ENV PORT=8080 \
     LEROBOT_IMAGE=${BASE_IMAGE} \
     CONSOLE_COMMIT=${CONSOLE_COMMIT}
 
+# Auto-activate the lerobot uv venv in interactive login shells. The console terminal spawns
+# `bash -l`, whose /etc/profile hardcodes PATH and drops /lerobot/.venv/bin — so `python`
+# would resolve to the system python. /etc/profile.d/*.sh is sourced *after* that reset, so
+# this re-activates the venv: `python` / `lerobot-*` run in it directly, no `uv run` needed.
+RUN printf '%s\n' '[ -f /lerobot/.venv/bin/activate ] && . /lerobot/.venv/bin/activate' \
+      > /etc/profile.d/10-lerobot-venv.sh
+
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["python", "/opt/agent-console/server.py"]
