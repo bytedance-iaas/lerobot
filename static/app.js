@@ -625,7 +625,15 @@
     chatWS.send(JSON.stringify({ type: "msg", text }));
   }
   sendBtn.onclick = () => { if (busy) stopTurn(); else send(); };
-  textEl.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
+  textEl.addEventListener("keydown", (e) => {
+    // Ignore Enter while an IME is composing — that Enter confirms a candidate (CJK/pinyin),
+    // it must not send, or the box keeps residue. isComposing is the standard flag; keyCode
+    // 229 is the legacy fallback for older browsers.
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
+      e.preventDefault();
+      send();
+    }
+  });
   textEl.addEventListener("input", () => { textEl.style.height = "auto"; textEl.style.height = Math.min(textEl.scrollHeight, 140) + "px"; });
   // Release-notes button: always (re)open the doc so clicking gives a visible reaction even
   // when the tab is already the active one.
