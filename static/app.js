@@ -218,16 +218,22 @@
     pane.appendChild(doc);
     viewerBody.appendChild(pane);
     tabs.set(id, { tabEl, paneEl: pane, kind: "doc" });
-    // Fetch the doc + the live deployed versions (server-side, so it's correct regardless of
-    // any stale browser cache) and show a version banner above the release notes.
+    // The welcome/release-notes doc also gets a live deployed-version banner (fetched
+    // server-side, so it's correct regardless of any stale browser cache).
+    const wantVer = id === "welcome";
     Promise.all([
       fetch(url).then((r) => r.text()).catch(() => "# " + label + "\n\n(无法加载)"),
-      fetch("/api/version", { cache: "no-store" }).then((r) => r.json()).catch(() => ({})),
+      wantVer
+        ? fetch("/api/version", { cache: "no-store" }).then((r) => r.json()).catch(() => ({}))
+        : Promise.resolve(null),
     ]).then(([md, ver]) => {
-      const short = (s) => (s || "unknown").slice(0, 12);
-      const banner =
-        '<div class="md-ver">当前部署版本 · lerobot <code>' + short(ver.lerobot) +
-        '</code> · console <code>' + short(ver.console) + "</code></div>";
+      let banner = "";
+      if (ver) {
+        const short = (s) => (s || "unknown").slice(0, 12);
+        banner =
+          '<div class="md-ver">当前部署版本 · lerobot <code>' + short(ver.lerobot) +
+          '</code> · console <code>' + short(ver.console) + "</code></div>";
+      }
       doc.innerHTML = banner + mdToHtml(md);
     });
     activate(id);
@@ -600,7 +606,21 @@
   sendBtn.onclick = () => { if (busy) stopTurn(); else send(); };
   textEl.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
   textEl.addEventListener("input", () => { textEl.style.height = "auto"; textEl.style.height = Math.min(textEl.scrollHeight, 140) + "px"; });
-  $("q-release").onclick = () => addDocTab("welcome", "更新说明", "/static/release_note.md");
+  // Release-notes button: always (re)open the doc so clicking gives a visible reaction even
+  // when the tab is already the active one.
+  $("q-release").onclick = () => {
+    if (tabs.has("welcome")) closeTab("welcome");
+    addDocTab("welcome", "更新说明", "/static/release_note.md");
+  };
+  // In-app markdown links like [text](doc:webrtc) open the local lerobot doc (served from
+  // /lerobot in the image) as a doc tab, instead of navigating to an external URL.
+  viewerBody.addEventListener("click", (e) => {
+    const a = e.target.closest('a[href^="doc:"]');
+    if (!a) return;
+    e.preventDefault();
+    const name = a.getAttribute("href").slice(4);
+    addDocTab("doc-" + name, (a.textContent || name).trim(), "/api/lerobot-doc/" + name);
+  });
   $("chat-quick").addEventListener("click", (e) => {
     const b = e.target.closest("button[data-q]");
     if (!b) return;

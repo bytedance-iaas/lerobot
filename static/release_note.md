@@ -49,7 +49,7 @@ python examples/webrtc_remote_so100/cloud_teleop_so100.py
 
 - 用 `--transport livekit` 选择该传输后端，并配置 `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET`。在本控制台里，启动后它的 web 操作面板会作为一个新标签页直接在这里打开。
 
-更详细的配置、传输后端与设计说明，见 [lerobot webrtc_proxy README](https://github.com/thesues/lerobot/blob/remote_robot/src/lerobot/robots/webrtc_proxy/README.md)。
+更详细的配置、传输后端与设计说明，见 [lerobot webrtc_proxy README](doc:webrtc)（直接读镜像里 `/lerobot` 下的本地文档）。
 
 ---
 

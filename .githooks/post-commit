@@ -1,0 +1,7 @@
+#!/bin/sh
+# Write the current commit into static/version.txt so the console can show which build it
+# is, with zero manual steps: this runs after every commit, and the file is baked into the
+# image by `COPY static ./static`. version.txt is gitignored (a committed file can't contain
+# its own commit hash), so it never dirties the tree — it just tracks the latest local commit.
+root=$(git rev-parse --show-toplevel)
+git rev-parse HEAD > "$root/static/version.txt"
