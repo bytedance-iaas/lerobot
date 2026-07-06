@@ -251,7 +251,11 @@ body {
 .q-orange { color: var(--orange); border-color: #f8d6bd; background: #fff7f1; }
 .q-blue { color: var(--blue); border-color: #cfe0ff; }
 .q-purple { color: var(--purple); border-color: #ddd4ff; }
+.q-green { color: var(--green); border-color: #c9f0d6; background: #f2fdf6; }
 .q:hover { filter: brightness(.97); }
+.md-ver { font-size: 12px; color: var(--muted); background: #f6f7f9; border: 1px solid var(--line);
+  border-radius: 8px; padding: 7px 12px; margin: -4px 0 18px; }
+.md-ver code { background: #fff; }
 
 /* tool-call lines + permission prompts (ACP streaming) */
 .tool-ava { background: #eef0f4 !important; color: #6b7180 !important; }

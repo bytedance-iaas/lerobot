@@ -12,7 +12,8 @@
 # gzip too.
 #   docker buildx build \
 #     --build-arg BASE_IMAGE=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot:<lerobot-tag> \
-#     --output type=image,name=<registry>/lerobot-console:<tag>,push=true,compression=gzip,oci-mediatypes=true \
+#     --build-arg CONSOLE_COMMIT=$(git rev-parse HEAD) \
+#     --output type=image,name=<registry>/lerobot-agent-console:<tag>,push=true,compression=gzip,oci-mediatypes=true \
 #     .
 ARG BASE_IMAGE=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot:f5bc4aef835d4b7b2013a103434916976d81e078
 FROM ${BASE_IMAGE}
@@ -89,9 +90,16 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh scripts/install_skill.sh
 
 # The console shell + agent operate from LEROBOT_HOME (the lerobot checkout in the
 # base image is at /lerobot). Exported to children.
+# LEROBOT_IMAGE / CONSOLE_COMMIT are surfaced by the UI's "更新说明" button so you can see
+# exactly which versions are deployed (LEROBOT_IMAGE's tag = the lerobot commit; pass
+# --build-arg CONSOLE_COMMIT=$(git rev-parse HEAD) to fill in this console's commit).
+ARG BASE_IMAGE
+ARG CONSOLE_COMMIT=""
 ENV PORT=8080 \
     LEROBOT_HOME=/lerobot \
-    HERMES_CHAT_SKILL=robot_sft
+    HERMES_CHAT_SKILL=robot_sft \
+    LEROBOT_IMAGE=${BASE_IMAGE} \
+    CONSOLE_COMMIT=${CONSOLE_COMMIT}
 
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

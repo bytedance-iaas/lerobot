@@ -218,8 +218,18 @@
     pane.appendChild(doc);
     viewerBody.appendChild(pane);
     tabs.set(id, { tabEl, paneEl: pane, kind: "doc" });
-    fetch(url).then((r) => r.text()).then((t) => { doc.innerHTML = mdToHtml(t); })
-      .catch(() => { doc.innerHTML = '<p class="md-loading">无法加载 ' + url + "</p>"; });
+    // Fetch the doc + the live deployed versions (server-side, so it's correct regardless of
+    // any stale browser cache) and show a version banner above the release notes.
+    Promise.all([
+      fetch(url).then((r) => r.text()).catch(() => "# " + label + "\n\n(无法加载)"),
+      fetch("/api/version", { cache: "no-store" }).then((r) => r.json()).catch(() => ({})),
+    ]).then(([md, ver]) => {
+      const short = (s) => (s || "unknown").slice(0, 12);
+      const banner =
+        '<div class="md-ver">当前部署版本 · lerobot <code>' + short(ver.lerobot) +
+        '</code> · console <code>' + short(ver.console) + "</code></div>";
+      doc.innerHTML = banner + mdToHtml(md);
+    });
     activate(id);
     return id;
   }
@@ -590,6 +600,7 @@
   sendBtn.onclick = () => { if (busy) stopTurn(); else send(); };
   textEl.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
   textEl.addEventListener("input", () => { textEl.style.height = "auto"; textEl.style.height = Math.min(textEl.scrollHeight, 140) + "px"; });
+  $("q-release").onclick = () => addDocTab("welcome", "更新说明", "/static/release_note.md");
   $("chat-quick").addEventListener("click", (e) => {
     const b = e.target.closest("button[data-q]");
     if (!b) return;

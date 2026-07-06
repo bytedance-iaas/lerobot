@@ -226,6 +226,20 @@ async def handle_status(_request: web.Request) -> web.Response:
     return web.json_response(info)
 
 
+def _versions() -> dict:
+    """Deployed image versions surfaced in the UI (release-notes button): the lerobot base
+    commit (= the base image tag) and this console's commit. Read from env baked at build."""
+    img = os.environ.get("LEROBOT_IMAGE", "")
+    tag = img.rsplit(":", 1)[-1] if ":" in img else ""
+    lerobot = "" if "/" in tag else tag  # guard: a host:port ":" with no tag
+    console = os.environ.get("CONSOLE_COMMIT", "").strip()
+    return {"lerobot": lerobot or "unknown", "console": console or "unknown"}
+
+
+async def handle_version(_request: web.Request) -> web.Response:
+    return web.json_response(_versions())
+
+
 async def handle_volcano_key(request: web.Request) -> web.Response:
     try:
         body = await request.json()
@@ -945,6 +959,7 @@ def build_app() -> web.Application:
     app.router.add_get("/", handle_index)
     app.router.add_get("/healthz", handle_health)   # unauthenticated — for LB/k8s probes
     app.router.add_get("/api/status", handle_status)
+    app.router.add_get("/api/version", handle_version)
     app.router.add_get("/api/services", handle_services)
     app.router.add_post("/api/volcano-key", handle_volcano_key)
     app.router.add_get("/ws/control", handle_control)
