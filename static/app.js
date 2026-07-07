@@ -492,7 +492,15 @@
   }
   function wsSend(o) { if (chatWS && chatWS.readyState === 1) chatWS.send(JSON.stringify(o)); }
 
-  function setTitle(t) { sessTitle.textContent = (t && t.trim()) || "新会话"; }
+  // A session title can have the "[System] 请用简洁的 Markdown …" steering block folded in —
+  // leading (legacy prepend), trailing (new append), or truncated. Strip it wherever it is.
+  function cleanTitle(t) {
+    t = (t || "").trim();
+    t = t.replace(/^\s*\[System\][\s\S]*?\n\n/, "");   // leading block up to the blank line
+    t = t.replace(/\s*\[System\][\s\S]*$/, "");         // trailing block (or a truncated leading one)
+    return t.trim() || "新会话";
+  }
+  function setTitle(t) { sessTitle.textContent = cleanTitle(t); }
 
   function newSession() {
     toggleSessMenu(false);
@@ -556,11 +564,12 @@
       const row = document.createElement("div");
       row.className = "sess-item" + (s.id === current ? " active" : "");
       row.innerHTML = '<div class="si-main"><div class="si-title"></div></div><button class="si-del" title="删除会话">🗑</button>';
-      row.querySelector(".si-title").textContent = s.title || "新会话";
-      row.querySelector(".si-main").onclick = () => loadSession(s.id, s.title);
+      const clean = cleanTitle(s.title);
+      row.querySelector(".si-title").textContent = clean;
+      row.querySelector(".si-main").onclick = () => loadSession(s.id, clean);
       row.querySelector(".si-del").onclick = (e) => {
         e.stopPropagation();
-        if (confirm("删除会话「" + (s.title || "新会话") + "」？此操作不可撤销。")) deleteSession(s.id);
+        if (confirm("删除会话「" + clean + "」？此操作不可撤销。")) deleteSession(s.id);
       };
       sessList.appendChild(row);
     });
