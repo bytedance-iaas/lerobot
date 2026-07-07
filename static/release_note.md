@@ -35,21 +35,80 @@ for item in ds:
 
 云端 GPU 与机器人往往**不在同一张网里**，也很难直接互联（内网隔离、家用 NAT）。我们让 `WebRTCProxyRobot` 支持 **LiveKit（SFU）** 传输：机器人与云端各自**主动拨出**连到 LiveKit，借此穿透 NAT，**无需机器人侧暴露任何公网入站**。云端拿到的就是一个普通的 lerobot `Robot`——`get_observation()` 取远端关节 + 摄像头，`send_action()` 驱动远端电机，record / teleop / eval 全部无改动即可用；机器人侧内置安全看门狗，链路中断自动 safe-stop。
 
-**大概怎么用：**
+**用法举例：**
 
-- 机器人侧（接着 SO-100 的那台机器）跑采集守护进程，拨出连到 LiveKit：
+> 本仓库机器人侧的模块名是 **`mac_daemon`**（不是 `robot_daemon`）：`python -m lerobot.robots.webrtc_proxy.mac_daemon ...`。
 
-```bash
-python examples/webrtc_remote_so100/robot_daemon_so100.py
-```
-
-- 云端 / 控制侧跑控制脚本，连同一个 LiveKit，就能看到远端摄像头并遥操作：
+- **先做一次 LiveKit 连通性测试**（不接机械臂，用合成关节 + 一路真实摄像头 `--real-camera 0` 验证能连上 LiveKit、视频能推流）：
 
 ```bash
-python examples/webrtc_remote_so100/cloud_teleop_so100.py
+python -m lerobot.robots.webrtc_proxy.mac_daemon \
+  --transport livekit --session so100 \
+  --livekit-url ws://<你的 LiveKit 地址>:7880 \
+  --livekit-api-key devkey --livekit-api-secret lerobotlivekitsecret0123456789abcd \
+  --real-camera 0
 ```
 
-- 用 `--transport livekit` 选择该传输后端，并配置 `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET`。在本控制台里，启动后它的 web 操作面板会作为一个新标签页直接在这里打开。
+- **机器人侧**（接着 SO-100 的那台机器）跑采集守护进程，拨出连到 LiveKit（`--robot.*` 会被 draccus 解析成真实机器人，取代 `--real-camera`）：
+
+```bash
+python -m lerobot.robots.webrtc_proxy.mac_daemon \
+  --transport livekit --session so100 \
+  --livekit-url ws://<你的 LiveKit 地址>:7880 \
+  --livekit-api-key devkey --livekit-api-secret lerobotlivekitsecret0123456789abcd \
+  --robot.type=so100_follower --robot.port=/dev/tty.usbmodemXXXX \
+  --robot.id=my_awesome_follower_arm \
+  --robot.cameras="{ front: {type: opencv, index_or_path: 1, width: 640, height: 480, fps: 30}, wrist: {type: opencv, index_or_path: 0, width: 640, height: 480} }"
+```
+
+- **云端 / 控制侧**跑控制脚本，连同一个 LiveKit，就能看到远端摄像头并遥操作（在本控制台里，启动后它的 web 操作面板会作为一个新标签页直接在这里打开）。控制台与 LiveKit 在**同一个集群**里，直接用集群内服务名 `ws://livekit-clb:7880` 连接，无需走公网：
+
+```bash
+python examples/webrtc_remote_so100/cloud_teleop_so100.py \
+  --mode web --transport livekit --session so100 --cameras "front,wrist" --web-port 8080 \
+  --livekit-url ws://livekit-clb:7880 \
+  --livekit-api-key devkey --livekit-api-secret lerobotlivekitsecret0123456789abcd
+```
+
+**机器人侧守护进程参数（`mac_daemon`）：**
+
+| 参数 | 示例值 | 说明 |
+|------|--------|------|
+| `--transport` | `livekit` | 传输后端，`livekit` 或 `aiortc`（默认 `aiortc`） |
+| `--session` | `so100` | 会话 id == LiveKit room；**必须与控制侧一致** |
+| `--livekit-url` | `ws://<你的 LiveKit 地址>:7880` | LiveKit 信令地址（机器人主动拨出，填真实地址，别留 `{LK}` 占位） |
+| `--livekit-api-key` | `devkey` | LiveKit API key（需与服务端一致） |
+| `--livekit-api-secret` | `lerobotlivekitsecret0123456789abcd` | LiveKit API secret（需与服务端一致） |
+| `--real-camera` | `0` | 快速测试用：不接机械臂，只开这一路 opencv 摄像头（索引如 `0` 或 `/dev/videoN`）+ 合成关节；与 `--robot.*` 互斥 |
+| `--camera-name` / `--width` / `--height` / `--fps` | `front` / `640` / `480` / `30` | `--real-camera` 那路的名字与分辨率/帧率 |
+| `--robot.type` | `so100_follower` | 接真实机器人时用；任意 lerobot 机器人（draccus `--robot.*`，会取代 `--real-camera`） |
+| `--robot.port` | `/dev/tty.usbmodemXXXX` | 串口，用 `uv run lerobot-find-port` 找 |
+| `--robot.id` | `my_awesome_follower_arm` | 机器人 id |
+| `--robot.cameras` | draccus dict | 摄像头**名字**（`front`/`wrist`）要与控制侧 `--cameras` 对齐；索引用 `uv run lerobot-find-cameras` 找；某摄像头达不到指定 fps 会报错，可省略 `fps` 用原生帧率 |
+
+**控制侧参数（cloud_teleop_so100.py）：**
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--mode` | `web` | `web`（网页面板）或 `console`（终端） |
+| `--session` | `so100` | 会话 id == LiveKit room；**必须与机器人侧一致** |
+| `--web-port` | `8080` | web 面板端口 |
+| `--transport` | `aiortc` | 传输后端，此处用 `livekit` |
+| `--cameras` | `front` | 逗号分隔的摄像头名，**必须与机器人侧 `--robot.cameras` 的 key 对齐**；每项写 `name` 或 `name:WxH` |
+| `--livekit-url` | `$LIVEKIT_URL` | LiveKit 信令地址；控制台在集群内，用服务名 `ws://livekit-clb:7880`（不走公网） |
+| `--livekit-api-key` | `$LIVEKIT_API_KEY` | 同机器人侧，`devkey` |
+| `--livekit-api-secret` | `$LIVEKIT_API_SECRET` | 同机器人侧 |
+| `--livekit-token` | 自签发 | 预签发 JWT；不填则用 key/secret 自签 |
+| `--livekit-identity` | `controller` | 控制侧在 LiveKit 里的 identity |
+| `--signaling-url` | `$SIGNALING_URL` | aiortc 中继 WS 地址（仅 `aiortc` 后端） |
+| `--auth-token` | `$SIGNALING_AUTH_TOKEN` | 带鉴权的中继共享 token（仅 `aiortc` 后端） |
+
+**两侧必须对齐的参数：** `--session`（== LiveKit room）、`--livekit-api-key` / `--livekit-api-secret`、摄像头名字与数量（`--robot.cameras` ↔ `--cameras`）。
+> 常见报错：`cv2.error: !ssize.empty()` 通常是两侧摄像头数量不一致（1 路发 640x480，2 路发 640x960）。
+>
+> 控制侧要在**机器人守护进程开始推流之后**再启动——它的 `connect()` 会阻塞等待第一帧视频，收不到就退出。
+
+LiveKit 服务端配置：信令 `7880/TCP`、rtc `7881/TCP`、媒体 `7882/UDP`；`keys` 里定义 `<api_key>: <api_secret>`（示例 `devkey: lerobotlivekitsecret...` 是弱口令占位，生产请用 `livekit-server generate-keys` 轮换）。
 
 更详细的配置、传输后端与设计说明，见 [lerobot webrtc_proxy README](doc:webrtc)（直接读镜像里 `/lerobot` 下的本地文档）。
 
