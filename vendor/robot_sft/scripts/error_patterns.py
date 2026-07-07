@@ -22,8 +22,9 @@ import re
 FATAL = [
     (r"gated repo|Access to model .* is restricted|401 Client Error|403 Forbidden.*huggingface",
      "gated/unauthorized Hub model or dataset",
-     "Accept the repo's license on huggingface.co and `hf auth login` (pi0's PaliGemma and "
-     "some bases are gated), or point at a local path."),
+     "Accept the repo's license on huggingface.co, then PROMPT THE USER for their HF token and "
+     "`export HF_TOKEN=hf_…` (or `hf auth login`) — pi0's PaliGemma and some bases are gated, "
+     "and private datasets need auth. Or point at a local path."),
     (r"huggingface\.co.*(Max retries exceeded|Connection (refused|reset|aborted|timed out)|"
      r"Failed to establish|NewConnectionError)|Max retries exceeded.*huggingface|"
      r"Could not reach.*huggingface|Temporary failure in name resolution.*huggingface",

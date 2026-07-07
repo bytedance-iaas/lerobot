@@ -41,8 +41,14 @@ distilled list of the failure modes above, each with the concrete check that pre
 - **HuggingFace Hub downloads go through a mirror — the pod is behind a firewall that blocks
   `huggingface.co`.** Just `export HF_ENDPOINT=https://hf-mirror.com` at session start;
   every Hub pull (datasets via `--dataset.repo_id`, pretrained backbones via `--policy.path`
-  — pi0's PaliGemma, SmolVLA, …, and the `hf` CLI) then goes through the mirror. Gated repos
-  still need `hf auth login`. TOS/`FsspecLeRobotDataset` datasets don't touch the Hub.
+  — pi0's PaliGemma, SmolVLA, …, and the `hf` CLI) then goes through the mirror.
+  TOS/`FsspecLeRobotDataset` datasets don't touch the Hub.
+- **Gated / private repos need a token — the pod has none, so PROMPT THE USER for it.** pi0's
+  PaliGemma backbone and many bases are gated, and private datasets need auth. If stage a/b
+  involves a gated backbone or a private repo, ask the user for their HuggingFace token (`hf_…`,
+  from https://huggingface.co/settings/tokens) and `export HF_TOKEN=hf_…` — it authenticates
+  through the mirror too (equivalently `hf auth login`). Surface this **up front**, not after a
+  6-hour run fails on `401/403`. Never hardcode the token — it comes from the user, via env only.
 
 ## Core model: Session → Stages → Runs
 
