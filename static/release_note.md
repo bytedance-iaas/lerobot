@@ -2,6 +2,8 @@
 
 本控制台在标准 [LeRobot](https://github.com/huggingface/lerobot) 之上，把「云端 GPU × 远端机器人 × 对象存储数据 × AI Agent 运维」这套组合搬进一个浏览器页面：既增强了 LeRobot 本身，也让训练 / 评估 / 遥操作的日常操作可以对着 Agent 聊天完成。
 
+**增强后的 LeRobot 开源代码**（含下述所有增强）：[bytedance-iaas/lerobot @ dev](https://github.com/bytedance-iaas/lerobot/tree/dev)。
+
 ---
 
 ## 一、对 LeRobot 的能力增强
