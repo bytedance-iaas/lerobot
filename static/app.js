@@ -509,7 +509,15 @@
     setBusy(false);
   }
   function onDeleted(id) {
-    if (id === curSession) { curSession = null; newSession(); }  // deleted the open one → fresh
+    if (id === curSession) {
+      // Deleted the open session: clear it but DON'T auto-create a new one —
+      // wait for the user to click 新建会话.
+      curSession = null;
+      clearChat();
+      setTitle("");
+      setBusy(false);
+      addMsg("bot", "会话已删除。点上方「＋ 新建会话」开始新的对话。");
+    }
     refreshSessions();
   }
 
@@ -550,11 +558,15 @@
 
   // ----- history replay (session_load) -----
   let histAcc = null;  // { role, text } accumulator; consecutive same-role chunks merge
-  function histStart(id) { clearChat(); setBusy(true); histAcc = null; if (id) curSession = id; }
-  // Server prepends a "[System] …\n\n" steering block to the first user message of a
-  // session; hermes stores it, so on history replay it must NOT show in the bubble.
+  let histTools = {};  // tool cards by id — dedup so one tool isn't rendered per update event
+  function histStart(id) { clearChat(); setBusy(true); histAcc = null; histTools = {}; if (id) curSession = id; }
+  // The first user message carries a "[System] …" steering block. It may be appended (new
+  // sessions) or prepended (legacy) — strip it either way so it never shows in the bubble.
   function stripSystemPrefix(s) {
-    return s.replace(/^\s*\[System\][\s\S]*?\n\n/, "");
+    return s
+      .replace(/^\s*\[System\][\s\S]*?\n\n/, "")   // legacy: prepended
+      .replace(/\n\n\[System\][\s\S]*$/, "")        // new: appended
+      .trim();
   }
   function histFlush() {
     if (!histAcc) return;
@@ -578,13 +590,18 @@
   function histChunk(m) {
     if (m.role === "tool") {
       histFlush();
-      const wrap = document.createElement("div");
-      wrap.className = "msg msg-bot";
-      wrap.innerHTML = '<span class="msg-ava tool-ava">⚙</span><div class="bubble tool-bubble"></div>';
-      const bubble = wrap.querySelector(".tool-bubble");
-      const refs = buildToolBubble(bubble);
-      setToolBubble(bubble, refs, m.title, m.status, m.detail);
-      body.appendChild(wrap);
+      const id = m.id || Math.random();
+      let t = histTools[id];
+      if (!t) {                                    // one card per tool id, not per update event
+        const wrap = document.createElement("div");
+        wrap.className = "msg msg-bot";
+        wrap.innerHTML = '<span class="msg-ava tool-ava">⚙</span><div class="bubble tool-bubble"></div>';
+        const bubble = wrap.querySelector(".tool-bubble");
+        t = histTools[id] = { el: bubble, refs: buildToolBubble(bubble), title: "" };
+        body.appendChild(wrap);
+      }
+      if (m.title) t.title = m.title;
+      setToolBubble(t.el, t.refs, t.title, m.status, m.detail);
       return;
     }
     if (!histAcc || histAcc.role !== m.role) { histFlush(); histAcc = { role: m.role, text: "" }; }

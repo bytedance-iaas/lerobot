@@ -590,7 +590,9 @@ class HermesACP:
         await self.ensure()
         # Steer the answer format once per session, on its first prompt.
         if self.session_id not in self._directive_sent:
-            text = CHAT_DIRECTIVE + text
+            # Append (not prepend) the steering block so the session's auto-title comes
+            # from the user's real first words, not "[System] 请用简洁的 Markdown …".
+            text = text + "\n\n" + CHAT_DIRECTIVE
             self._directive_sent.add(self.session_id)
         self.on_update = on_update
         self.on_permission = on_permission
@@ -618,11 +620,14 @@ def _chunk_text(update: dict) -> str:
     return c.get("text", "") if isinstance(c, dict) else ""
 
 
-def _tool_detail(u: dict) -> str:
+_DETAIL_MAX = 4000  # cap per tool card — history replay of long sessions must not ship MBs
+
+
+def _tool_detail(u: dict, max_chars: int = _DETAIL_MAX) -> str:
     """Human-readable command + output for a tool_call update, so the UI can
     expand the one-line tool card. Best-effort over the ACP shape: `rawInput`
     (the tool's arguments, e.g. a shell `command`) plus any text in `content`
-    blocks (the tool's output)."""
+    blocks (the tool's output). Truncated (head+tail) to keep payloads bounded."""
     parts: list[str] = []
     ri = u.get("rawInput")
     if isinstance(ri, dict):
@@ -647,13 +652,27 @@ def _tool_detail(u: dict) -> str:
             out.append(f"[diff] {blk['path']}")
     if out:
         parts.append("\n".join(o for o in out if o))
-    return "\n\n".join(p for p in parts if p).strip()
+    s = "\n\n".join(p for p in parts if p).strip()
+    if len(s) > max_chars:
+        keep = max_chars // 2
+        s = s[:keep] + f"\n\n…（省略 {len(s) - max_chars} 字）…\n\n" + s[-keep:]
+    return s
+
+
+def _clean_title(t: str) -> str:
+    """Drop a leading '[System] …' steering block from legacy titles (sessions created
+    while the directive was prepended). New sessions append it, so their title is clean."""
+    t = (t or "").strip()
+    if t.startswith("[System]"):
+        i = t.find("\n\n")
+        t = t[i + 2 :].strip() if i != -1 else ""   # truncated all-directive title → empty
+    return t or "新会话"
 
 
 def _sess_brief(s: dict) -> dict:
     return {
         "id": s.get("sessionId"),
-        "title": s.get("title") or "新会话",
+        "title": _clean_title(s.get("title")),
         "updatedAt": s.get("updatedAt") or s.get("startedAt") or "",
     }
 
@@ -684,9 +703,12 @@ async def _handle_session_op(ws: web.WebSocketResponse, acp: "HermesACP", op: st
             elif kind == "agent_thought_chunk":
                 await ws.send_json({"type": "hist", "role": "thought", "text": _chunk_text(u)})
             elif kind in ("tool_call", "tool_call_update"):
-                await ws.send_json({"type": "hist", "role": "tool",
-                                    "title": u.get("title", ""), "status": u.get("status", ""),
-                                    "detail": _tool_detail(u)})
+                st = u.get("status", "")
+                # Detail only on the terminal state — intermediate updates would re-ship the
+                # (growing) output for the same tool. Include the id so the client dedups.
+                await ws.send_json({"type": "hist", "role": "tool", "id": u.get("toolCallId", ""),
+                                    "title": u.get("title", ""), "status": st,
+                                    "detail": _tool_detail(u) if st in ("completed", "failed") else ""})
 
         await acp.load_session(sid, on_hist)
         await ws.send_json({"type": "history_done", "id": sid})
@@ -725,6 +747,35 @@ async def handle_chat(request: web.Request) -> web.WebSocketResponse:
         finally:
             perm_waiters.pop(req_id, None)
 
+    async def _kill_turn(reselect: bool) -> bool:
+        """Reliably end the in-flight turn. Try graceful session/cancel first; if hermes
+        doesn't yield quickly (a long-running shell tool can't be interrupted mid-command),
+        hard-restart the process so the turn is killed and new work isn't queued behind it
+        ("Queued for the next turn"). Returns True if it force-killed (caller must emit 'done'
+        since run_turn was cancelled before it could). reselect keeps the user in the session."""
+        t = turn["task"]
+        turn["task"] = None
+        if not (t and not t.done()):
+            return False
+        sid = acp.session_id
+        await acp.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(t), timeout=1.5)
+            return False                              # hermes honored cancel; run_turn sent done/error
+        except asyncio.TimeoutError:
+            pass
+        await acp.restart()                           # force: kill the stuck turn + its tool
+        if not t.done():
+            t.cancel()
+        if reselect and sid:
+            async def _sink(_u: dict) -> None:
+                return None
+            try:
+                await acp.load_session(sid, _sink)    # re-select silently (discard the replay)
+            except Exception:  # noqa: BLE001
+                log.debug("re-select after restart failed", exc_info=True)
+        return True
+
     async def run_turn(text: str) -> None:
         # Booting = hermes not up yet (first turn / after a respawn): the
         # ensure() inside prompt() will spend a few seconds starting it.
@@ -754,8 +805,10 @@ async def handle_chat(request: web.Request) -> web.WebSocketResponse:
                     fut.set_result(payload.get("optionId"))
                 continue
             if ptype == "stop":
-                # Interrupt the running turn; the prompt resolves with "cancelled".
-                await acp.cancel()
+                # Reliably interrupt (graceful cancel, else hard-restart) so the turn really
+                # ends and the UI unblocks — session/cancel alone can't stop a running tool.
+                if await _kill_turn(reselect=True):
+                    await ws.send_json({"type": "done"})
                 continue
             if ptype in ("session_list", "session_new", "session_load", "session_delete"):
                 # session_list is read-only — safe to run while a turn streams (so the
@@ -763,11 +816,9 @@ async def handle_chat(request: web.Request) -> web.WebSocketResponse:
                 # active session, so first abandon any in-flight turn.
                 busy = bool(turn["task"] and not turn["task"].done())
                 if busy and ptype != "session_list":
-                    await acp.cancel()
-                    t = turn["task"]
-                    if t and not t.done():
-                        t.cancel()
-                    turn["task"] = None
+                    # Switching/creating/deleting changes the active session — end the current
+                    # turn reliably first (the op re-establishes the session, so no reselect).
+                    await _kill_turn(reselect=False)
                 try:
                     await _handle_session_op(ws, acp, ptype, payload)
                 except Exception as e:  # noqa: BLE001
