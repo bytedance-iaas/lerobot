@@ -279,7 +279,7 @@ function draw(id,pts,o){
 }
 async function tick(){
  try{
-  const s=await (await fetch('/api/session')).json();
+  const s=await (await fetch('api/session')).json();
   document.getElementById('sid').textContent=(s.session_id||'')+' ['+(s.status||'')+']';
   let h='<div class="row"><div><span class="k">goal</span> <span class="v">'+(s.goal||'—')+'</span></div>'
     +'<div><span class="k">stage</span> <span class="v">'+(s.current_stage||'')+'</span></div></div><table>';
@@ -287,7 +287,7 @@ async function tick(){
   for(const st of order){const o=(s.stages||{})[st]||{};
     h+='<tr><td>'+st+'</td><td><span class="b '+cls(o.status)+'">'+(o.status||'pending')+'</span></td><td>'+(o.summary||'')+'</td></tr>';}
   h+='</table>';document.getElementById('stages').innerHTML=h;
-  const runs=await (await fetch('/api/runs')).json();
+  const runs=await (await fetch('api/runs')).json();
   let r='';
   for(const run of runs){
    const cur=run.last_step||0,max=run.max_step||0,pct=max?Math.min(100,100*cur/max):0;
@@ -303,7 +303,7 @@ async function tick(){
    r+='</div>';
   }
   document.getElementById('runs').innerHTML=r||'<div class="card sub">no runs yet</div>';
-  const m=await (await fetch('/api/metrics')).json();
+  const m=await (await fetch('api/metrics')).json();
   const as=m.assessment||{};
   document.getElementById('assessv').textContent=as.verdict||'—';
   document.getElementById('assess').style.borderLeftColor=as.stop_recommended?'#fbbf24':'#4ade80';
@@ -318,14 +318,14 @@ async function tick(){
   const ev=(m.eval||[]).map(e=>[e[0],e[1]]);draw('evalc',ev,{color:'#60a5fa',dots:true});
   if(ev.length){const best=ev.filter(e=>e[1]!=null).reduce((a,b)=>b[1]<a[1]?b:a);
     document.getElementById('evalv').textContent='best ckpt-'+best[0]+' mse='+(best[1]!=null?best[1].toFixed(4):'—');}
-  const plots=await (await fetch('/api/plots')).json();
+  const plots=await (await fetch('api/plots')).json();
   const steps=plots.map(p=>p.step);
   let tabs='';for(const st of steps){tabs+='<span class="seltab'+((SELCK===st||(SELCK===null&&st===steps[steps.length-1]))?' on':'')+'" onclick="SELCK='+st+';tick()">ckpt-'+st+'</span>';}
   document.getElementById('ckpttabs').innerHTML=tabs;
   const sel=SELCK!==null?plots.find(p=>p.step===SELCK):plots[plots.length-1];
   let g='';if(sel){for(const[name,imgs]of Object.entries(sel.datasets)){
     g+='<div class="gcol"><div class="gname">'+name+'</div>';
-    for(const rel of imgs){g+='<img loading="lazy" src="/plot?p='+encodeURIComponent(rel)+'">';}
+    for(const rel of imgs){g+='<img loading="lazy" src="plot?p='+encodeURIComponent(rel)+'">';}
     g+='</div>';}}
   document.getElementById('gallery').innerHTML=g||'<div class="cv">no plots yet</div>';
  }catch(e){}
