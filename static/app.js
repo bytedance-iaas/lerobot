@@ -309,14 +309,44 @@
   }
 
   // streaming-turn state
-  let curBubble = null, curText = "", toolEls = {};
+  let curBubble = null, curText = "", toolEls = {}, curThought = null;
   function rm(el) { if (el) el.closest(".msg").remove(); }
 
   function startTurn(booting) {
-    curText = ""; toolEls = {};
+    curText = ""; toolEls = {}; curThought = null;
     curBubble = addMsg("bot", "");
     curBubble.classList.add("thinking");
     curBubble.textContent = booting ? "正在启动 Agent" : "思考中";
+  }
+  // Stream the agent's reasoning into its own collapsible 💭 bubble, placed
+  // ABOVE the answer bubble. Expanded while streaming (so it's visible live),
+  // collapsed when the turn ends. One thought bubble accumulates the whole turn.
+  function addThought(text) {
+    if (!text) return;
+    if (!curBubble) startTurn();
+    if (!curThought) {
+      const wrap = document.createElement("div");
+      wrap.className = "msg msg-bot";
+      wrap.innerHTML = '<span class="msg-ava tool-ava">💭</span><div class="bubble tool-bubble think-bubble"></div>';
+      body.insertBefore(wrap, curBubble.closest(".msg"));   // reasoning sits above the answer
+      const bubble = wrap.querySelector(".tool-bubble");
+      curThought = { bubble, refs: buildToolBubble(bubble), text: "" };
+      curThought.refs.detail.hidden = false;                 // stream expanded
+      curThought.refs.caret.textContent = "▾";
+      curBubble.textContent = "";                            // drop the redundant "思考中" (blinking cursor stays)
+    }
+    curThought.text += text;
+    curThought.refs.detail.textContent = curThought.text;
+    curThought.refs.label.textContent = "💭 思考中…";
+    curThought.bubble.classList.remove("no-detail");
+    body.scrollTop = body.scrollHeight;
+  }
+  function finalizeThought() {
+    if (!curThought) return;
+    curThought.refs.label.textContent = "💭 思考";
+    curThought.refs.detail.hidden = true;                    // collapse when done (click to re-expand)
+    curThought.refs.caret.textContent = "▸";
+    curThought = null;
   }
   // Render a bubble's raw text: full HTML artifacts via sanitize, otherwise markdown — so
   // **bold** / `code` / lists render *live* while streaming, not as raw text that only snaps
@@ -344,6 +374,34 @@
     curText += t;
     scheduleRender();
   }
+  // A tool card: clickable header (🔧 title · status) + a collapsible detail
+  // pane (the full command + output). Header toggles; caret shows the state.
+  function buildToolBubble(bubble) {
+    bubble.innerHTML =
+      '<button class="tool-head" type="button">' +
+      '<span class="tool-caret">▸</span><span class="tool-label"></span></button>' +
+      '<pre class="tool-detail" hidden></pre>';
+    const head = bubble.querySelector(".tool-head");
+    const detail = bubble.querySelector(".tool-detail");
+    const caret = bubble.querySelector(".tool-caret");
+    head.onclick = () => {
+      if (bubble.classList.contains("no-detail")) return;   // nothing to show
+      const open = detail.hidden;
+      detail.hidden = !open;
+      caret.textContent = open ? "▾" : "▸";
+    };
+    return { head, detail, caret, label: bubble.querySelector(".tool-label") };
+  }
+  function setToolBubble(bubble, refs, title, status, detail) {
+    refs.label.textContent = "🔧 " + (title || "工具") + (status ? " · " + status : "");
+    bubble.classList.toggle("tool-done", status === "completed" || status === "failed");
+    if (detail != null && detail !== "") {
+      refs.detail.textContent = detail;                     // latest non-empty wins
+      bubble.classList.remove("no-detail");
+    } else if (!refs.detail.textContent) {
+      bubble.classList.add("no-detail");                    // no detail yet → not expandable
+    }
+  }
   function addToolLine(u) {
     const id = u.id || Math.random();
     let t = toolEls[id];
@@ -352,11 +410,11 @@
       wrap.className = "msg msg-bot";
       wrap.innerHTML = '<span class="msg-ava tool-ava">⚙</span><div class="bubble tool-bubble"></div>';
       body.appendChild(wrap);
-      t = toolEls[id] = { el: wrap.querySelector(".tool-bubble"), title: "" };
+      const bubble = wrap.querySelector(".tool-bubble");
+      t = toolEls[id] = { el: bubble, refs: buildToolBubble(bubble), title: "" };
     }
     if (u.title) t.title = u.title;             // tool_call has the title; updates may not
-    t.el.textContent = "🔧 " + (t.title || "工具") + (u.status ? " · " + u.status : "");
-    t.el.classList.toggle("tool-done", u.status === "completed" || u.status === "failed");
+    setToolBubble(t.el, t.refs, t.title, u.status, u.detail);
     body.scrollTop = body.scrollHeight;
   }
   function addPermission(m) {
@@ -380,6 +438,7 @@
     body.scrollTop = body.scrollHeight;
   }
   function finishTurn() {
+    finalizeThought();
     const txt = curText.trim();
     if (!txt) {
       // No final text. If the agent ran tools, show a subtle "done" marker so the
@@ -405,7 +464,7 @@
 
   function clearChat() {
     body.innerHTML = "";
-    curBubble = null; curText = ""; toolEls = {};
+    curBubble = null; curText = ""; toolEls = {}; curThought = null;
   }
   function wsSend(o) { if (chatWS && chatWS.readyState === 1) chatWS.send(JSON.stringify(o)); }
 
@@ -490,6 +549,17 @@
     if (role === "user") { const u = stripSystemPrefix(text).trim(); if (u) addMsg("user", u); return; }
     const t = text.trim();
     if (!t) return;
+    if (role === "thought") {                          // replayed reasoning → collapsed 💭 card
+      const wrap = document.createElement("div");
+      wrap.className = "msg msg-bot";
+      wrap.innerHTML = '<span class="msg-ava tool-ava">💭</span><div class="bubble tool-bubble think-bubble"></div>';
+      const bubble = wrap.querySelector(".tool-bubble");
+      const refs = buildToolBubble(bubble);
+      refs.label.textContent = "💭 思考";
+      refs.detail.textContent = t;                     // collapsed by default; click to expand
+      body.appendChild(wrap);
+      return;
+    }
     renderBubble(addMsg("bot", ""), t);
   }
   function histChunk(m) {
@@ -497,8 +567,10 @@
       histFlush();
       const wrap = document.createElement("div");
       wrap.className = "msg msg-bot";
-      wrap.innerHTML = '<span class="msg-ava tool-ava">⚙</span><div class="bubble tool-bubble tool-done"></div>';
-      wrap.querySelector(".tool-bubble").textContent = "🔧 " + (m.title || "工具") + (m.status ? " · " + m.status : "");
+      wrap.innerHTML = '<span class="msg-ava tool-ava">⚙</span><div class="bubble tool-bubble"></div>';
+      const bubble = wrap.querySelector(".tool-bubble");
+      const refs = buildToolBubble(bubble);
+      setToolBubble(bubble, refs, m.title, m.status, m.detail);
       body.appendChild(wrap);
       return;
     }
@@ -534,7 +606,7 @@
       const m = JSON.parse(e.data);
       switch (m.type) {
         case "start": startTurn(m.booting); break;
-        case "thought": if (curBubble && !curText) curBubble.textContent = "思考中…"; break;
+        case "thought": addThought(m.text || ""); break;
         case "token": appendToken(m.text || ""); break;
         case "tool": addToolLine(m); break;
         case "permission": addPermission(m); break;

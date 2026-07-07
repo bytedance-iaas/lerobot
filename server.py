@@ -618,6 +618,38 @@ def _chunk_text(update: dict) -> str:
     return c.get("text", "") if isinstance(c, dict) else ""
 
 
+def _tool_detail(u: dict) -> str:
+    """Human-readable command + output for a tool_call update, so the UI can
+    expand the one-line tool card. Best-effort over the ACP shape: `rawInput`
+    (the tool's arguments, e.g. a shell `command`) plus any text in `content`
+    blocks (the tool's output)."""
+    parts: list[str] = []
+    ri = u.get("rawInput")
+    if isinstance(ri, dict):
+        cmd = ri.get("command") or ri.get("cmd")
+        if cmd:
+            parts.append(str(cmd))
+        elif ri:
+            try:
+                parts.append(json.dumps(ri, ensure_ascii=False, indent=2))
+            except (TypeError, ValueError):
+                pass
+    elif isinstance(ri, str) and ri.strip():
+        parts.append(ri)
+    out: list[str] = []
+    for blk in u.get("content") or []:
+        if not isinstance(blk, dict):
+            continue
+        c = blk.get("content")
+        if isinstance(c, dict) and c.get("type") == "text" and c.get("text"):
+            out.append(c["text"])
+        elif blk.get("type") == "diff" and blk.get("path"):
+            out.append(f"[diff] {blk['path']}")
+    if out:
+        parts.append("\n".join(o for o in out if o))
+    return "\n\n".join(p for p in parts if p).strip()
+
+
 def _sess_brief(s: dict) -> dict:
     return {
         "id": s.get("sessionId"),
@@ -649,9 +681,12 @@ async def _handle_session_op(ws: web.WebSocketResponse, acp: "HermesACP", op: st
                 await ws.send_json({"type": "hist", "role": "user", "text": _chunk_text(u)})
             elif kind == "agent_message_chunk":
                 await ws.send_json({"type": "hist", "role": "assistant", "text": _chunk_text(u)})
+            elif kind == "agent_thought_chunk":
+                await ws.send_json({"type": "hist", "role": "thought", "text": _chunk_text(u)})
             elif kind in ("tool_call", "tool_call_update"):
                 await ws.send_json({"type": "hist", "role": "tool",
-                                    "title": u.get("title", ""), "status": u.get("status", "")})
+                                    "title": u.get("title", ""), "status": u.get("status", ""),
+                                    "detail": _tool_detail(u)})
 
         await acp.load_session(sid, on_hist)
         await ws.send_json({"type": "history_done", "id": sid})
@@ -672,7 +707,8 @@ async def handle_chat(request: web.Request) -> web.WebSocketResponse:
             await ws.send_json({"type": "thought", "text": _chunk_text(u)})
         elif kind in ("tool_call", "tool_call_update"):
             await ws.send_json({"type": "tool", "title": u.get("title", ""),
-                                "status": u.get("status", ""), "id": u.get("toolCallId", "")})
+                                "status": u.get("status", ""), "id": u.get("toolCallId", ""),
+                                "detail": _tool_detail(u)})
 
     async def on_permission(params: dict):
         # Ask the user (no --yolo): forward options, await their pick.

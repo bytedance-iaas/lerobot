@@ -280,8 +280,23 @@ body {
 /* tool-call lines + permission prompts (ACP streaming) */
 .tool-ava { background: #eef0f4 !important; color: #6b7180 !important; }
 .tool-bubble { background: #0b0f17; color: #9fb3d1; font-family: ui-monospace, Menlo, monospace;
-  font-size: 12px; border-radius: 10px; padding: 8px 11px; }
-.tool-bubble.tool-done { color: #6ee7a8; }
+  font-size: 12px; border-radius: 10px; padding: 0; overflow: hidden; }
+.tool-head { display: flex; align-items: center; gap: 7px; width: 100%; box-sizing: border-box;
+  background: none; border: 0; color: inherit; font: inherit; text-align: left; cursor: pointer;
+  padding: 8px 11px; }
+.tool-caret { color: #5b6479; font-size: 10px; flex: none; transition: color .15s; }
+.tool-head:hover .tool-caret { color: #9fb3d1; }
+.tool-label { flex: 1; min-width: 0; word-break: break-word; }
+.tool-bubble.tool-done .tool-label { color: #6ee7a8; }
+.tool-bubble.no-detail .tool-head { cursor: default; }
+.tool-bubble.no-detail .tool-caret { visibility: hidden; }
+.tool-detail { margin: 0; padding: 9px 11px; border-top: 1px solid rgba(159,179,209,.15);
+  color: #c7d2e4; font-family: inherit; font-size: 12px; white-space: pre-wrap; word-break: break-word;
+  max-height: 340px; overflow: auto; }
+/* reasoning card: muted vs. the tool card, so "thinking" reads distinct from tool output */
+.think-bubble { background: #12161f; }
+.think-bubble .tool-label { color: #9aa4b8; }
+.think-bubble .tool-detail { color: #b6c0d2; font-style: italic; }
 .bubble.perm { background: #fff7ed; border: 1px solid #fed7aa; color: #9a3412; }
 .perm-btns { display: flex; gap: 8px; margin-top: 10px; }
 .perm-btn { border: 1px solid var(--line); background: #fff; border-radius: 9px; padding: 6px 12px;
