@@ -316,59 +316,62 @@
     if (chatWS && chatWS.readyState === 1) chatWS.send(JSON.stringify({ type: "stop" }));
   }
 
-  // streaming-turn state
-  let curBubble = null, curText = "", toolEls = {}, curThought = null;
+  // Streaming-turn state. Like Claude Code / Codex, a turn is a CHRONOLOGICAL stream of
+  // segments — reasoning (💭), output (assistant text), and tool cards — in arrival order.
+  // A new tool call closes the current reasoning/output segment; the next chunk opens a
+  // fresh one. So think→output→tool→output→… naturally interleaves.
+  let curSeg = null;      // { kind:'think'|'output', el, refs, text }
+  let toolEls = {};       // tool cards by id (dedup status updates)
+  let pendingEl = null;   // initial "思考中" placeholder, removed on the first content
   function rm(el) { if (el) el.closest(".msg").remove(); }
 
   function startTurn(booting) {
-    curText = ""; toolEls = {}; curThought = null;
-    curBubble = addMsg("bot", "");
-    curBubble.classList.add("thinking");
-    curBubble.textContent = booting ? "正在启动 Agent" : "思考中";
+    curSeg = null; toolEls = {};
+    pendingEl = addMsg("bot", booting ? "正在启动 Agent" : "思考中");
+    pendingEl.classList.add("thinking");
   }
-  // The answer bubble (blinking while pending) must stay at the BOTTOM — reasoning
-  // and tool cards stack above it in arrival order. Re-append it after each new card.
-  function keepAnswerLast() { if (curBubble) body.appendChild(curBubble.closest(".msg")); }
-  // Stream the agent's reasoning into its own collapsible 💭 bubble, placed
-  // ABOVE the answer bubble. Expanded while streaming (so it's visible live),
-  // collapsed when the turn ends. One thought bubble accumulates the whole turn.
+  function clearPending() { if (pendingEl) { rm(pendingEl); pendingEl = null; } }
+
+  // Close the current segment: collapse a reasoning card, or finalize an output bubble
+  // (dropping it if it stayed empty).
+  function finalizeSeg() {
+    if (!curSeg) return;
+    if (curSeg.kind === "think") {
+      curSeg.refs.label.textContent = "💭 思考";
+      curSeg.refs.detail.hidden = true;                      // collapse (click to reopen)
+      curSeg.refs.caret.textContent = "▸";
+      if (!curSeg.text.trim()) rm(curSeg.el);
+    } else {
+      curSeg.el.classList.remove("thinking");
+      if (!curSeg.text.trim()) rm(curSeg.el);
+    }
+    curSeg = null;
+  }
+  function newThinkSeg() {
+    const wrap = document.createElement("div");
+    wrap.className = "msg msg-bot";
+    wrap.innerHTML = '<span class="msg-ava tool-ava">💭</span><div class="bubble tool-bubble think-bubble"></div>';
+    body.appendChild(wrap);
+    const bubble = wrap.querySelector(".tool-bubble");
+    const refs = buildToolBubble(bubble);
+    refs.detail.hidden = false;                              // stream expanded (visible live)
+    refs.caret.textContent = "▾";
+    curSeg = { kind: "think", el: bubble, refs, text: "" };
+  }
+  function newOutputSeg() {
+    const bubble = addMsg("bot", "");
+    bubble.classList.add("thinking");                        // blinking cursor while streaming
+    curSeg = { kind: "output", el: bubble, refs: null, text: "" };
+  }
   function addThought(text) {
     if (!text) return;
-    if (!curBubble) startTurn();
-    if (!curThought) {
-      const wrap = document.createElement("div");
-      wrap.className = "msg msg-bot";
-      wrap.innerHTML = '<span class="msg-ava tool-ava">💭</span><div class="bubble tool-bubble think-bubble"></div>';
-      body.appendChild(wrap);                                // reasoning stacks in arrival order
-      const bubble = wrap.querySelector(".tool-bubble");
-      curThought = { bubble, refs: buildToolBubble(bubble), text: "" };
-      curThought.refs.detail.hidden = false;                 // stream expanded
-      curThought.refs.caret.textContent = "▾";
-      curBubble.textContent = "";                            // drop the redundant "思考中" (blinking cursor stays)
-      keepAnswerLast();                                      // keep the blinking answer bubble at the bottom
-    }
-    curThought.text += text;
-    curThought.refs.detail.textContent = curThought.text;
-    curThought.refs.label.textContent = "💭 思考中…";
-    curThought.bubble.classList.remove("no-detail");
+    clearPending();
+    if (!curSeg || curSeg.kind !== "think") { finalizeSeg(); newThinkSeg(); }
+    curSeg.text += text;
+    curSeg.refs.detail.textContent = curSeg.text;
+    curSeg.refs.label.textContent = "💭 思考中…";
+    curSeg.el.classList.remove("no-detail");
     body.scrollTop = body.scrollHeight;
-  }
-  function finalizeThought() {
-    if (!curThought) return;
-    curThought.refs.label.textContent = "💭 思考";
-    curThought.refs.detail.hidden = true;                    // collapse when done (click to re-expand)
-    curThought.refs.caret.textContent = "▸";
-    curThought = null;
-  }
-  // Dock the reasoning card directly ABOVE the answer bubble and collapse it, so "思考"
-  // reads as part of the answer (grouped) and is closed by default — click to reopen.
-  function dockThoughtToAnswer() {
-    if (!curThought || !curBubble) return;
-    const answerMsg = curBubble.closest(".msg");
-    const thoughtMsg = curThought.bubble.closest(".msg");
-    thoughtMsg.classList.add("think-docked");                // tighten the gap to the answer
-    body.insertBefore(thoughtMsg, answerMsg);
-    finalizeThought();                                       // collapse + relabel 💭 思考
   }
   // Render a bubble's raw text: full HTML artifacts via sanitize, otherwise markdown — so
   // **bold** / `code` / lists render *live* while streaming, not as raw text that only snaps
@@ -385,16 +388,16 @@
     _renderPending = true;
     requestAnimationFrame(() => {
       _renderPending = false;
-      if (!curBubble) return;
-      renderBubble(curBubble, curText);
+      if (!curSeg || curSeg.kind !== "output") return;
+      curSeg.el.classList.remove("thinking");
+      renderBubble(curSeg.el, curSeg.text);
       body.scrollTop = body.scrollHeight;
     });
   }
   function appendToken(t) {
-    if (!curBubble) startTurn();
-    if (!curText && curThought) dockThoughtToAnswer();   // first answer token → group 思考 with the answer
-    curBubble.classList.remove("thinking");
-    curText += t;
+    clearPending();
+    if (!curSeg || curSeg.kind !== "output") { finalizeSeg(); newOutputSeg(); }
+    curSeg.text += t;
     scheduleRender();
   }
   // A tool card: clickable header (🔧 title · status) + a collapsible detail
@@ -429,13 +432,14 @@
     const id = u.id || Math.random();
     let t = toolEls[id];
     if (!t) {
+      clearPending();
+      finalizeSeg();                            // a new tool call ends the current think/output
       const wrap = document.createElement("div");
       wrap.className = "msg msg-bot";
       wrap.innerHTML = '<span class="msg-ava tool-ava">⚙</span><div class="bubble tool-bubble"></div>';
       body.appendChild(wrap);
       const bubble = wrap.querySelector(".tool-bubble");
       t = toolEls[id] = { el: bubble, refs: buildToolBubble(bubble), title: "" };
-      keepAnswerLast();                         // keep the blinking answer bubble at the bottom
     }
     if (u.title) t.title = u.title;             // tool_call has the title; updates may not
     setToolBubble(t.el, t.refs, t.title, u.status, u.detail);
@@ -462,23 +466,14 @@
     body.scrollTop = body.scrollHeight;
   }
   function finishTurn() {
-    finalizeThought();
-    const txt = curText.trim();
-    if (!txt) {
-      // No final text. If the agent ran tools, show a subtle "done" marker so the
-      // turn doesn't look frozen; otherwise drop the empty bubble.
-      if (Object.keys(toolEls).length) {
-        curBubble.classList.remove("thinking");
-        curBubble.textContent = "（已完成）";
-        curBubble.style.color = "#8a90a0";
-      } else {
-        rm(curBubble);
-      }
-    } else {
-      curBubble.classList.remove("thinking");
-      renderBubble(curBubble, curText.trim());   // same render path as live streaming
+    finalizeSeg();
+    if (pendingEl) {
+      // The turn produced no content at all → turn the placeholder into a done marker.
+      pendingEl.classList.remove("thinking");
+      pendingEl.textContent = "（已完成）";
+      pendingEl.style.color = "#8a90a0";
+      pendingEl = null;
     }
-    curBubble = null;
     setBusy(false);
   }
 
@@ -488,7 +483,7 @@
 
   function clearChat() {
     body.innerHTML = "";
-    curBubble = null; curText = ""; toolEls = {}; curThought = null;
+    curSeg = null; toolEls = {}; pendingEl = null;
   }
   function wsSend(o) { if (chatWS && chatWS.readyState === 1) chatWS.send(JSON.stringify(o)); }
 
@@ -661,8 +656,8 @@
         case "tool": addToolLine(m); break;
         case "permission": addPermission(m); break;
         case "done": finishTurn(); setTimeout(() => { if (!busy) refreshSessions(); }, 800); break;
-        case "error": rm(curBubble); curBubble = null; addMsg("bot", "⚠️ " + m.error); setBusy(false); break;
-        case "need_key": rm(curBubble); curBubble = null; setBusy(false); openKeyModal(); break;
+        case "error": finalizeSeg(); clearPending(); addMsg("bot", "⚠️ " + m.error); setBusy(false); break;
+        case "need_key": finalizeSeg(); clearPending(); setBusy(false); openKeyModal(); break;
         case "sessions": renderSessions(m.items || [], m.current); break;
         case "session_switched": onSwitched(m.id, m.title, m.fresh); break;
         case "session_deleted": onDeleted(m.id); break;
