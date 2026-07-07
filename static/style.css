@@ -297,6 +297,10 @@ body {
 .think-bubble { background: #12161f; }
 .think-bubble .tool-label { color: #9aa4b8; }
 .think-bubble .tool-detail { color: #b6c0d2; font-style: italic; }
+/* docked under the answer → grouped: tuck it against the answer and dim it further */
+.msg.think-docked { margin-bottom: 2px; }
+.msg.think-docked .think-bubble { background: #0f131b; }
+.msg.think-docked .tool-label { font-size: 11px; color: #7f8798; }
 .bubble.perm { background: #fff7ed; border: 1px solid #fed7aa; color: #9a3412; }
 .perm-btns { display: flex; gap: 8px; margin-top: 10px; }
 .perm-btn { border: 1px solid var(--line); background: #fff; border-radius: 9px; padding: 6px 12px;

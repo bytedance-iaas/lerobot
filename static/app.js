@@ -360,6 +360,16 @@
     curThought.refs.caret.textContent = "▸";
     curThought = null;
   }
+  // Dock the reasoning card directly ABOVE the answer bubble and collapse it, so "思考"
+  // reads as part of the answer (grouped) and is closed by default — click to reopen.
+  function dockThoughtToAnswer() {
+    if (!curThought || !curBubble) return;
+    const answerMsg = curBubble.closest(".msg");
+    const thoughtMsg = curThought.bubble.closest(".msg");
+    thoughtMsg.classList.add("think-docked");                // tighten the gap to the answer
+    body.insertBefore(thoughtMsg, answerMsg);
+    finalizeThought();                                       // collapse + relabel 💭 思考
+  }
   // Render a bubble's raw text: full HTML artifacts via sanitize, otherwise markdown — so
   // **bold** / `code` / lists render *live* while streaming, not as raw text that only snaps
   // to rendered at the end of the turn.
@@ -382,6 +392,7 @@
   }
   function appendToken(t) {
     if (!curBubble) startTurn();
+    if (!curText && curThought) dockThoughtToAnswer();   // first answer token → group 思考 with the answer
     curBubble.classList.remove("thinking");
     curText += t;
     scheduleRender();
