@@ -124,11 +124,14 @@ def _hermes_config_path() -> Path:
 
 
 def _sql_delete_session(sid: str) -> None:
-    """Delete a chat session from hermes' sqlite store (no ACP delete method).
+    """FALLBACK delete when `hermes sessions delete` is unavailable. Prefer the CLI
+    (HermesACP.delete_session) — it's schema-aware and also cleans the FTS index; this
+    raw delete only removes the sessions+messages rows (leaves FTS entries orphaned).
 
     hermes keeps sessions+messages in HERMES_HOME/state.db (WAL mode). We open a
-    short-timeout connection and remove the rows; the running agent re-reads the
-    store on the next session/list, so the deletion shows up immediately.
+    short-timeout connection and remove the rows. NOTE: a running `hermes acp` server
+    caches session/list in memory and will NOT reflect this until it restarts — callers
+    filter deleted ids from the list (HermesACP._deleted) to hide them immediately.
     """
     import sqlite3
 
@@ -534,8 +537,26 @@ class HermesACP:
         self._directive_sent.add(sid)  # existing history → never inject the directive
 
     async def delete_session(self, sid: str) -> None:
-        await asyncio.to_thread(_sql_delete_session, sid)
-        self._deleted.add(sid)  # hermes' cached session/list still has it → filter it out
+        # Prefer hermes' own CLI delete — it's schema-aware (also cleans the FTS index +
+        # related tables that a raw DELETE would orphan). Fall back to raw SQL if it fails.
+        deleted = False
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                HERMES_BIN, "sessions", "delete", sid, "--yes",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            )
+            out, _ = await proc.communicate()
+            deleted = proc.returncode == 0
+            if not deleted:
+                log.warning("`hermes sessions delete %s` rc=%s: %s", sid, proc.returncode,
+                            out.decode(errors="replace")[:300])
+        except OSError as e:  # noqa: BLE001
+            log.warning("`hermes sessions delete %s` errored: %s", sid, e)
+        if not deleted:
+            await asyncio.to_thread(_sql_delete_session, sid)
+        # The running `hermes acp` server caches session/list in memory and won't see the
+        # delete (whether CLI or SQL) until it restarts, so still filter it from the list.
+        self._deleted.add(sid)
         self._directive_sent.discard(sid)
         if self.session_id == sid:
             self.session_id = None  # next prompt/ensure() makes a fresh one
