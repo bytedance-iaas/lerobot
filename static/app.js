@@ -480,6 +480,7 @@
   /* ---------------------------------------------------------- chat sessions */
   const sessMenu = $("sess-menu"), sessList = $("sess-list"), sessTitle = $("chat-session-title"), sessFoot = $("sess-foot");
   let curSession = null;
+  const deletedSessions = new Set();   // ids deleted this session — hermes' cached list still returns them, so filter client-side too
 
   function clearChat() {
     body.innerHTML = "";
@@ -511,7 +512,9 @@
   }                                             // Setting it early left a stale guard that ate the 1st click.
   function deleteSession(id) {
     if (busy) return;
+    deletedSessions.add(id);                   // filter it out immediately; hermes' cached list still returns it
     wsSend({ type: "session_delete", id });
+    refreshSessions();                          // re-render (now filtered) without waiting on the reply
   }
   function refreshSessions() { wsSend({ type: "session_list" }); }
 
@@ -536,6 +539,7 @@
   }
 
   function renderSessions(items, current) {
+    items = (items || []).filter((s) => !deletedSessions.has(s.id));   // drop just-deleted (hermes cache lag)
     curSession = current || curSession;
     const cur = items.find((s) => s.id === current);
     if (cur) setTitle(cur.title);

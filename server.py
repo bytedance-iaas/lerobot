@@ -446,6 +446,9 @@ class HermesACP:
         # on their first prompt; loaded (existing) sessions are marked so we never
         # inject it mid-conversation.
         self._directive_sent: set[str] = set()
+        # Sessions deleted via SQL (hermes has no delete API); filtered from session/list
+        # because hermes' in-memory cache still returns them until it restarts.
+        self._deleted: set[str] = set()
         # Per-turn callbacks (single-user console → one active turn at a time):
         self.on_update = None       # async fn(update dict) — stream notifications
         self.on_permission = None   # async fn(params) -> optionId|None
@@ -511,7 +514,13 @@ class HermesACP:
     async def list_sessions(self) -> list[dict]:
         await self._ensure_proc()
         res = await self._request("session/list", {})
-        return res.get("sessions", []) if isinstance(res, dict) else []
+        sessions = res.get("sessions", []) if isinstance(res, dict) else []
+        # hermes caches session/list in memory and ignores our out-of-band SQL delete,
+        # so a just-deleted session lingers in the list. Filter the ones we've deleted
+        # (the row is already gone from state.db; a hermes restart re-reads it cleanly).
+        if self._deleted:
+            sessions = [s for s in sessions if s.get("sessionId") not in self._deleted]
+        return sessions
 
     async def load_session(self, sid: str, on_update) -> None:
         """Switch to an existing session; replays its history via on_update."""
@@ -526,6 +535,7 @@ class HermesACP:
 
     async def delete_session(self, sid: str) -> None:
         await asyncio.to_thread(_sql_delete_session, sid)
+        self._deleted.add(sid)  # hermes' cached session/list still has it → filter it out
         self._directive_sent.discard(sid)
         if self.session_id == sid:
             self.session_id = None  # next prompt/ensure() makes a fresh one
