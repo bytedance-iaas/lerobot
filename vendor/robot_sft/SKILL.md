@@ -129,6 +129,22 @@ policy — whether the dataset's features match the policy's `config.json` featu
 `dataset_explore.json`. This is where camera-key and dimension mismatches get caught
 **before** they waste a training run.
 
+**TOS datasets (object storage) — explore without downloading.** When the user points at a
+`tos://bucket/prefix` dataset, do NOT download it. First `ls` the tree with fsspec to confirm
+the LeRobot layout (`meta/ data/ videos/`), then load metadata with **`FsspecLeRobotDataset`**
+(see "Streaming a dataset from TOS" below) and read `num_frames`, `num_episodes`, `fps`,
+`meta.camera_keys`, and the state/action feature shapes — all from the mirrored `meta/` (a few
+MB), no bulk download. Write the same `dataset_explore.json` fields as for a local/Hub dataset.
+```python
+import fsspec, os
+so = {"key": os.environ["TOS_ACCESS_KEY"], "secret": os.environ["TOS_SECRET_KEY"],
+      "endpoint": "https://tos-cn-beijing.volces.com", "region": "cn-beijing"}
+fs = fsspec.filesystem("tos", **so); fs.ls("bucket/prefix/<name>")          # confirm meta/ data/ videos/
+from lerobot.datasets import FsspecLeRobotDataset
+ds = FsspecLeRobotDataset("tos://bucket/prefix/<name>", storage_options=so)  # metadata only
+print(ds.num_frames, ds.num_episodes, ds.fps, ds.meta.camera_keys)
+```
+
 ### c. Train/eval episode split  (always, unless the user opts out; conversion is conditional)
 Two responsibilities:
 - **Conversion (conditional):** if stage b found a v2.x dataset, convert it with lerobot's
@@ -142,6 +158,10 @@ Two responsibilities:
   --dataset-repo-id <id> [--dataset-root <dir>] --out <session>/preprocess.json`
   (default ≈10% holdout, min 1, seeded/deterministic). Verify the two id lists are
   disjoint and in range.
+  - **TOS datasets** split the same way — purely by **episode list**, no physical split:
+    pass `episodes=[...]` to `FsspecLeRobotDataset` (train vs eval subsets), just as
+    `--dataset.episodes` subsets a local/Hub dataset. Only the id lists are needed;
+    nothing is copied or moved on TOS.
 
 Writes `preprocess.json` with `train_episodes` + `eval_episodes`. If the user opted out,
 record `eval_episodes: []` (eval then only sanity-checks learning, not generalization).
@@ -385,6 +405,31 @@ Notes: it's an **`IterableDataset`** (buffer-shuffled, no random index) — same
 generic `url=` + `storage_options=` instead of `from_tos`; presigning falls back to fsspec
 `.sign()`. Validated end-to-end against a `file://` mirror of `izuluaga/finish_sandwich`
 (v3.0, 80 eps / 70k frames): metadata mirror + parquet streaming + episode filter all work.
+
+### Training on a TOS dataset (custom loop, no download)
+
+`lerobot-train` can't stream from `tos://` (its `--dataset.streaming` is Hub/local only). Two
+options: (1) `tosutil cp tos://… /opt/data/datasets/<name> -r` it down and pass
+`--dataset.root` to normal `lerobot-train`; or (2) — when you want to **avoid the download** —
+drive a **custom training loop over `FsspecLeRobotDataset`** that reuses lerobot's own
+building blocks so the run stays compatible with the rest of this skill:
+
+- **Dataloader:** build it from `FsspecLeRobotDataset(...)` (with the `train_episodes` from
+  stage c) **instead of** `make_dataset(cfg)`. It's an `IterableDataset`, so use a plain
+  `torch.utils.data.DataLoader` (no random sampler / `shuffle=True`).
+- **Reuse lerobot's pipeline unchanged:** the policy (`make_policy`), the pre/post
+  **processor** steps, and the **optimizer + LR scheduler** (`make_optimizer_and_scheduler`)
+  — same objects `lerobot-train` uses, so training dynamics match.
+- **Keep the checkpoint format identical:** write `pretrained_model/` (policy weights +
+  config) **and** `training_state/` (optimizer + scheduler + rng + `training_step.json`) exactly
+  as lerobot does, so the checkpoint stays **resumable AND inference-loadable** — the watchdog's
+  resume logic, `offline_eval.py`, and `verify_run.py` all keep working (references/
+  lerobot_resume.md).
+- **Known issue — investigate before trusting a run:** TOS/torchcodec **video-frame index
+  alignment** can be off (a decoded frame may not line up with the low-dim row for the same
+  timestep). Verify frame↔state alignment on a few samples first; if misaligned, treat it as a
+  bug to fix (or fall back to `tosutil cp` + `--dataset.root`) rather than training on skewed
+  data. See lessons_learned (FsspecLeRobotDataset streaming-training caveats).
 
 ## Style
 

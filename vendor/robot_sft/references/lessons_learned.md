@@ -173,3 +173,24 @@ scheduler_state.json,training_step.json}}` plus a `checkpoints/last` symlink.
 `pretrained_model/{config.json,model.safetensors,train_config.json}` +
 `training_state/{optimizer_state.safetensors,training_step.json,rng_state*}`. Confirm against
 a real checkpoint produced by *this* lerobot version if in doubt (preflight saves one).
+
+## 18. Streaming training from TOS — `FsspecLeRobotDataset`, and the frame-alignment trap
+**Context:** a `tos://` dataset too large to download can be trained without a local copy via
+a custom loop over `FsspecLeRobotDataset` (see SKILL.md "Training on a TOS dataset"). But
+`lerobot-train --dataset.streaming` does NOT support `tos://` (Hub/local only), so you're
+off the paved path — reuse lerobot's own pieces to stay compatible.
+**Do:**
+- Build the DataLoader from `FsspecLeRobotDataset` (not `make_dataset(cfg)`); it's an
+  `IterableDataset` → plain `DataLoader`, no random sampler/`shuffle=True` (buffer-shuffled).
+- Reuse lerobot's **processor** (pre/post steps), **optimizer + LR scheduler**
+  (`make_optimizer_and_scheduler`), and `make_policy` — so dynamics match `lerobot-train`.
+- Write checkpoints in lerobot's **exact** layout (`pretrained_model/` + `training_state/`)
+  so they stay resumable AND inference-loadable — watchdog resume, `offline_eval.py`, and
+  `verify_run.py` keep working (see #17 / lerobot_resume.md).
+**Trap — video-frame index alignment (KNOWN BUG, investigate before trusting a run):** with
+TOS/torchcodec, a decoded video frame can fail to line up with the low-dim (state/action) row
+for the same timestep — training then learns on skewed (image, state) pairs and silently
+degrades. **Check:** on a few samples, confirm the frame at index *i* matches the state/action
+at *i* (e.g. compare against a `tosutil cp`-downloaded reference, or timestamps). If
+misaligned, treat it as a bug to FIX (or fall back to `tosutil cp` + `--dataset.root` for the
+run) — do not train on it. Same `IterableDataset` caveats as #13 also apply.
