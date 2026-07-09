@@ -159,6 +159,26 @@ class TestCodecOptions:
         assert "crf" not in opts
         assert opts["g"] == 2
 
+    @require_videotoolbox
+    def test_videotoolbox_options_as_strings(self):
+        """Regression: q:v must be stringified with as_strings=True (streaming encoder path).
+
+        The streaming encoder feeds these options straight to PyAV, which rejects
+        non-string values ("expected str, got int").
+        """
+        cfg = RGBEncoderConfig(vcodec="h264_videotoolbox", g=2, crf=30, preset=None)
+        opts = cfg.get_codec_options(as_strings=True)
+        assert opts == {"g": "2", "q:v": "40"}
+        assert all(isinstance(v, str) for v in opts.values())
+
+    @require_nvenc
+    def test_nvenc_options_as_strings(self):
+        """Regression: rc must be stringified with as_strings=True (streaming encoder path)."""
+        cfg = RGBEncoderConfig(vcodec="h264_nvenc", g=2, crf=25, preset=None)
+        opts = cfg.get_codec_options(as_strings=True)
+        assert opts["rc"] == "0"
+        assert all(isinstance(v, str) for v in opts.values())
+
     @require_vaapi
     def test_vaapi_options(self):
         cfg = RGBEncoderConfig(vcodec="h264_vaapi", crf=28, preset=None)
