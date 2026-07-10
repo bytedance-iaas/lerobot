@@ -202,7 +202,13 @@ def launch(cmd: str, log_path: str) -> subprocess.Popen:
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     logf = open(log_path, "ab", buffering=0)
     logf.write(f"\n===== watchdog launch @ {time.ctime()} =====\n{cmd}\n".encode())
-    return subprocess.Popen(["bash", "-lc", cmd], stdout=logf, stderr=subprocess.STDOUT,
+    # `bash -lc` is a LOGIN shell: it sources /etc/profile[.d] (which activates the lerobot
+    # venv) but NOT ~/.bashrc — where the pod exports HF_ENDPOINT + TOS_ACCESS_KEY/SECRET_KEY
+    # (needed for tos:// streaming). Source it explicitly so the training subprocess ALWAYS
+    # has those, independent of how the watchdog itself was started (a bare `python
+    # watchdog.py` wouldn't have inherited them). Guarded so it's harmless if ~/.bashrc is absent.
+    wrapped = f"[ -f ~/.bashrc ] && . ~/.bashrc; {cmd}"
+    return subprocess.Popen(["bash", "-lc", wrapped], stdout=logf, stderr=subprocess.STDOUT,
                             start_new_session=True)
 
 
