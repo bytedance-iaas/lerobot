@@ -36,6 +36,13 @@ distilled list of the failure modes above, each with the concrete check that pre
   `/opt/data/robot_sft/runs/...` (via `plan_training.py`), and HF caches land under
   `/opt/data/.cache/...` automatically (`HOME=/opt/data` in the pod). **Never** write
   checkpoints or datasets into `/lerobot` or `/tmp`.
+- **Use the provided `scripts/` — do NOT hand-write ad-hoc scratch scripts.** Each stage has a
+  tool: plan with `plan_training.py` (writes `training_plan.json`) — don't write your own
+  `save_plan.py`; explore/split/train/eval/verify via the bundled scripts, and **train by
+  running `lerobot-train`** (it streams `tos://` directly — no custom training script). If you
+  genuinely need a one-off helper, write it under the **session dir**
+  (`/opt/data/robot_sft/sessions/<id>/`), **never `/tmp`** (ephemeral + forbidden above) and
+  **never** into the skill's own `scripts/` dir (that's the vendored, versioned tooling).
 - Outside the pod both default to the current directory (`.robot_sft/`); override with
   `$ROBOT_SFT_HOME` / `--output-dir`.
 - **HuggingFace Hub downloads go through a mirror — the pod is behind a firewall that blocks
