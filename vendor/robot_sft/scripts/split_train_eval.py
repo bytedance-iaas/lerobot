@@ -36,6 +36,9 @@ import random
 import sys
 
 
+_OBJECT_STORE_PREFIXES = ("tos://", "s3://", "gs://", "gcs://")
+
+
 def find_info_json(repo_id: str, root: str | None) -> str | None:
     candidates = []
     if root:
@@ -48,6 +51,24 @@ def find_info_json(repo_id: str, root: str | None) -> str | None:
         if os.path.isfile(c):
             return c
     return None
+
+
+def read_object_store_total_episodes(url: str) -> int:
+    """Stream-read `total_episodes` from `<url>/meta/info.json` via fsspec (no download).
+    TOS creds come from the environment (`TOS_ACCESS_KEY`/`TOS_SECRET_KEY`[/`TOS_ENDPOINT`/
+    `TOS_REGION`]); `tosfs` registers the tos:// protocol. Only meta/info.json is read (a few KB)."""
+    import fsspec  # lazy: only tos://… datasets need it; local/Hub stay stdlib
+
+    so: dict = {}
+    if url.startswith("tos://"):
+        so = {"endpoint": os.environ.get("TOS_ENDPOINT", "https://tos-cn-beijing.volces.com"),
+              "region": os.environ.get("TOS_REGION", "cn-beijing")}
+        if os.environ.get("TOS_ACCESS_KEY"):
+            so["key"] = os.environ["TOS_ACCESS_KEY"]
+        if os.environ.get("TOS_SECRET_KEY"):
+            so["secret"] = os.environ["TOS_SECRET_KEY"]
+    with fsspec.open(f"{url.rstrip('/')}/meta/info.json", "r", **so) as f:
+        return int(json.load(f)["total_episodes"])
 
 
 def main() -> None:
@@ -63,11 +84,20 @@ def main() -> None:
 
     total = args.total_episodes
     info_path = find_info_json(args.dataset_repo_id, args.dataset_root)
+    if total is None and info_path is None and args.dataset_repo_id.startswith(_OBJECT_STORE_PREFIXES):
+        # Object-store dataset: stream-read total_episodes from <url>/meta/info.json via fsspec.
+        try:
+            total = read_object_store_total_episodes(args.dataset_repo_id)
+            info_path = f"{args.dataset_repo_id.rstrip('/')}/meta/info.json"
+        except Exception as e:  # noqa: BLE001
+            print(f"ERROR: could not read meta/info.json from {args.dataset_repo_id}: {e}\n"
+                  "Check TOS creds (TOS_ACCESS_KEY/TOS_SECRET_KEY) + tosfs, or pass --total-episodes N.",
+                  file=sys.stderr)
+            sys.exit(2)
     if total is None:
         if not info_path:
-            print("ERROR: dataset meta/info.json not found. Pass --dataset-root <local dir>, or "
-                  "--total-episodes N. (A tos://… dataset has no local meta — pass "
-                  "--total-episodes N, from stage b's num_episodes.)", file=sys.stderr)
+            print("ERROR: dataset meta/info.json not found. Pass --dataset-root <local dir> or "
+                  "--total-episodes N.", file=sys.stderr)
             sys.exit(2)
         info = json.load(open(info_path))
         total = int(info["total_episodes"])

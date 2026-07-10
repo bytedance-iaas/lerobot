@@ -171,12 +171,11 @@ Two responsibilities:
   --dataset-repo-id <id> [--dataset-root <dir>] --out <session>/preprocess.json`
   (default ≈10% holdout, min 1, seeded/deterministic). Verify the two id lists are
   disjoint and in range.
-  - **TOS datasets:** `split_train_eval.py` is stdlib and **can't read a `tos://` meta**, so
-    pass **`--total-episodes <N>`** explicitly (N = `num_episodes` from stage b's
-    `dataset_explore.json`) — e.g. `--dataset-repo-id tos://<bucket>/<prefix>/<name>
-    --total-episodes 80`. The split itself is the same: it just writes disjoint id lists
-    (`train_episodes` / `eval_episodes`); `lerobot-train --dataset.episodes='[...]'` subsets
-    on TOS with nothing copied.
+  - **TOS datasets:** `split_train_eval.py` **stream-reads `total_episodes` from
+    `tos://…/meta/info.json` via fsspec** (creds from env) — just pass `--dataset-repo-id
+    tos://<bucket>/<prefix>/<name>`, no `--total-episodes` needed (pass it only to override).
+    The split itself is the same: it writes disjoint id lists (`train_episodes` /
+    `eval_episodes`); `lerobot-train --dataset.episodes='[...]'` subsets on TOS with nothing copied.
 
 Writes `preprocess.json` with `train_episodes` + `eval_episodes`. If the user opted out,
 record `eval_episodes: []` (eval then only sanity-checks learning, not generalization).
