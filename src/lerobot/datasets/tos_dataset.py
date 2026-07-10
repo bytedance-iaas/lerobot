@@ -13,46 +13,33 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Stream a LeRobot v3.0 dataset from an fsspec object store (S3, GCS, Volcengine TOS…).
+"""Stream a LeRobot v3.0 dataset from Volcengine TOS (object storage) — no download.
 
-:class:`StreamingLeRobotDataset` streams from the HF Hub or a local dir. This subclass
-points it at any ``fsspec`` URL instead, with no per-provider code:
+:class:`StreamingLeRobotDataset` streams from the HF Hub or a local dir. This subclass points
+it at a TOS (or any ``fsspec``) URL instead, with credentials read from the environment and no
+per-provider code:
 
-1. **metadata** — the small ``meta/`` tree is mirrored to a local dir via fsspec and handed
-   to the parent as ``root``, so the stock metadata path runs unchanged (a few MB; ``data/``
-   and ``videos/`` are never downloaded).
+1. **metadata** — the small ``meta/`` tree is mirrored to a local dir via fsspec and handed to
+   the parent as ``root``, so the stock metadata path runs unchanged (a few MB; ``data/`` and
+   ``videos/`` are never downloaded).
 2. **low-dim data** — overrides the parent's ``_load_hf_dataset`` seam:
    ``load_dataset("parquet", data_files="<url>/data/*/*.parquet", storage_options=…,
-   streaming=True)`` streams the parquet shards over fsspec. Also applies the ``episodes``
-   filter (useful for held-out train/eval splits).
-3. **video** — lerobot's decoder already opens each mp4 with ``fsspec.open(...)`` and lets
-   torchcodec range-read it, so overriding the parent's ``_get_video_path`` seam to return
-   the full ``<url>/…mp4`` fsspec URL is enough; the depth/rgb decode logic stays shared.
-   ``storage_options`` are registered as protocol defaults (``fsspec.config.conf``) so that
-   bare ``fsspec.open`` can authenticate.
+   streaming=True)`` streams the parquet shards over fsspec, plus the ``episodes`` filter.
+3. **video** — overrides the parent's ``_get_video_path`` seam to return the full ``<url>/…mp4``
+   fsspec URL; lerobot's decoder opens it with ``fsspec.open(...)`` and lets torchcodec
+   range-read it (frame-accurate — verified bit-exact vs the non-streaming reader).
 
-Everything else — the shuffle buffer, sharding, delta-timestamp windows, per-item
-construction — is inherited from the parent constructor untouched.
-
-You build the fsspec URL yourself and pass credentials via ``storage_options`` (read them
-from the environment; never hardcode secrets). For Volcengine TOS install ``tosfs`` to get
-the ``tos://`` protocol.
+Everything else — shuffle buffer, sharding, delta-timestamp windows, per-item construction — is
+inherited from the parent. Credentials come from ``TOS_ACCESS_KEY`` / ``TOS_SECRET_KEY`` (plus
+optional ``TOS_ENDPOINT`` / ``TOS_REGION``); pass ``storage_options`` to override. Install
+``tosfs`` for the ``tos://`` protocol. It's an ``IterableDataset`` (buffer-shuffled, no random
+index) — iterate it, don't index ``ds[i]``.
 
 Example::
 
-    import os
-    ds = FsspecLeRobotDataset(
-        "tos://my-bucket/lerobot-datasets/finish_sandwich",
-        storage_options={
-            "key": os.environ["TOS_ACCESS_KEY"],
-            "secret": os.environ["TOS_SECRET_KEY"],
-            "endpoint": "https://tos-cn-beijing.volces.com",
-            "region": "cn-beijing",
-        },
-        episodes=[0, 3, 17],   # optional held-out subset
-    )
-    for item in ds:  # IterableDataset — iterate, no ds[i]
-        item["observation.images.front"]  # (C, H, W); also item["observation.state"], ["action"]
+    ds = StreamingTOSRobotDataset("tos://bucket/prefix/name", episodes=[0, 3, 17])
+    for item in ds:  # no ds[i]
+        item["observation.images.front"]  # (C, H, W); also ["observation.state"], ["action"]
         break
 """
 
@@ -68,8 +55,22 @@ from datasets import load_dataset
 from .streaming_dataset import StreamingLeRobotDataset
 
 
-class FsspecLeRobotDataset(StreamingLeRobotDataset):
-    """A :class:`StreamingLeRobotDataset` that reads a v3.0 dataset from any fsspec URL."""
+def _tos_env_storage_options() -> dict:
+    """TOS fsspec ``storage_options`` from the environment (never hardcode secrets):
+    ``TOS_ACCESS_KEY`` / ``TOS_SECRET_KEY`` (+ optional ``TOS_ENDPOINT`` / ``TOS_REGION``)."""
+    opts: dict = {
+        "endpoint": os.environ.get("TOS_ENDPOINT", "https://tos-cn-beijing.volces.com"),
+        "region": os.environ.get("TOS_REGION", "cn-beijing"),
+    }
+    if os.environ.get("TOS_ACCESS_KEY"):
+        opts["key"] = os.environ["TOS_ACCESS_KEY"]
+    if os.environ.get("TOS_SECRET_KEY"):
+        opts["secret"] = os.environ["TOS_SECRET_KEY"]
+    return opts
+
+
+class StreamingTOSRobotDataset(StreamingLeRobotDataset):
+    """A :class:`StreamingLeRobotDataset` that reads a v3.0 dataset from Volcengine TOS."""
 
     def __init__(
         self,
@@ -82,11 +83,11 @@ class FsspecLeRobotDataset(StreamingLeRobotDataset):
     ):
         """
         Args:
-            url: dataset root on the backend, e.g. ``tos://bucket/prefix`` or ``s3://bucket/prefix``.
-            repo_id: optional label only (metadata is read from the mirrored ``meta/``, never
-                the Hub). Defaults to the last path segment of ``url``.
-            storage_options: fsspec kwargs for the backend (TOS: ``key``/``secret``/``endpoint``/
-                ``region``). Also registered as the protocol default so the video decoder's bare
+            url: dataset root on TOS, e.g. ``tos://bucket/prefix/name`` (any fsspec URL works too).
+            repo_id: optional label only (metadata is read from the mirrored ``meta/``, never the
+                Hub). Defaults to the last path segment of ``url``.
+            storage_options: fsspec kwargs; merged over the env-derived TOS credentials (explicit
+                values win). Also registered as the protocol default so the video decoder's bare
                 ``fsspec.open`` authenticates.
             meta_cache_dir: where to mirror ``meta/`` (default: a temp dir).
             **kwargs: forwarded to :class:`StreamingLeRobotDataset` (``episodes``,
@@ -96,7 +97,16 @@ class FsspecLeRobotDataset(StreamingLeRobotDataset):
         self._url = url.rstrip("/")
         self._protocol, self._rpath = fsspec.core.split_protocol(self._url)
         self._rpath = (self._rpath or "").rstrip("/")
-        self.storage_options = dict(storage_options or {})
+
+        so = _tos_env_storage_options()
+        if storage_options:
+            so.update(storage_options)  # explicit values win over the environment
+        if self._protocol == "tos" and (not so.get("key") or not so.get("secret")):
+            raise ValueError(
+                "TOS credentials not found: set TOS_ACCESS_KEY and TOS_SECRET_KEY in the environment "
+                "(optionally TOS_ENDPOINT / TOS_REGION), or pass storage_options={'key':…, 'secret':…}."
+            )
+        self.storage_options = dict(so)
         # instance-cached by fsspec, so this is the same object load_dataset/fsspec.open resolve.
         self._fs = fsspec.filesystem(self._protocol, **self.storage_options)
 
@@ -115,7 +125,7 @@ class FsspecLeRobotDataset(StreamingLeRobotDataset):
 
     # ---- metadata mirror -------------------------------------------------
     def _mirror_meta(self, cache_dir: str | None, repo_id: str) -> str:
-        local = cache_dir or tempfile.mkdtemp(prefix="fsspec_lerobot_")
+        local = cache_dir or tempfile.mkdtemp(prefix="tos_lerobot_")
         dst = os.path.join(local, repo_id.replace("/", "__"))
         meta_dst = os.path.join(dst, "meta")
         if not os.path.exists(os.path.join(meta_dst, "info.json")):
@@ -125,7 +135,7 @@ class FsspecLeRobotDataset(StreamingLeRobotDataset):
             self._fs.get(f"{self._rpath}/meta", meta_dst, recursive=True)
         if not os.path.exists(os.path.join(meta_dst, "info.json")):
             raise FileNotFoundError(
-                f"no meta/info.json under {self._url}/meta — is this a LeRobot v3.0 dataset on the backend?"
+                f"no meta/info.json under {self._url}/meta — is this a LeRobot v3.0 dataset on TOS?"
             )
         return dst
 
