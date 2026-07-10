@@ -187,10 +187,14 @@ off the paved path — reuse lerobot's own pieces to stay compatible.
 - Write checkpoints in lerobot's **exact** layout (`pretrained_model/` + `training_state/`)
   so they stay resumable AND inference-loadable — watchdog resume, `offline_eval.py`, and
   `verify_run.py` keep working (see #17 / lerobot_resume.md).
-**Trap — video-frame index alignment (KNOWN BUG, investigate before trusting a run):** with
-TOS/torchcodec, a decoded video frame can fail to line up with the low-dim (state/action) row
-for the same timestep — training then learns on skewed (image, state) pairs and silently
-degrades. **Check:** on a few samples, confirm the frame at index *i* matches the state/action
-at *i* (e.g. compare against a `tosutil cp`-downloaded reference, or timestamps). If
-misaligned, treat it as a bug to FIX (or fall back to `tosutil cp` + `--dataset.root` for the
-run) — do not train on it. Same `IterableDataset` caveats as #13 also apply.
+**Video-frame alignment — VERIFIED OK on finish_sandwich (2026-07, lerobot 0.6.1):** an
+earlier concern was that TOS/torchcodec might mis-map a decoded frame to the low-dim row for
+the same timestep (esp. the per-episode offset inside v3.0's concatenated `file-000.mp4`). A
+direct check disproved it: the TOS-streamed image matched the non-streaming reader **bit-exactly**
+(mean abs diff 0.00000, off-by-N scan → offset 0) for episode 0 (file start) AND episode 5
+(mid-file offset), across multiple frame positions, while neighbor frames differed (~0.015–0.038).
+So streaming training from TOS is frame-accurate here. **Still spot-check a NEW dataset**
+(different fps / variable-length episodes / non-monotonic timestamps could differ): grab a few
+(episode, frame_index) pairs, compare `FsspecLeRobotDataset` vs a `--dataset.root` local copy
+of the same frame; expect ~0 diff at the same index and >0 at neighbors. Same `IterableDataset`
+caveats as #13 still apply.
