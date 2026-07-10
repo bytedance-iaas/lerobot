@@ -342,7 +342,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         """Build the streaming HF dataset over the low-dim parquet shards.
 
         Extracted as a seam so subclasses can source the shards elsewhere (e.g.
-        :class:`~lerobot.datasets.fsspec_dataset.FsspecLeRobotDataset` streams them
+        :class:`~lerobot.datasets.tos_dataset.StreamingTOSRobotDataset` streams them
         from an fsspec object store).
         """
         return load_dataset(
@@ -590,7 +590,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         """Resolve where a video file is fetched from (Hub URL or local path).
 
         Extracted as a seam so subclasses can source videos elsewhere (e.g.
-        :class:`~lerobot.datasets.fsspec_dataset.FsspecLeRobotDataset` supplies an
+        :class:`~lerobot.datasets.tos_dataset.StreamingTOSRobotDataset` supplies an
         fsspec object-store URL); the decode logic stays shared.
         """
         root = self.meta.url_root if self.streaming and not self.streaming_from_local else self.root
@@ -605,7 +605,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
 
         item = {}
         for video_key, query_ts in query_timestamps.items():
-            # _get_video_path is the subclass seam (FsspecLeRobotDataset overrides it to
+            # _get_video_path is the subclass seam (StreamingTOSRobotDataset overrides it to
             # source videos from object storage); it returns the same URL/path the base
             # class computed inline. Keep main's depth-map decode branch on top of it.
             video_path = self._get_video_path(ep_idx, video_key)
