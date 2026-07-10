@@ -425,12 +425,13 @@ building blocks so the run stays compatible with the rest of this skill:
   as lerobot does, so the checkpoint stays **resumable AND inference-loadable** — the watchdog's
   resume logic, `offline_eval.py`, and `verify_run.py` all keep working (references/
   lerobot_resume.md).
-- **Video-frame alignment — verified OK on finish_sandwich (2026-07):** an earlier concern that
-  TOS/torchcodec might mis-map a decoded frame to the low-dim row (esp. the per-episode offset in
-  v3.0's concatenated video) did NOT reproduce — the TOS stream matched the non-streaming reader
-  bit-exactly (see lessons_learned #18). Streaming training is frame-accurate here. Still
-  **spot-check a new/unusual dataset** (odd fps / variable-length episodes) by comparing a few
-  frames vs a `--dataset.root` local copy before a long run.
+- **Verify video-frame alignment before a streaming-train run.** Risk: TOS/torchcodec mis-maps a
+  decoded frame to the low-dim row for the same timestep (esp. the per-episode offset in v3.0's
+  concatenated video), silently skewing (image, state) pairs. Check: compare a few `(episode,
+  frame_index)` frames — including a **mid-dataset episode** — from `FsspecLeRobotDataset` vs a
+  `--dataset.root` local copy; expect ~0 diff at the same index, >0 at neighbors. Bit-exact
+  alignment has been confirmed in testing; still verify a new/unusual dataset (odd fps /
+  variable-length episodes). See lessons_learned #18.
 
 ## Style
 
