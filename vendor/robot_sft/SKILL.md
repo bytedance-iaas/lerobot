@@ -369,10 +369,10 @@ if used raw) — `tosutil` de-obfuscates them internally, but the Python SDK / `
 Use the plaintext AK/SK from the Volcengine console / IAM (the pod's `~/.bashrc` exports them —
 `source ~/.bashrc` if a fresh shell doesn't have `$TOS_ACCESS_KEY`).
 
-**3. Install the TOS fsspec impl** (once, in the lerobot venv):
-```bash
-cd /lerobot && uv pip install --native-tls tosfs   # registers the tos:// protocol (+ tos SDK)
-```
+**3. The TOS fsspec impl (`tosfs`) is pre-installed** in the console image (registers the
+`tos://` protocol + TOS SDK), so `StreamingTOSRobotDataset` works out of the box. Only if you
+hit `ImportError: Install tosfs …` (e.g. a non-console env): `cd /lerobot && uv pip install
+--native-tls tosfs`.
 
 **4. Open it** — just pass the `tos://` URL; credentials are read from the environment
 (`repo_id` optional, auto-derived from the URL):
