@@ -48,10 +48,10 @@ concrete check that prevents it — see [`references/lessons_learned.md`](refere
   anatomy → `VERIFY.md` (don't trust exit 0).
 - `monitor_server.py` — dependency-free FastAPI dashboard: loss curve, eval-MSE curve, the
   watchdog's assessment, and a generic gallery of eval artifacts.
-- **`lerobot.datasets.FsspecLeRobotDataset`** (lives in the lerobot package) — stream a
-  LeRobot v3.0 dataset from object storage (Volcengine **TOS** via `tosfs`, or S3) without
-  downloading it — metadata mirrored locally, parquet streamed via fsspec, video via
-  presigned HTTPS URLs. See SKILL.md "Streaming a dataset from TOS".
+- **`lerobot.datasets.StreamingTOSRobotDataset`** (lives in the lerobot package) — stream a
+  LeRobot v3.0 dataset from Volcengine **TOS** without downloading it — TOS credentials read
+  from the environment, metadata mirrored locally, parquet streamed via fsspec, video decoded
+  directly off fsspec (frame-accurate). See SKILL.md "Streaming a dataset from TOS".
 
 ## Status
 

@@ -174,13 +174,13 @@ scheduler_state.json,training_step.json}}` plus a `checkpoints/last` symlink.
 `training_state/{optimizer_state.safetensors,training_step.json,rng_state*}`. Confirm against
 a real checkpoint produced by *this* lerobot version if in doubt (preflight saves one).
 
-## 18. Streaming training from TOS — `FsspecLeRobotDataset`, and the frame-alignment trap
+## 18. Streaming training from TOS — `StreamingTOSRobotDataset`, and the frame-alignment trap
 **Context:** a `tos://` dataset too large to download can be trained without a local copy via
-a custom loop over `FsspecLeRobotDataset` (see SKILL.md "Training on a TOS dataset"). But
+a custom loop over `StreamingTOSRobotDataset` (see SKILL.md "Training on a TOS dataset"). But
 `lerobot-train --dataset.streaming` does NOT support `tos://` (Hub/local only), so you're
 off the paved path — reuse lerobot's own pieces to stay compatible.
 **Do:**
-- Build the DataLoader from `FsspecLeRobotDataset` (not `make_dataset(cfg)`); it's an
+- Build the DataLoader from `StreamingTOSRobotDataset` (not `make_dataset(cfg)`); it's an
   `IterableDataset` → plain `DataLoader`, no random sampler/`shuffle=True` (buffer-shuffled).
 - Reuse lerobot's **processor** (pre/post steps), **optimizer + LR scheduler**
   (`make_optimizer_and_scheduler`), and `make_policy` — so dynamics match `lerobot-train`.
@@ -192,7 +192,7 @@ mis-maps a decoded frame to the low-dim (state/action) row for the same timestep
 per-episode offset inside v3.0's concatenated video file — so training silently learns on skewed
 (image, state) pairs. **Check:** download the dataset once to a local `--dataset.root`, then for a
 few `(episode, frame_index)` pairs (include a **mid-dataset episode**, not just episode 0, so the
-concatenation offset is exercised) compare `FsspecLeRobotDataset`'s streamed frame against the
+concatenation offset is exercised) compare `StreamingTOSRobotDataset`'s streamed frame against the
 non-streaming reader's same frame. Expect **~0 diff at the same index and >0 at neighbors** (also
 scan offsets ±5 to catch an off-by-N). Bit-exact alignment has been confirmed in testing, but odd
 fps / variable-length episodes / non-monotonic timestamps could differ — if a run's data path is
