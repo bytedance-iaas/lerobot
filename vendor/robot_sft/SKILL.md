@@ -406,25 +406,39 @@ generic `url=` + `storage_options=` instead of `from_tos`; presigning falls back
 `.sign()`. Validated end-to-end against a v3.0 dataset (metadata mirror + parquet streaming +
 episode filter + bit-exact video-frame alignment vs the non-streaming reader).
 
-### Training on a TOS dataset (custom loop, no download)
+### Training on a TOS dataset
 
-`lerobot-train` can't stream from `tos://` (its `--dataset.streaming` is Hub/local only). Two
-options: (1) `tosutil cp tos://… /opt/data/datasets/<name> -r` it down and pass
-`--dataset.root` to normal `lerobot-train`; or (2) — when you want to **avoid the download** —
-drive a **custom training loop over `FsspecLeRobotDataset`** that reuses lerobot's own
-building blocks so the run stays compatible with the rest of this skill:
+`lerobot-train` cannot read `tos://` directly — `make_dataset()` only builds `LeRobotDataset`
+(local/Hub) or `StreamingLeRobotDataset` (Hub/local streaming); a `tos://` URL gets Path-mangled
+with no credentials. `FsspecLeRobotDataset` is the `tos://` reader (a `StreamingLeRobotDataset`
+subclass). Pick by dataset size:
 
-- **Dataloader:** build it from `FsspecLeRobotDataset(...)` (with the `train_episodes` from
-  stage c) **instead of** `make_dataset(cfg)`. It's an `IterableDataset`, so use a plain
-  `torch.utils.data.DataLoader` (no random sampler / `shuffle=True`).
-- **Reuse lerobot's pipeline unchanged:** the policy (`make_policy`), the pre/post
-  **processor** steps, and the **optimizer + LR scheduler** (`make_optimizer_and_scheduler`)
-  — same objects `lerobot-train` uses, so training dynamics match.
-- **Keep the checkpoint format identical:** write `pretrained_model/` (policy weights +
-  config) **and** `training_state/` (optimizer + scheduler + rng + `training_step.json`) exactly
-  as lerobot does, so the checkpoint stays **resumable AND inference-loadable** — the watchdog's
-  resume logic, `offline_eval.py`, and `verify_run.py` all keep working (references/
-  lerobot_resume.md).
+**A. Small dataset → download once, standard `lerobot-train` (SIMPLEST, no code change).** Copy
+it to the roomy PVC and point `--dataset.root` at it — everything (sampler, checkpoints, resume,
+eval) works unchanged. Prefer this whenever the dataset fits comfortably on `/opt/data`.
+```bash
+# download (tosutil, or fsspec: fs.get("<bucket>/<prefix>/<name>", "/opt/data/datasets/<name>", recursive=True))
+lerobot-train --dataset.repo_id=<name> --dataset.root=/opt/data/datasets/<name> --policy.type=act ...
+```
+
+**B. Large dataset → stream (avoid the download).** The **training loop needs NO changes** —
+`FsspecLeRobotDataset` subclasses `StreamingLeRobotDataset` (an `IterableDataset`), so batches
+flow through the DataLoader / forward-backward / optimizer / scheduler / checkpoint identically.
+The **only** change is *dataset construction*, in exactly one place:
+
+- **`make_dataset()` in `src/lerobot/datasets/factory.py`** — add a branch: if the repo_id is a
+  `tos://`/`s3://` URL (or a config flag is set), build
+  `FsspecLeRobotDataset(url, storage_options=<TOS key/secret/endpoint/region from env>,
+  episodes=cfg.dataset.episodes, delta_timestamps=delta_timestamps, image_transforms=…,
+  tolerance_s=cfg.tolerance_s, return_uint8=True)` instead of `StreamingLeRobotDataset(...)`.
+  ~10 lines. Then stock `lerobot-train` runs end-to-end and stays compatible with this skill —
+  the same `pretrained_model/` + `training_state/` checkpoints, so watchdog resume / `offline_eval`
+  / `verify_run` all keep working. (Alternatively, a standalone loop that builds the dataset with
+  `FsspecLeRobotDataset` and reuses `make_policy` / `make_optimizer_and_scheduler` / the processor
+  — more code, no lerobot patch.)
+- **Streaming caveats (already true for `--dataset.streaming`, not extra work):** it's an
+  `IterableDataset` → buffer-shuffled, **no** `EpisodeAwareSampler` and **no** `drop_n_last_frames`
+  (those need random access); the train script already disables the shuffle-sampler when streaming.
 - **Verify video-frame alignment before a streaming-train run.** Risk: TOS/torchcodec mis-maps a
   decoded frame to the low-dim row for the same timestep (esp. the per-episode offset in v3.0's
   concatenated video), silently skewing (image, state) pairs. Check: compare a few `(episode,
