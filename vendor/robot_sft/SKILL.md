@@ -347,7 +347,7 @@ use **`lerobot.datasets.FsspecLeRobotDataset`** (a `StreamingLeRobotDataset` sub
 the lerobot package), which adds the three fsspec seams: metadata is mirrored locally (the
 tiny `meta/`), low-dim parquet streams via `fsspec`, and video mp4s are decoded from
 short-lived **presigned HTTPS URLs** (torchcodec range-reads only the bytes it needs).
-Validated live against TOS on `izuluaga/finish_sandwich` (v3.0, 80 eps / 70k frames).
+Validated live against a v3.0 dataset on TOS (metadata mirror + parquet streaming + video decode).
 
 **1. Put a dataset on TOS** (LeRobot **v3.0** layout — `meta/ data/ videos/`). Upload with
 `tosutil` (already configured on the box):
@@ -380,7 +380,7 @@ import os
 from lerobot.datasets import FsspecLeRobotDataset
 
 ds = FsspecLeRobotDataset(
-    "tos://dongmao-test/lerobot-datasets/finish_sandwich",
+    "tos://<bucket>/<prefix>/<dataset>",
     storage_options={
         "key": os.environ["TOS_ACCESS_KEY"], "secret": os.environ["TOS_SECRET_KEY"],
         "endpoint": "https://tos-cn-beijing.volces.com", "region": "cn-beijing",
@@ -403,8 +403,8 @@ Notes: it's an **`IterableDataset`** (buffer-shuffled, no random index) — same
 `StreamingLeRobotDataset` (lessons_learned #13 caveats). Video decode needs **torchcodec**
 (present in the lerobot image; missing on a bare Mac). For non-TOS backends (S3/GCS) pass a
 generic `url=` + `storage_options=` instead of `from_tos`; presigning falls back to fsspec
-`.sign()`. Validated end-to-end against a `file://` mirror of `izuluaga/finish_sandwich`
-(v3.0, 80 eps / 70k frames): metadata mirror + parquet streaming + episode filter all work.
+`.sign()`. Validated end-to-end against a v3.0 dataset (metadata mirror + parquet streaming +
+episode filter + bit-exact video-frame alignment vs the non-streaming reader).
 
 ### Training on a TOS dataset (custom loop, no download)
 
