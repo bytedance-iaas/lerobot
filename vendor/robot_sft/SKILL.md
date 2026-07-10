@@ -402,39 +402,37 @@ vs the non-streaming reader).
 
 ### Training on a TOS dataset
 
-`StreamingTOSRobotDataset` is a standalone reader — it is **not** wired into `lerobot-train`
-(`make_dataset` isn't patched). Two ways to train on TOS data:
-
-**A. Small dataset → download once, standard `lerobot-train` (PREFERRED — no code, most
-reliable).** Copy it to the roomy PVC and point `--dataset.root` at it; everything (sampler,
-checkpoints, resume, eval) works unchanged. Use this whenever the dataset fits on `/opt/data`.
+`make_dataset` now recognizes a `tos://` URL, so **`lerobot-train` streams from TOS directly** —
+no download, no custom loop. Pass the `tos://` URL as `--dataset.repo_id`; it auto-forces
+`--dataset.streaming` and builds `StreamingTOSRobotDataset` (TOS creds from env). The training
+loop, checkpoints (`pretrained_model/` + `training_state/`), resume, watchdog, and
+`offline_eval` all work unchanged. **This is the default path for a TOS dataset.**
 ```bash
-# download: tosutil cp tos://<bucket>/<prefix>/<name> /opt/data/datasets/<name> -r -flat
-#   or: python -c "import fsspec; fsspec.filesystem('tos').get('<bucket>/<prefix>/<name>', '/opt/data/datasets/<name>', recursive=True)"
+cd /lerobot && HF_ENDPOINT=https://hf-mirror.com CUDA_VISIBLE_DEVICES=<gpu> lerobot-train \
+  --dataset.repo_id=tos://<bucket>/<prefix>/<name> \
+  --policy.type=act --policy.push_to_hub=false \
+  --dataset.episodes="[<train ids>]" --env_eval_freq=0 \
+  --output_dir=<run_dir> --steps=<N> --batch_size=<B> --num_workers=<W> --save_freq=<F> --wandb.enable=false
+```
+- Creds are read from env (`TOS_ACCESS_KEY`/`TOS_SECRET_KEY`[/`TOS_ENDPOINT`/`TOS_REGION`]); the
+  pod's `~/.bashrc` exports them (`source ~/.bashrc` in a fresh shell). `tosfs` is baked into the image.
+- Verified end-to-end: a real `lerobot-train` run on a `tos://` dataset spanning **both** video
+  files (ep0 in file-000, ep40 in file-001) trained and checkpointed correctly. **`plan_training.py`
+  emits the launch/resume commands as usual — just with the `tos://` repo_id.**
+- **Streaming caveats (as for any `--dataset.streaming`):** it's an `IterableDataset` →
+  buffer-shuffled, **no** `EpisodeAwareSampler` / `drop_n_last_frames` (those need random access),
+  and `--num_workers=0` isn't supported for streaming (use `>=1`).
+
+**Alternative — download once + `--dataset.root`** (for a small dataset, or to avoid streaming):
+copy it to the PVC and train non-streaming — identical to any local dataset.
+```bash
+python -c "import fsspec; fsspec.filesystem('tos').get('<bucket>/<prefix>/<name>', '/opt/data/datasets/<name>', recursive=True)"
 lerobot-train --dataset.repo_id=<name> --dataset.root=/opt/data/datasets/<name> --policy.type=act ...
 ```
 
-**B. Large dataset → custom training loop over `StreamingTOSRobotDataset` (avoid the download).**
-Don't patch lerobot — write a small loop that reuses lerobot's own building blocks so the run
-stays compatible with the rest of this skill:
-- **Dataloader:** `StreamingTOSRobotDataset(url, episodes=train_episodes, delta_timestamps=…,
-  image_transforms=…, return_uint8=True)` → a plain `torch.utils.data.DataLoader`. It's an
-  `IterableDataset` → buffer-shuffled, so **no** `shuffle=True`, **no** `EpisodeAwareSampler` /
-  `drop_n_last_frames` (those need random access). `delta_timestamps` needs `meta`, which the
-  dataset builds — construct the dataset, then compute delta from `dataset.meta` and set
-  `dataset.delta_timestamps` + `dataset.delta_indices = get_delta_indices(dt, dataset.fps)`.
-- **Reuse lerobot's pipeline unchanged:** `make_policy`, the pre/post **processor** steps, and
-  `make_optimizer_and_scheduler` — the same objects `lerobot-train` uses, so dynamics match.
-- **Keep the checkpoint format identical:** write `pretrained_model/` + `training_state/` exactly
-  as lerobot does, so the checkpoint stays resumable AND inference-loadable — the watchdog's
-  resume logic, `offline_eval.py`, and `verify_run.py` all keep working (references/lerobot_resume.md).
-- **Verify video-frame alignment before the run.** Risk: TOS/torchcodec mis-maps a decoded frame
-  to the low-dim row for the same timestep (esp. the per-episode offset in v3.0's concatenated
-  video), silently skewing (image, state) pairs. Check: compare a few `(episode, frame_index)`
-  frames — including a **mid-dataset episode** — from `StreamingTOSRobotDataset` vs a
-  `--dataset.root` local copy; expect ~0 diff at the same index, >0 at neighbors. Bit-exact
-  alignment has been confirmed in testing; still verify a new/unusual dataset (odd fps /
-  variable-length episodes). See lessons_learned #18.
+**Frame alignment** was an upstream `StreamingLeRobotDataset` bug (global vs file-relative video
+timestamps) that broke multi-video-file datasets — **fixed** (see lessons_learned #18); streaming
+is now bit-exact vs the non-streaming reader. Still spot-check a new/unusual dataset if in doubt.
 
 ## Style
 

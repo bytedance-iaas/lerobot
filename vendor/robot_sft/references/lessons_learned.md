@@ -174,27 +174,23 @@ scheduler_state.json,training_step.json}}` plus a `checkpoints/last` symlink.
 `training_state/{optimizer_state.safetensors,training_step.json,rng_state*}`. Confirm against
 a real checkpoint produced by *this* lerobot version if in doubt (preflight saves one).
 
-## 18. Streaming training from TOS — `StreamingTOSRobotDataset`, and the frame-alignment trap
-**Context:** a `tos://` dataset too large to download can be trained without a local copy via
-a custom loop over `StreamingTOSRobotDataset` (see SKILL.md "Training on a TOS dataset"). But
-`lerobot-train --dataset.streaming` does NOT support `tos://` (Hub/local only), so you're
-off the paved path — reuse lerobot's own pieces to stay compatible.
-**Do:**
-- Build the DataLoader from `StreamingTOSRobotDataset` (not `make_dataset(cfg)`); it's an
-  `IterableDataset` → plain `DataLoader`, no random sampler/`shuffle=True` (buffer-shuffled).
-- Reuse lerobot's **processor** (pre/post steps), **optimizer + LR scheduler**
-  (`make_optimizer_and_scheduler`), and `make_policy` — so dynamics match `lerobot-train`.
-- Write checkpoints in lerobot's **exact** layout (`pretrained_model/` + `training_state/`)
-  so they stay resumable AND inference-loadable — watchdog resume, `offline_eval.py`, and
-  `verify_run.py` keep working (see #17 / lerobot_resume.md).
-**Video-frame alignment — ALWAYS verify before a streaming-train run.** The risk: TOS/torchcodec
-mis-maps a decoded frame to the low-dim (state/action) row for the same timestep — especially the
-per-episode offset inside v3.0's concatenated video file — so training silently learns on skewed
-(image, state) pairs. **Check:** download the dataset once to a local `--dataset.root`, then for a
-few `(episode, frame_index)` pairs (include a **mid-dataset episode**, not just episode 0, so the
-concatenation offset is exercised) compare `StreamingTOSRobotDataset`'s streamed frame against the
-non-streaming reader's same frame. Expect **~0 diff at the same index and >0 at neighbors** (also
-scan offsets ±5 to catch an off-by-N). Bit-exact alignment has been confirmed in testing, but odd
-fps / variable-length episodes / non-monotonic timestamps could differ — if a run's data path is
-new, verify first; on a mismatch, fix it or fall back to a downloaded copy. Same `IterableDataset`
-caveats as #13 still apply.
+## 18. Streaming training from TOS — now first-class, and the (fixed) frame-alignment bug
+**Streaming a `tos://` dataset for training is now first-class:** `make_dataset` recognizes a
+`tos://` URL and builds `StreamingTOSRobotDataset` (TOS creds from env), auto-forcing
+`--dataset.streaming`. So plain **`lerobot-train --dataset.repo_id=tos://…`** works end-to-end —
+no download, no custom loop — with lerobot's normal checkpoints / resume / eval. (`make_dataset`
+resolves `delta_timestamps` from the dataset's mirrored `.meta`.) Verified with a real run
+spanning two video files. `--num_workers>=1` (streaming has no `num_workers=0` path);
+`IterableDataset` → buffer-shuffled, no `EpisodeAwareSampler` / `drop_n_last_frames` (see #13).
+
+**The frame-alignment bug (FIXED).** `StreamingLeRobotDataset` decoded video at
+`current_ts = item["index"] / fps` — a *global* position, correct only while the whole dataset
+fits in one `.mp4`. v3.0 splits video into multiple files (`file-000.mp4`, `file-001.mp4`, …)
+each timestamped from 0, so episodes past the first file queried out-of-range frames: **crash**
+(`IndexError: Invalid frame index … must be less than …`) on the plain path, or **frozen
+last-frame video** (silent, corrupts training) on the delta path. Latent for small single-file
+datasets. Fixed by using the **file-relative** timestamp `from_timestamp[key] + item["timestamp"]`
+(committed upstream-style). If you ever suspect misalignment on a NEW/odd dataset (unusual fps,
+variable-length episodes), spot-check: compare a few `(episode, frame_index)` frames — include a
+**mid-dataset episode** — from streaming vs a `--dataset.root` copy; expect ~0 diff at the same
+index, >0 at neighbors (scan ±5 for an off-by-N).
