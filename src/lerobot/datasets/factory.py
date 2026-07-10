@@ -82,7 +82,34 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
     )
 
-    if isinstance(cfg.dataset.repo_id, str):
+    if isinstance(cfg.dataset.repo_id, str) and cfg.dataset.repo_id.startswith(
+        ("tos://", "s3://", "gs://", "gcs://")
+    ):
+        # Object-store URL (Volcengine TOS): stream via StreamingTOSRobotDataset — a
+        # StreamingLeRobotDataset subclass, so the DataLoader / training loop is unchanged
+        # (it's an IterableDataset). It reads TOS credentials from the environment. Since
+        # LeRobotDatasetMetadata can't read the URL directly, build the dataset first (it
+        # mirrors meta/ locally) and resolve delta_timestamps from its .meta afterwards.
+        from .feature_utils import get_delta_indices
+        from .tos_dataset import StreamingTOSRobotDataset
+
+        if not cfg.dataset.streaming:
+            # IterableDataset: the train script keys its shuffle/EpisodeAwareSampler off this flag.
+            cfg.dataset.streaming = True
+            logging.info("object-store dataset URL — forcing --dataset.streaming=true")
+        dataset = StreamingTOSRobotDataset(
+            cfg.dataset.repo_id,
+            episodes=cfg.dataset.episodes,
+            image_transforms=image_transforms,
+            max_num_shards=cfg.num_workers,
+            tolerance_s=cfg.tolerance_s,
+            return_uint8=True,
+        )
+        delta_timestamps = resolve_delta_timestamps(cfg.trainable_config, dataset.meta)
+        if delta_timestamps is not None:
+            dataset.delta_timestamps = delta_timestamps
+            dataset.delta_indices = get_delta_indices(delta_timestamps, dataset.fps)
+    elif isinstance(cfg.dataset.repo_id, str):
         ds_meta = LeRobotDatasetMetadata(
             cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
         )
