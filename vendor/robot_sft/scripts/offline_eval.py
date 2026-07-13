@@ -53,15 +53,46 @@ def main() -> None:
     cfg.pretrained_path = args.model_path
     cfg.device = device
 
-    ds_meta = LeRobotDatasetMetadata(args.dataset_repo_id, root=args.dataset_root)
+    eval_eps = sorted(set(args.episodes))
+    if args.dataset_repo_id.startswith(("tos://", "s3://", "gs://", "gcs://")):
+        # Stream held-out episodes from object storage (no download). Two things the streaming
+        # dataset forces us to handle for correct OPEN-LOOP replay (frames must arrive in
+        # temporal order within an episode):
+        #   - it ALWAYS buffer-shuffles (shuffle=False only makes it deterministic); buffer_size=1
+        #     disables the buffer -> source/frame order.
+        #   - multiple episodes interleave in one stream -> iterate ONE episode at a time.
+        # Its .meta feeds make_policy; return_uint8 default (False) matches the local path so the
+        # checkpoint's preprocessor gets images in the range it expects.
+        import tempfile
+
+        from lerobot.datasets import StreamingTOSRobotDataset
+
+        _meta_cache = tempfile.mkdtemp(prefix="offline_eval_meta_")
+
+        def _stream(eps):
+            return StreamingTOSRobotDataset(args.dataset_repo_id, episodes=eps, shuffle=False,
+                                            buffer_size=1, meta_cache_dir=_meta_cache)
+
+        ds_meta = _stream(eval_eps).meta
+
+        def _tos_items():
+            for ep in eval_eps:
+                yield from _stream([ep])
+
+        item_iter = _tos_items()
+        n_frames = "streaming"
+    else:
+        ds_meta = LeRobotDatasetMetadata(args.dataset_repo_id, root=args.dataset_root)
+        dataset = LeRobotDataset(args.dataset_repo_id, root=args.dataset_root, episodes=eval_eps)
+        item_iter = (dataset[i] for i in range(len(dataset)))
+        n_frames = dataset.num_frames
+
     policy = make_policy(cfg, ds_meta=ds_meta)
     policy.eval()
     preprocessor, postprocessor = make_pre_post_processors(cfg, pretrained_path=args.model_path)
 
-    dataset = LeRobotDataset(args.dataset_repo_id, root=args.dataset_root,
-                             episodes=sorted(set(args.episodes)))
     print(f"[offline_eval] model={args.model_path} device={device} "
-          f"episodes={sorted(set(args.episodes))} frames={dataset.num_frames}")
+          f"episodes={eval_eps} frames={n_frames}")
 
     # Replay each episode sequentially. Items of the selected episodes come back in order;
     # a change of episode_index marks a boundary -> reset the policy (fresh action queue).
@@ -70,8 +101,7 @@ def main() -> None:
     gt_hist: dict[int, list] = {}
     pred_hist: dict[int, list] = {}
     with torch.inference_mode():
-        for i in range(len(dataset)):
-            item = dataset[i]
+        for item in item_iter:
             ep = int(item["episode_index"])
             if ep != cur_ep:
                 cur_ep, ep_frames = ep, 0
