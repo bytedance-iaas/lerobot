@@ -30,6 +30,7 @@ import glob
 import json
 import os
 import re
+import shlex
 import signal as _signal
 import subprocess
 import sys
@@ -85,8 +86,11 @@ def eval_one(repo, ckpt_dir, plan, gpu, eval_dir, env, plot_dest, timeout,
     if plan.get("dataset_root"):
         cmd += ["--dataset-root", plan["dataset_root"]]
     # Own session so we can kill the WHOLE tree on timeout — a hung eval must never
-    # block the pipeline.
-    p = subprocess.Popen(cmd, cwd=repo, env=env, stdout=subprocess.PIPE,
+    # block the pipeline. Run through `bash -lc` sourcing ~/.bashrc so offline_eval inherits
+    # HF_ENDPOINT + TOS_ACCESS_KEY/SECRET_KEY (needed to stream a tos:// eval set) even if this
+    # watcher wasn't started from an interactive shell — same reason the watchdog does it.
+    inner = "[ -f ~/.bashrc ] && . ~/.bashrc; " + " ".join(shlex.quote(c) for c in cmd)
+    p = subprocess.Popen(["bash", "-lc", inner], cwd=repo, env=env, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True, start_new_session=True)
     try:
         out, _ = p.communicate(timeout=timeout)
