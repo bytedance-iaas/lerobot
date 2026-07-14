@@ -27,7 +27,7 @@
 # source copied below, otherwise `uv sync --locked` will disagree with the base venv. When
 # pyproject.toml / uv.lock change: rebuild Dockerfile.deps and bump this tag. Override at
 # build time with --build-arg DEPS_IMAGE=...
-ARG DEPS_IMAGE=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot-livekit-deps:28da7074390e450b42cf0fe040aac7651939a9a0
+ARG DEPS_IMAGE=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot-livekit-deps:23fc8f5f12e6c4c1ddf673e8394c43df6653d8a4
 FROM ${DEPS_IMAGE}
 
 # The base already provides the venv (/lerobot/.venv), system deps, uv, WORKDIR /lerobot,
