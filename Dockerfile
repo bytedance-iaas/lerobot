@@ -28,8 +28,18 @@ ARG PIP_INDEX_URL=https://mirrors.volces.com/pypi/simple/
 ENV UV_DEFAULT_INDEX=${PIP_INDEX_URL} \
     PIP_INDEX_URL=${PIP_INDEX_URL}
 
-# --- system deps: ripgrep speeds up the agent's file search.
-RUN apt-get update \
+# --- apt mirror + system deps (ripgrep speeds up the agent's file search) ------ #
+# Older lerobot bases point apt at Aliyun; newer ones already point at Volcengine.
+# Rewrite either way, so both this build and any `apt update` run inside the
+# deployed pod stay on the VKE-local mirror. Host-only rewrite, in the classic
+# sources.list and the deb822 sources.list.d/debian.sources, so whatever
+# suite/components the base pins still resolve. Debian paths (/debian,
+# /debian-security) — NOT ubuntu-*: the base image is Debian, not Ubuntu.
+ARG APT_MIRROR=https://mirrors.volces.com
+RUN for f in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do \
+      [ -f "$f" ] && sed -i -E "s#https?://(mirrors\.aliyun\.com|deb\.debian\.org|security\.debian\.org)#${APT_MIRROR}#g" "$f" || true; \
+    done; \
+    apt-get update \
     && apt-get install -y --no-install-recommends ripgrep ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
