@@ -37,12 +37,15 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/lerobot/.venv/bin:$PATH
 
 # Install system dependencies and uv (as root)
-# Point apt at the Aliyun Debian mirror first (fast from the CN build cluster). Rewrites only
-# the host, in both the classic sources.list and the deb822 sources.list.d/debian.sources, so
-# whatever suite/components the base image pins still resolve (aliyun mirrors them all). If
-# neither file exists it falls through to the default sources — slower, but not broken.
+# Point apt at the Volcengine Debian mirror first (fast from the CN build cluster and from VKE
+# nodes, so `apt update` inside a running pod stays on it too). Rewrites only the host, in both
+# the classic sources.list and the deb822 sources.list.d/debian.sources, so whatever
+# suite/components the base image pins still resolve (the mirror carries them all). If neither
+# file exists it falls through to the default sources — slower, but not broken. Debian paths
+# (/debian, /debian-security) — NOT ubuntu-*: python:*-slim is Debian, not Ubuntu.
+ARG APT_MIRROR=https://mirrors.volces.com
 RUN for f in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do \
-      [ -f "$f" ] && sed -i -E 's#https?://(deb|security)\.debian\.org#https://mirrors.aliyun.com#g' "$f" || true; \
+      [ -f "$f" ] && sed -i -E "s#https?://(deb|security)\.debian\.org#${APT_MIRROR}#g" "$f" || true; \
     done; \
     apt-get update && apt-get install -y --no-install-recommends \
     build-essential git curl libglib2.0-0 libegl1-mesa-dev ffmpeg \
