@@ -72,6 +72,9 @@ WORKDIR /opt/agent-console
 COPY server.py ./
 COPY static ./static
 COPY scripts ./scripts
+# Session listing runs INSIDE the hermes venv (it imports hermes_state), so this one
+# file lives next to that venv and is invoked with its interpreter, not ours.
+COPY hermes_session_api.py /opt/hermes/session_api.py
 # The robot_sft skill is VENDORED into this repo (vendor/robot_sft) so the build
 # needs NO GitHub — see vendor/robot_sft.SOURCE for the upstream commit.
 COPY vendor ./vendor
@@ -93,10 +96,15 @@ RUN mkdir -p "${HERMES_HOME}/skills" \
 # --- assert the runtime wiring at BUILD time (fail fast if a venv is wrong) -- #
 # 1) server.py runs in the lerobot venv → must import aiohttp + yaml and parse.
 # 2) hermes resolves via the symlink → its own venv (separate process).
+# 3) the session bridge runs in the HERMES venv → must import hermes_state and emit JSON.
+#    Asserting it here means a hermes upgrade that renames the store API breaks the BUILD,
+#    not the session list of a running console.
 RUN python -c "import aiohttp, yaml, ast; ast.parse(open('/opt/agent-console/server.py').read()); print('lerobot venv: console deps + server.py OK')" \
     && test -x /usr/local/bin/hermes \
     && hermes --version \
-    && echo "runtime wiring OK (lerobot venv + hermes venv + skill)"
+    && /opt/hermes/.venv/bin/python /opt/hermes/session_api.py list --limit 1 \
+       | python -c "import json,sys; json.load(sys.stdin); print('hermes venv: session bridge OK')" \
+    && echo "runtime wiring OK (lerobot venv + hermes venv + skill + session bridge)"
 
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh scripts/install_skill.sh

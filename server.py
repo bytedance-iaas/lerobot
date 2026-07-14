@@ -45,6 +45,7 @@ import signal
 import ssl
 import struct
 import termios
+from datetime import datetime, timezone
 from pathlib import Path
 
 import aiohttp
@@ -66,6 +67,12 @@ SHELL = os.environ.get("CONSOLE_SHELL") or shutil.which("bash") or "/bin/sh"
 WORKDIR = os.environ.get("CONSOLE_WORKDIR") or os.environ.get("LEROBOT_HOME") or os.getcwd()
 os.environ.pop("LEROBOT_HOME", None)
 HERMES_BIN = os.environ.get("HERMES_BIN") or shutil.which("hermes") or "hermes"
+# Session LISTING calls hermes' own store API (hermes_state.SessionDB) — but it has to run
+# in HERMES' interpreter, not ours: the two venvs disagree on 11 shared packages, so an
+# in-process import would shadow our deps with theirs. HERMES_BIN is a symlink into the
+# hermes venv's bin/, so its resolved sibling `python` is that interpreter.
+HERMES_PY = os.environ.get("HERMES_PY") or str(Path(HERMES_BIN).resolve().with_name("python"))
+HERMES_SESSION_API = os.environ.get("HERMES_SESSION_API") or "/opt/hermes/session_api.py"
 # Single-user HTTP Basic auth, credentials from the environment. When both are
 # set, EVERY route (page, static, WS, proxy) requires them; otherwise the console
 # is open (logged as a warning). This is a single account by design.
@@ -424,9 +431,6 @@ class HermesACP:
         # on their first prompt; loaded (existing) sessions are marked so we never
         # inject it mid-conversation.
         self._directive_sent: set[str] = set()
-        # Sessions deleted via SQL (hermes has no delete API); filtered from session/list
-        # because hermes' in-memory cache still returns them until it restarts.
-        self._deleted: set[str] = set()
         # Per-turn callbacks (single-user console → one active turn at a time):
         self.on_update = None       # async fn(update dict) — stream notifications
         self.on_permission = None   # async fn(params) -> optionId|None
@@ -488,21 +492,35 @@ class HermesACP:
         return self.session_id
 
     # ----- session management (new / list / load / delete) -----------------
-    async def new_session(self) -> str:
+    async def new_session(self) -> None:
+        """Arm a new session WITHOUT creating one: the next prompt does that.
+
+        Creating it here (or at startup) is what littered the store with titleless,
+        zero-message ghosts — one per page-open / server-start / API-key change, since
+        most of those never get a message. Deferring means a session row exists only
+        once there is something in it.
+        """
         await self._ensure_proc()
-        async with self._start_lock:
-            return await self._new_locked()
+        self.session_id = None
 
     async def list_sessions(self) -> list[dict]:
-        await self._ensure_proc()
-        res = await self._request("session/list", {})
-        sessions = res.get("sessions", []) if isinstance(res, dict) else []
-        # hermes caches session/list in memory and ignores our out-of-band SQL delete,
-        # so a just-deleted session lingers in the list. Filter the ones we've deleted
-        # (the row is already gone from state.db; a hermes restart re-reads it cleanly).
-        if self._deleted:
-            sessions = [s for s in sessions if s.get("sessionId") not in self._deleted]
-        return sessions
+        """Read the session store directly (hermes' own SessionDB API, via its venv).
+
+        NOT ACP `session/list`: that server caches the list in memory, so a session
+        deleted through the CLI kept coming back until hermes restarted — which is why
+        this used to carry a `_deleted` filter on both ends of the wire. Reading the
+        store means the list is simply always current.
+        """
+        proc = await asyncio.create_subprocess_exec(
+            HERMES_PY, HERMES_SESSION_API, "list", "--limit", "200",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"session list failed (rc={proc.returncode}): {err.decode(errors='replace')[:400]}"
+            )
+        return json.loads(out.decode() or "[]")
 
     async def load_session(self, sid: str, on_update) -> None:
         """Switch to an existing session; replays its history via on_update."""
@@ -528,9 +546,6 @@ class HermesACP:
                 f"`hermes sessions delete {sid}` failed (rc={proc.returncode}): "
                 f"{out.decode(errors='replace')[:400]}"
             )
-        # The running `hermes acp` server caches session/list in memory and won't reflect
-        # the delete until it restarts, so still filter it from the list.
-        self._deleted.add(sid)
         self._directive_sent.discard(sid)
         if self.session_id == sid:
             self.session_id = None  # next prompt/ensure() makes a fresh one
@@ -675,22 +690,30 @@ def _clean_title(t: str) -> str:
 
 
 def _sess_brief(s: dict) -> dict:
-    return {
-        "id": s.get("sessionId"),
-        "title": _clean_title(s.get("title")),
-        "updatedAt": s.get("updatedAt") or s.get("startedAt") or "",
-    }
+    """Store row -> what the sidebar needs. `lastActive` is epoch seconds; the client
+    parses an ISO string. Title can be absent (hermes auto-titles lazily, and it does
+    lose them), so fall back to the first words of the conversation rather than
+    rendering a wall of identical "新会话"."""
+    ts = s.get("lastActive") or 0
+    iso = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts else ""
+    title = _clean_title(s.get("title")) if s.get("title") else ""
+    if not title or title == "新会话":
+        preview = _clean_title(s.get("preview") or "")
+        title = preview[:40] if preview and preview != "新会话" else "新会话"
+    return {"id": s.get("id"), "title": title, "updatedAt": iso}
 
 
 async def _handle_session_op(ws: web.WebSocketResponse, acp: "HermesACP", op: str, payload: dict) -> None:
     if op == "session_list":
         items = await acp.list_sessions()
-        items = sorted(items, key=lambda s: s.get("updatedAt") or "", reverse=True)
+        items = sorted(items, key=lambda s: s.get("lastActive") or 0, reverse=True)
         await ws.send_json({"type": "sessions", "items": [_sess_brief(s) for s in items],
                             "current": acp.session_id})
     elif op == "session_new":
-        sid = await acp.new_session()
-        await ws.send_json({"type": "session_switched", "id": sid, "title": "新会话", "fresh": True})
+        # Deferred: no row exists until the first prompt, so `id` is null here. The client
+        # shows an empty chat; the turn-end session_list refresh fills in the real id.
+        await acp.new_session()
+        await ws.send_json({"type": "session_switched", "id": None, "title": "新会话", "fresh": True})
     elif op == "session_delete":
         sid = payload.get("id") or ""
         await acp.delete_session(sid)
@@ -1095,7 +1118,9 @@ async def _on_startup(app: web.Application) -> None:
     if read_chat_config()["chat_ready"]:
         async def _warm() -> None:
             try:
-                await app["acp"].ensure()
+                # Process only — NOT ensure(): that also opens a session, and a server that
+                # boots without anyone chatting would leave an empty one behind every time.
+                await app["acp"]._ensure_proc()
             except Exception as e:  # noqa: BLE001
                 log.warning("hermes acp warmup failed (will retry on first chat): %s", e)
         app["acp_warm"] = asyncio.create_task(_warm())
