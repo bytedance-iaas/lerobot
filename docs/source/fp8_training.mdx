@@ -41,18 +41,24 @@ model — but they explain why some policies benefit and others don't.
    In practice, on a mixed cluster this means fp8 runs on the H20 nodes, not the A30 nodes.
 
 2. **Layer type — trainable MLP/FFN `nn.Linear`, dims divisible by 16.** torchao only converts
-   `nn.Linear`. The filter additionally requires `in_features` and `out_features` both divisible
-   by 16 (tensor-core tiling) and a minimum size, and skips fully-frozen layers. Consequences:
+   `nn.Linear`, and LeRobot restricts that further to a **positive MLP allowlist**
+   (`MLP_FQN_MARKERS`): a Linear is eligible only if its name marks it as MLP/FFN
+   (`mlp`/`ffn`/`fc1`/`gate_proj`/…). It must also have both dims divisible by 16, be larger
+   than `min_size`, and be trainable. Consequences:
 
-   - **MLP/FFN only by default** — the attention **q/k/v/o projections stay in bf16**. Attention
-     projections (especially q/k) carry activation outliers that fp8 quantizes worse, and the FFN
-     holds most of the Linear FLOPs, so MLP-only captures the bulk of the speedup at lower
-     numerical risk. Convert attention projections too by calling
-     `apply_float8_training(..., include_attention=True)`.
-   - **Conv / UNet compute gets nothing** — fp8 here doesn't touch `Conv2d`/`Conv1d`.
-   - **Action heads are auto-skipped** — their output dim is the action size (e.g. 7), not
-     divisible by 16.
+   - **MLP/FFN only** — the attention **q/k/v/o projections stay in bf16**. They aren't
+     MLP-named, so they're excluded by construction. Attention activations (esp. q/k) carry
+     outliers fp8 quantizes worse, and the FFN holds most of the Linear FLOPs, so MLP-only
+     captures the bulk of the speedup at lower numerical risk.
+   - **Action / state heads stay in bf16** — they aren't MLP-named either, so they're skipped
+     regardless of their dims. This matters: pi0 pads `max_action_dim` to 32 (divisible by 16!),
+     so its `action_in_proj` / `action_out_proj` / `state_proj` *would* pass a dim-only check —
+     the allowlist keeps the output head out of fp8 where it belongs.
+   - **Conv / UNet compute gets nothing** — fp8 doesn't touch `Conv2d`/`Conv1d`.
    - **Frozen backbones are auto-skipped** — a layer you don't train is pure overhead in fp8.
+
+   An MLP with an unusual name is missed (a *safe* failure: less coverage, never wrong
+   numerics); extend the allowlist via `apply_float8_training(..., mlp_fqn_markers=...)`.
 
 3. **`torch.compile` for real speedup.** Un-compiled fp8 often breaks even or regresses because
    of quantize/dequantize overhead around each GEMM; torchao's benchmarks show the speedup with
@@ -113,10 +119,9 @@ fp8 gives little or nothing here — the filter no-ops, and enabling it just log
 `lerobot/optim/float8.py` exposes `apply_float8_training(policy, recipe=...)`. `lerobot-train`
 calls it when `--use_float8=true`, **after** the policy is built and frozen/PEFT-wrapped (so
 `requires_grad` is final) and **before** the optimizer is created (so it captures the swapped
-parameters) and before `accelerator.prepare()`. A layer is converted only when it is an
-**MLP/FFN** `nn.Linear` (attention projections are excluded via `ATTENTION_FQN_MARKERS` unless
-`include_attention=True`) with both dims divisible by 16, larger than `min_size`, at least partly
-trainable, and not matched by a skip pattern (e.g. `lm_head`). Attention is detected by FQN
-substring, so a parent module confusingly named `attention*` could over-skip an FFN — a safe
-failure (less fp8 coverage, never wrong numerics). The count of converted layers is logged; zero
+parameters) and before `accelerator.prepare()`. A layer is converted only when its FQN matches
+the MLP allowlist (`MLP_FQN_MARKERS`) AND it is an `nn.Linear` with both dims divisible by 16,
+larger than `min_size`, at least partly trainable, and not matched by a skip pattern (e.g.
+`lm_head`). Because it's a positive allowlist, attention, action/state heads, and embeddings are
+excluded by construction, not by coincidence. The count of converted layers is logged; zero
 converted means fp8 had no effect on this model.
