@@ -49,6 +49,7 @@ from .diffusion.configuration_diffusion import DiffusionConfig
 from .eo1.configuration_eo1 import EO1Config
 from .evo1.configuration_evo1 import Evo1Config
 from .fastwam.configuration_fastwam import FastWAMConfig
+from .dreamzero.configuration_dreamzero import DreamZeroConfig
 from .gaussian_actor.configuration_gaussian_actor import GaussianActorConfig
 from .groot.configuration_groot import GrootConfig
 from .lingbot_va.configuration_lingbot_va import LingBotVAConfig
@@ -145,6 +146,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .groot.modeling_groot import GrootPolicy
 
         return GrootPolicy
+    elif name == "dreamzero":
+        from .dreamzero.modeling_dreamzero import DreamZeroPolicy
+
+        return DreamZeroPolicy
     elif name == "xvla":
         from .xvla.modeling_xvla import XVLAPolicy
 
@@ -223,6 +228,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return SmolVLAConfig(**kwargs)
     elif policy_type == "groot":
         return GrootConfig(**kwargs)
+    elif policy_type == "dreamzero":
+        return DreamZeroConfig(**kwargs)
     elif policy_type == "xvla":
         return XVLAConfig(**kwargs)
     elif policy_type == "wall_x":
@@ -430,6 +437,15 @@ def make_pre_post_processors(
         from .groot.processor_groot import make_groot_pre_post_processors
 
         processors = make_groot_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+            dataset_meta=kwargs.get("dataset_meta"),
+        )
+
+    elif isinstance(policy_cfg, DreamZeroConfig):
+        from .dreamzero.processor_dreamzero import make_dreamzero_pre_post_processors
+
+        processors = make_dreamzero_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
             dataset_meta=kwargs.get("dataset_meta"),
