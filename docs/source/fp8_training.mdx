@@ -1,0 +1,114 @@
+# fp8 (float8) training with torchao
+
+LeRobot can train with **fp8 matmuls** on Hopper/Ada GPUs via [torchao](https://github.com/pytorch/ao).
+When enabled, eligible `nn.Linear` layers are swapped in place for torchao's `Float8Linear`, so
+their GEMMs run in fp8 on the tensor cores. Master weights, optimizer state, gradients, and every
+non-Linear op stay in bf16/fp32 — this is fp8 **training**, not post-training quantization, and it
+composes with the existing bf16 autocast.
+
+```bash
+pip install "lerobot[fp8]"   # adds torchao
+```
+
+```bash
+lerobot-train \
+  --policy.type=pi0 \
+  --policy.dtype=bfloat16 \
+  --use_float8=true \
+  --float8_recipe=rowwise \
+  --dataset.repo_id=<your/dataset> \
+  ...
+```
+
+`--float8_recipe` is one of `tensorwise` (fastest), `rowwise` (more accurate, default), or
+`rowwise_with_gw_hp`.
+
+> [!IMPORTANT]
+> **fp8 does not help every model.** Enabling it is *safe* on any policy — layers that cannot
+> benefit are skipped automatically and, if none qualify, training proceeds unchanged with a
+> logged warning `fp8: ... 0 layers were converted`. But it only *speeds up* a specific subset.
+> The rest of this page is the analysis of which.
+
+## When fp8 actually applies
+
+Three independent conditions must all hold for fp8 to do anything useful. They are enforced
+automatically by the layer filter (`lerobot/optim/float8.py`), so you don't configure them per
+model — but they explain why some policies benefit and others don't.
+
+1. **Hardware — Hopper/Ada only.** fp8 tensor-core GEMMs exist on compute capability **sm_89
+   (Ada, e.g. L40S) and sm_90 (Hopper, e.g. H100 / H20)** and newer, plus AMD MI300X. **Ampere
+   (A30/A100, sm_80) and older have no fp8 matmul** — requesting fp8 there raises a clear error.
+   In practice, on a mixed cluster this means fp8 runs on the H20 nodes, not the A30 nodes.
+
+2. **Layer type — large trainable `nn.Linear`, dims divisible by 16.** torchao only converts
+   `nn.Linear`. The filter additionally requires `in_features` and `out_features` both divisible
+   by 16 (tensor-core tiling) and a minimum size, and skips fully-frozen layers. Consequences:
+
+   - **Conv / UNet compute gets nothing** — fp8 here doesn't touch `Conv2d`/`Conv1d`.
+   - **Action heads are auto-skipped** — their output dim is the action size (e.g. 7), not
+     divisible by 16.
+   - **Frozen backbones are auto-skipped** — a layer you don't train is pure overhead in fp8.
+
+3. **`torch.compile` for real speedup.** Un-compiled fp8 often breaks even or regresses because
+   of quantize/dequantize overhead around each GEMM; torchao's benchmarks show the speedup with
+   `torch.compile` on. LeRobot does not compile the policy by default, so treat fp8 as a
+   *compile-time* optimization: enable it together with compilation for throughput.
+
+## Per-policy applicability
+
+Grouped by how much fp8 helps. "Trained" = whether the large Linear layers are trainable **by
+default** (fp8 only accelerates layers you actually train).
+
+### Group A — fp8 clearly beneficial
+
+Linear-dominated transformer/VLA/DiT policies whose big layers are trained by default:
+
+| Policy | Backbone | Why it benefits |
+|---|---|---|
+| `pi0`, `pi05`, `pi0_fast` | PaliGemma / Gemma | VLM trained end-to-end by default; large FFN/attention Linears (dims ÷16). |
+| `eo1`, `wall_x`, `xvla` | Qwen2.5-VL / Florence-2 | Encoders not frozen by default; transformer Linears dominate. |
+| `vla_jepa` | Qwen3-VL + DiT | Qwen + DiT trainable by default. |
+| `multi_task_dit` | DiT (frozen CLIP) | DiT trained from scratch; frozen CLIP is small and auto-skipped. |
+| `dreamzero`, `fastwam`, `lingbot_va` | ~5B Wan video-DiT | Large DiT trainable; big Linears. |
+
+### Group B — marginal / small
+
+Linear present but small, or compute shared with Conv, so the fp8 win is minor:
+
+| Policy | Note |
+|---|---|
+| `act` | ResNet stem (Conv, no fp8) + a small transformer (`d_model` ~512). Borderline. |
+| `vqbet` | minGPT (small) + ResNet + frozen VQ-VAE. |
+| `tdmpc`, `sac`, `gaussian_actor` | RL world-model / actor-critic MLPs with small hidden dims. |
+
+### Group C — fp8 problematic or inapplicable
+
+fp8 gives little or nothing here — the filter no-ops, and enabling it just logs the warning:
+
+| Policy | Reason |
+|---|---|
+| `smolvla` | VLM **frozen by default** (`train_expert_only=True`); only the small action expert trains. |
+| `groot` | LLM + vision **frozen by default** (`tune_llm=False`, `tune_visual=False`). |
+| `evo1` | Default stage freezes the InternVL VLM, trains only the action head. |
+| `diffusion` | Conv-dominated (ResNet + Conv1d UNet); almost no large Linear. |
+| `molmoact2` | VLM finetune, but needs the optional `molmoact2` extra + external HF checkpoint. |
+| `rtc` | Inference-time real-time-chunking wrapper; no trainable params. |
+| `sarm` | A reward model, not an action policy. |
+| `vllm` | Remote-proxy client; inference only, no local trainable module. |
+
+> [!NOTE]
+> Nearly every Group-A policy gets its transformer from an external library (`transformers`
+> PaliGemma / Qwen / InternVL / Florence-2 / SmolVLM, or a vendored Wan/qwen port) behind an
+> optional dependency. fp8 is applied to the `nn.Linear` layers **inside** those modules after the
+> policy is built — you don't need to do anything special, but the relevant extra
+> (`lerobot[pi]`, `lerobot[smolvla]`, ...) must be installed for the policy to exist at all.
+
+## How it works internally
+
+`lerobot/optim/float8.py` exposes `apply_float8_training(policy, recipe=...)`. `lerobot-train`
+calls it when `--use_float8=true`, **after** the policy is built and frozen/PEFT-wrapped (so
+`requires_grad` is final) and **before** the optimizer is created (so it captures the swapped
+parameters) and before `accelerator.prepare()`. A layer is converted only when it is an
+`nn.Linear` with both dims divisible by 16, larger than `min_size`, at least partly trainable, and
+not matched by a skip pattern (e.g. `lm_head`). The count of converted layers is logged; zero
+converted means fp8 had no effect on this model.

@@ -167,6 +167,9 @@ placo-dep = ["placo>=0.9.6,<0.9.16", "cmeel-urdfdom>=4,<5", "cmeel-tinyxml2<11"]
 transformers-dep = ["transformers>=5.4.0,<5.6.0"]
 grpcio-dep = ["grpcio>=1.73.1,<2.0.0", "protobuf>=6.31.1,<8.0.0"]
 accelerate-dep = ["accelerate>=1.14.0,<2.0.0"]
+# fp8 (float8) training via torchao. Needs a Hopper/Ada GPU (sm_89/90+) at runtime; the
+# wheel itself is arch-agnostic. See docs/source/fp8_training.mdx.
+fp8 = ["torchao>=0.13.0", "lerobot[accelerate-dep]"]
 can-dep = ["python-can>=4.2.0,<5.0.0"]
 peft-dep = ["peft>=0.18.0,<1.0.0"]
 scipy-dep = ["scipy>=1.14.0,<2.0.0"]
