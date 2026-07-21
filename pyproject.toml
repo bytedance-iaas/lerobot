@@ -279,6 +279,14 @@ fastwam = [
 flux3 = [
     "lerobot[transformers-dep]",
 ]
+dreamzero = [
+    "lerobot[transformers-dep]",
+    "lerobot[peft-dep]",
+    "lerobot[diffusers-dep]",
+    "einops>=0.8.0,<1.0.0",
+    "tqdm>=4.66.0",
+    "decord>=0.6.0,<1.0.0; (platform_machine == 'AMD64' or platform_machine == 'x86_64')",
+]
 evo1 = ["lerobot[transformers-dep]"]
 # fineart_vla: PI0.5-based policy that also trains a language head. The optional
 # fused training kernels (Liger Triton kernels, FlashRT Hub kernels) need Linux + CUDA.
@@ -385,6 +393,7 @@ all = [
     "lerobot[longwam]",
     "lerobot[flux3]",
     "lerobot[groot]",
+    "lerobot[dreamzero]",
     "lerobot[xvla]",
     "lerobot[evo1]",
     "lerobot[hilserl]",
