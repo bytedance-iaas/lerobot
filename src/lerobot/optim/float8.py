@@ -42,6 +42,7 @@ import logging
 
 import torch
 from torch import nn
+from torch.nn.modules.linear import NonDynamicallyQuantizableLinear
 
 # fp8 e4m3/e5m2 tensor-core matmul first appears on Ada Lovelace (sm_89) and Hopper (sm_90);
 # Ampere (sm_80/sm_86, e.g. A30/A100) and older have no fp8 GEMM path.
@@ -80,7 +81,18 @@ def assert_fp8_supported() -> None:
 
 
 def _eligible(module: nn.Module, fqn: str, *, min_size: int, skip_fqn_substrings: tuple[str, ...]) -> bool:
-    """torchao ``module_filter_fn``: return True to convert this module to fp8."""
+    """torchao ``module_filter_fn``: return True to convert this module to fp8.
+
+    NOTE on attention: for HF-style attention (Gemma/Qwen/...) the q/k/v/o projections are
+    plain ``nn.Linear`` and ARE converted — they are prime fp8 targets (the softmax(QKᵀ)V math
+    stays bf16; only the projection GEMMs go fp8). But ``nn.MultiheadAttention`` (used by ACT)
+    packs QKV into a raw ``in_proj_weight`` parameter we can't see, and its ``out_proj`` is a
+    ``NonDynamicallyQuantizableLinear`` — an ``nn.Linear`` *subclass*. Converting only that
+    out_proj would half-convert the attention inconsistently, so skip that subclass and leave
+    MHA fully in bf16 (ACT is small/marginal for fp8 anyway).
+    """
+    if type(module) is NonDynamicallyQuantizableLinear:
+        return False
     if not isinstance(module, nn.Linear):
         return False
     if module.in_features % 16 != 0 or module.out_features % 16 != 0:
