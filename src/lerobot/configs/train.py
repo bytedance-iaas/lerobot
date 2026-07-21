@@ -130,11 +130,12 @@ class TrainPipelineConfig(HubMixin):
     # Sample weighting configuration (e.g., for RA-BC training)
     sample_weighting: SampleWeightingConfig | None = None
 
-    # fp8 (float8) training via torchao: swap eligible trainable nn.Linear layers to fp8
-    # GEMMs. Only helps Linear-heavy transformer/VLA policies on Hopper/Ada GPUs (sm_89/90+,
-    # e.g. H20) — a safe no-op elsewhere (conv/UNet, small MLPs, frozen backbones), where it
-    # logs "0 layers converted". Needs lerobot[fp8] (torchao). Composes with bf16 (keep
-    # policy.dtype=bfloat16); for real speedup also enable torch.compile.
+    # fp8 (float8) training via torchao: swap eligible trainable MLP/FFN nn.Linear layers to
+    # fp8 GEMMs (attention q/k/v/o projections stay bf16 by default). Only helps Linear-heavy
+    # transformer/VLA policies on Hopper/Ada GPUs (sm_89/90+, e.g. H20) — a safe no-op elsewhere
+    # (conv/UNet, small MLPs, frozen backbones), where it logs "0 layers converted". Needs
+    # lerobot[fp8] (torchao). Composes with bf16 (keep policy.dtype=bfloat16); for real speedup
+    # also enable torch.compile.
     use_float8: bool = False
     # torchao float8 recipe: "tensorwise" (fastest) | "rowwise" (more accurate) | "rowwise_with_gw_hp".
     float8_recipe: str = "rowwise"

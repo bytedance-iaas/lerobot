@@ -24,7 +24,10 @@ auto-skips layers where it is wrong or useless. Enabling it on a policy that can
 is a safe no-op (a warning is logged that 0 layers were converted), never a crash. A layer
 is converted only when ALL of these hold:
 
-* it is an ``nn.Linear``;
+* it is an ``nn.Linear`` (and not ``nn.MultiheadAttention``'s hidden ``out_proj``);
+* it is an **MLP/FFN** layer, not an attention projection — by default attention q/k/v/o
+  projections stay in bf16 (safer fp8 numerics; the FFN holds most of the Linear FLOPs).
+  Pass ``include_attention=True`` to convert attention projections too;
 * both ``in_features`` and ``out_features`` are divisible by 16 (fp8 tensor-core tiling) —
   this alone excludes most action heads, whose output dim is the (small, arbitrary) action
   size;
@@ -47,6 +50,29 @@ from torch.nn.modules.linear import NonDynamicallyQuantizableLinear
 # fp8 e4m3/e5m2 tensor-core matmul first appears on Ada Lovelace (sm_89) and Hopper (sm_90);
 # Ampere (sm_80/sm_86, e.g. A30/A100) and older have no fp8 GEMM path.
 FP8_MIN_COMPUTE_CAPABILITY: tuple[int, int] = (8, 9)
+
+# By default fp8 is applied to MLP/FFN Linears ONLY; the attention q/k/v/o projections stay
+# in bf16. Rationale: attention projections (esp. q/k) carry activation outliers that fp8
+# quantizes worse, while the FFN holds most of the Linear FLOPs, so MLP-only captures the bulk
+# of the speedup at lower numerical risk. A Linear is treated as attention if its FQN contains
+# any of these markers — matching the attention BLOCK name ("attn"/"attention") catches the
+# projections regardless of per-model proj naming; the explicit proj markers cover models that
+# don't nest projections under an "attn"-named module. Matched case-insensitively. Pass
+# ``include_attention=True`` to convert attention projections too.
+ATTENTION_FQN_MARKERS: tuple[str, ...] = (
+    "attn",
+    "attention",
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "out_proj",
+    "qkv",
+    ".wq",
+    ".wk",
+    ".wv",
+    ".wo",
+)
 
 
 def is_fp8_supported() -> bool:
@@ -80,20 +106,33 @@ def assert_fp8_supported() -> None:
         )
 
 
-def _eligible(module: nn.Module, fqn: str, *, min_size: int, skip_fqn_substrings: tuple[str, ...]) -> bool:
+def _is_attention_linear(fqn: str) -> bool:
+    """True if this Linear's fully-qualified name marks it as an attention projection."""
+    f = fqn.lower()
+    return any(m in f for m in ATTENTION_FQN_MARKERS)
+
+
+def _eligible(
+    module: nn.Module,
+    fqn: str,
+    *,
+    min_size: int,
+    skip_fqn_substrings: tuple[str, ...],
+    include_attention: bool,
+) -> bool:
     """torchao ``module_filter_fn``: return True to convert this module to fp8.
 
-    NOTE on attention: for HF-style attention (Gemma/Qwen/...) the q/k/v/o projections are
-    plain ``nn.Linear`` and ARE converted — they are prime fp8 targets (the softmax(QKᵀ)V math
-    stays bf16; only the projection GEMMs go fp8). But ``nn.MultiheadAttention`` (used by ACT)
-    packs QKV into a raw ``in_proj_weight`` parameter we can't see, and its ``out_proj`` is a
-    ``NonDynamicallyQuantizableLinear`` — an ``nn.Linear`` *subclass*. Converting only that
-    out_proj would half-convert the attention inconsistently, so skip that subclass and leave
-    MHA fully in bf16 (ACT is small/marginal for fp8 anyway).
+    By default only MLP/FFN Linears are converted; attention q/k/v/o projections are left in
+    bf16 (see ``ATTENTION_FQN_MARKERS``). ``nn.MultiheadAttention`` (ACT) is doubly excluded:
+    it packs QKV into a raw ``in_proj_weight`` parameter we can't see, and its ``out_proj`` is a
+    ``NonDynamicallyQuantizableLinear`` (an ``nn.Linear`` subclass) — skipped both by type and
+    by the "out_proj"/"attn" markers.
     """
     if type(module) is NonDynamicallyQuantizableLinear:
         return False
     if not isinstance(module, nn.Linear):
+        return False
+    if not include_attention and _is_attention_linear(fqn):
         return False
     if module.in_features % 16 != 0 or module.out_features % 16 != 0:
         return False
@@ -113,6 +152,7 @@ def apply_float8_training(
     recipe: str = "rowwise",
     min_size: int = 256,
     skip_fqn_substrings: tuple[str, ...] = ("lm_head",),
+    include_attention: bool = False,
     enforce_hardware: bool = True,
 ) -> list[str]:
     """Convert eligible ``nn.Linear`` layers of ``model`` in place to fp8 training.
@@ -127,6 +167,9 @@ def apply_float8_training(
             accurate, default), or ``"rowwise_with_gw_hp"``.
         min_size: skip Linear layers whose larger dim is below this (overhead > benefit).
         skip_fqn_substrings: skip any layer whose fully-qualified name contains one of these.
+        include_attention: by default (``False``) only MLP/FFN Linears are converted and
+            attention q/k/v/o projections stay in bf16 (safer fp8 numerics, most of the FLOPs
+            anyway). Set ``True`` to also convert attention projections.
         enforce_hardware: raise if the GPUs lack fp8 tensor cores. Set False only to test the
             filter on CPU.
 
@@ -150,7 +193,13 @@ def apply_float8_training(
     converted: list[str] = []
 
     def module_filter_fn(module: nn.Module, fqn: str) -> bool:
-        keep = _eligible(module, fqn, min_size=min_size, skip_fqn_substrings=skip_fqn_substrings)
+        keep = _eligible(
+            module,
+            fqn,
+            min_size=min_size,
+            skip_fqn_substrings=skip_fqn_substrings,
+            include_attention=include_attention,
+        )
         if keep:
             converted.append(fqn)
         return keep
