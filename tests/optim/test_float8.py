@@ -84,6 +84,22 @@ def test_filter_over_a_mixed_model_selects_only_the_right_layers():
     assert picked == ["ffn_up", "ffn_down"]
 
 
+def test_hf_style_attention_projections_are_converted():
+    # For HF transformers (Gemma/Qwen/...), q/k/v/o are plain nn.Linear and ARE prime fp8
+    # targets — the projection GEMMs should convert (the attention softmax math stays bf16).
+    for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+        assert _fqn_eligible(nn.Linear(2048, 2048), f"model.layers.0.self_attn.{name}")
+
+
+def test_nn_multiheadattention_out_proj_is_skipped():
+    # nn.MultiheadAttention (ACT) packs QKV into a raw in_proj_weight parameter (invisible to
+    # the filter) but its out_proj is a NonDynamicallyQuantizableLinear (an nn.Linear SUBCLASS).
+    # Converting only that would half-convert the attention; it must be skipped so MHA stays
+    # fully bf16.
+    mha = nn.MultiheadAttention(512, 8)
+    assert not _fqn_eligible(mha.out_proj, "encoder.layers.0.self_attn.out_proj")
+
+
 def test_is_fp8_supported_is_false_without_cuda():
     if not torch.cuda.is_available():
         assert is_fp8_supported() is False
