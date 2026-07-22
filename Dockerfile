@@ -91,6 +91,10 @@ WORKDIR /opt/agent-console
 COPY server.py ./
 COPY static ./static
 COPY scripts ./scripts
+# diffusers <0.36 (lerobot's pin) hardcodes torchao internal module paths that torchao 0.17
+# (installed for fp8) removed → a scary "Unable to import torchao Tensor objects" at import.
+# Patch diffusers to import each Tensor optionally. Idempotent; no-op if diffusers changes.
+RUN /lerobot/.venv/bin/python scripts/patch_diffusers_torchao.py
 # Session listing runs INSIDE the hermes venv (it imports hermes_state), so this one
 # file lives next to that venv and is invoked with its interpreter, not ours.
 COPY hermes_session_api.py /opt/hermes/session_api.py
