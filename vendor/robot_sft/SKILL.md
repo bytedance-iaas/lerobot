@@ -215,13 +215,15 @@ Run `python scripts/check_hardware.py` and `python scripts/plan_training.py`. Th
     from a `tos://…/meta/info.json`), and with `--episodes-file` sizes the **train subset** — so
     you normally don't pass `--samples`/`--episodes` (they're optional overrides). The generated
     `lerobot-train` command already carries `--env_eval_freq=0` + `--policy.push_to_hub=false`.
-  - **torch.compile is ON by default** (`plan_training.py` adds `--policy.compile_model=true`).
-    It's what turns fp8 into a real speedup — without it the fp8 quant/dequant isn't fused and you
-    get little/no gain — and it helps bf16 too. Only added for policies that support it
-    (pi0/pi05/pi0_fast/smolvla/diffusion); skipped (with a note) for ACT etc. The first training
-    step is slow (max-autotune warm-up, minutes) but it amortizes over a real run. **preflight
-    strips compile** so the 2-step smoke isn't swamped by the warm-up. `--no-compile` to disable
-    (plan_training then WARNS if `--float8` is on, since fp8 alone barely helps).
+  - **torch.compile is ON by default** (`plan_training.py` adds `--policy.compile_model=true
+    --policy.compile_mode=reduce-overhead`). It's what turns fp8 into a real speedup — without it
+    the quant/dequant isn't fused and you get little/no gain — and it helps bf16 too. Only added
+    for policies that support it (pi0/pi05/pi0_fast/smolvla/diffusion); skipped (with a note) for
+    ACT etc. **Default mode is `reduce-overhead`, NOT the policies' own max-autotune default**: on
+    a 4B VLA max-autotune's kernel search warms up 10+ min (and uses more GPU memory), while
+    reduce-overhead compiles in ~a minute for most of the win; use `--compile-mode max-autotune`
+    on a long run to squeeze the last bit. **preflight strips compile** so the 2-step smoke isn't
+    swamped by warm-up. `--no-compile` to disable (plan_training then WARNS if `--float8` is on).
   - **fp8 training:** add **`--float8`** to `plan_training.py` for a VLA policy (pi0/pi05/…) on a
     **Hopper/Ada GPU (H20/H100, sm_89/90+)** — it appends `--use_float8=true --float8_recipe=rowwise
     --policy.dtype=bfloat16` (and, with compile on by default, the real speedup). **NOT on A30**

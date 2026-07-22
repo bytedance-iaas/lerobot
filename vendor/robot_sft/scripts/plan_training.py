@@ -182,7 +182,9 @@ def main() -> None:
                          "elsewhere. First step is slow (max-autotune warmup); amortized over a "
                          "real run. Use --no-compile to disable.")
     ap.add_argument("--compile-mode", default=None,
-                    help="override torch.compile mode (else the policy default, usually max-autotune)")
+                    help="torch.compile mode (default reduce-overhead: fast warm-up, most of the "
+                         "win). Use max-autotune for a long run to squeeze the last bit — but on a "
+                         "4B VLA its kernel search warms up 10+ min and uses more GPU memory.")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--out", default=None,
                     help="write JSON plan to this file (instead of stdout)")
@@ -300,8 +302,11 @@ def main() -> None:
     compile_on = args.compile and compile_supported
     if compile_on:
         parts.append("--policy.compile_model=true")
-        if args.compile_mode:
-            parts.append(f"--policy.compile_mode={args.compile_mode}")
+        # Default to reduce-overhead, NOT the policies' own max-autotune default: on a 4B VLA,
+        # max-autotune's exhaustive kernel search takes 10+ min to warm up (and more GPU mem),
+        # while reduce-overhead compiles in ~a minute for most of the runtime win. Opt into the
+        # exhaustive search with --compile-mode max-autotune on a long run.
+        parts.append(f"--policy.compile_mode={args.compile_mode or 'reduce-overhead'}")
     elif args.compile and compile_family and not compile_supported:
         print(f"note: --compile skipped — policy '{compile_family}' has no compile_model field.",
               file=_sys.stderr)
