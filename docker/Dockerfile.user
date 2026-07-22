@@ -39,7 +39,10 @@ COPY --chown=user_lerobot:user_lerobot . .
 # Install the lerobot package itself into the prebuilt venv. Every dependency is already
 # installed in the base image (Dockerfile.deps ran `uv sync ... --no-install-project`), so
 # this only builds/installs lerobot from src/ — seconds, no dependency downloads.
-RUN uv sync --locked --extra all --no-cache
+# `--extra fp8` adds torchao (fp8 training) here at the user layer rather than in the deps
+# base: torchao is a single torch-dependent wheel, so installing it on top of the base venv
+# keeps the slow deps image unchanged (no deps rebuild / DEPS_IMAGE bump needed).
+RUN uv sync --locked --extra all --extra fp8 --no-cache
 
 # Set the default command
 CMD ["/bin/bash"]
