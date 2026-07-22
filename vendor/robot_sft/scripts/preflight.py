@@ -114,6 +114,9 @@ def smoke_command(cmd: str, real_output_dir: str, tmp_dir: str, steps: int) -> s
     cmd = _override_flag(cmd, "steps", steps)
     cmd = _override_flag(cmd, "save_freq", steps)   # exercise a checkpoint save too
     cmd = _override_flag(cmd, "log_freq", 1)
+    # Strip torch.compile for the smoke run: max-autotune spends minutes warming up on the first
+    # step, which would swamp (or time out) a 2-step correctness check. The real run keeps it.
+    cmd = re.sub(r"\s*--policy\.compile_(model|mode)[= ]\S+", "", cmd)
     if real_output_dir and real_output_dir in cmd:
         cmd = cmd.replace(real_output_dir, tmp_dir)
     else:

@@ -215,13 +215,20 @@ Run `python scripts/check_hardware.py` and `python scripts/plan_training.py`. Th
     from a `tos://…/meta/info.json`), and with `--episodes-file` sizes the **train subset** — so
     you normally don't pass `--samples`/`--episodes` (they're optional overrides). The generated
     `lerobot-train` command already carries `--env_eval_freq=0` + `--policy.push_to_hub=false`.
+  - **torch.compile is ON by default** (`plan_training.py` adds `--policy.compile_model=true`).
+    It's what turns fp8 into a real speedup — without it the fp8 quant/dequant isn't fused and you
+    get little/no gain — and it helps bf16 too. Only added for policies that support it
+    (pi0/pi05/pi0_fast/smolvla/diffusion); skipped (with a note) for ACT etc. The first training
+    step is slow (max-autotune warm-up, minutes) but it amortizes over a real run. **preflight
+    strips compile** so the 2-step smoke isn't swamped by the warm-up. `--no-compile` to disable
+    (plan_training then WARNS if `--float8` is on, since fp8 alone barely helps).
   - **fp8 training:** add **`--float8`** to `plan_training.py` for a VLA policy (pi0/pi05/…) on a
     **Hopper/Ada GPU (H20/H100, sm_89/90+)** — it appends `--use_float8=true --float8_recipe=rowwise
-    --policy.dtype=bfloat16`. **NOT on A30** (Ampere): lerobot-train ERRORS out (`compute
-    capability >= 8.9`), so only pass it when `check_hardware` reports an H20/Hopper card.
-    preflight inherits it from the plan (`--session`) — the smoke run uses the same fp8 config, so
-    the memory estimate is accurate; watchdog resume reloads it from the saved `train_config.json`.
-    See `references/policy_selection.md`.
+    --policy.dtype=bfloat16` (and, with compile on by default, the real speedup). **NOT on A30**
+    (Ampere): lerobot-train ERRORS out (`compute capability >= 8.9`), so only pass it when
+    `check_hardware` reports an H20/Hopper card. preflight inherits it from the plan (`--session`) —
+    the smoke run uses the same fp8 config, so the memory estimate is accurate; watchdog resume
+    reloads it from the saved `train_config.json`. See `references/policy_selection.md`.
     **⚠️ Do NOT pass `--out` — argparse prefix-matches it to `--output-dir`, silently overriding
     the output-dir you set. Redirect stdout with `> file` instead.**
 - Checks **GPU count + free memory** (pick idle GPUs), **disk space** for checkpoints

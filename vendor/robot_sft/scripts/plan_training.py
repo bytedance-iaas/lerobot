@@ -93,6 +93,8 @@ def load_train_episodes(path: str):
 
 
 _OBJECT_STORE_PREFIXES = ("tos://", "s3://", "gs://", "gcs://")
+# Policies whose config exposes a `compile_model` field (so --policy.compile_model=true is valid).
+_COMPILE_POLICIES = {"pi0", "pi05", "pi0_fast", "smolvla", "diffusion"}
 
 
 def read_meta_counts(repo_id: str, root: str | None) -> tuple[int | None, int | None]:
@@ -173,6 +175,14 @@ def main() -> None:
     ap.add_argument("--float8-recipe", default="rowwise",
                     choices=["rowwise", "tensorwise", "rowwise_with_gw_hp"],
                     help="torchao float8 recipe (default rowwise: more accurate)")
+    ap.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True,
+                    help="torch.compile the policy (--policy.compile_model=true). Default ON — it "
+                         "is what turns fp8 into a real speedup, and helps bf16 too. Only added for "
+                         "policies that support it (pi0/pi05/pi0_fast/smolvla/diffusion); a no-op "
+                         "elsewhere. First step is slow (max-autotune warmup); amortized over a "
+                         "real run. Use --no-compile to disable.")
+    ap.add_argument("--compile-mode", default=None,
+                    help="override torch.compile mode (else the policy default, usually max-autotune)")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--out", default=None,
                     help="write JSON plan to this file (instead of stdout)")
@@ -275,6 +285,30 @@ def main() -> None:
         parts.append("--policy.dtype=bfloat16")
         parts.append("--use_float8=true")
         parts.append(f"--float8_recipe={args.float8_recipe}")
+
+    # torch.compile — ON by default. It's what makes fp8 a real speedup (fuses the quant/dequant
+    # around the fp8 GEMMs) and helps bf16 too. Only pi0/pi05/pi0_fast/smolvla/diffusion expose a
+    # `compile_model` config field; passing it to others (ACT, …) would be an unknown-flag error,
+    # so gate on the policy family (from --policy-type, or the checkpoint config's `type`).
+    import sys as _sys
+    compile_family = args.policy_type
+    if not compile_family and args.policy_path:
+        _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import check_features as _cf
+        compile_family = (_cf.policy_config(args.policy_path) or {}).get("type")
+    compile_supported = compile_family in _COMPILE_POLICIES
+    compile_on = args.compile and compile_supported
+    if compile_on:
+        parts.append("--policy.compile_model=true")
+        if args.compile_mode:
+            parts.append(f"--policy.compile_mode={args.compile_mode}")
+    elif args.compile and compile_family and not compile_supported:
+        print(f"note: --compile skipped — policy '{compile_family}' has no compile_model field.",
+              file=_sys.stderr)
+    if args.float8 and not compile_on:
+        print("⚠ fp8 WITHOUT torch.compile gives little/no speedup (quant/dequant not fused). "
+              "Enable --compile on a compile-capable policy for the real win.", file=_sys.stderr)
+
     cuda = f"CUDA_VISIBLE_DEVICES={args.cuda} " if args.cuda else ""
     cmd = f"cd {args.repo} && {cuda}" + " \\\n  ".join(parts)
 
@@ -290,6 +324,11 @@ def main() -> None:
         "repo": args.repo,
         "float8": args.float8,
         "float8_recipe": args.float8_recipe if args.float8 else None,
+        "compile": compile_on,
+        "compile_note": ("on (real fp8 speedup needs it)" if compile_on and args.float8
+                         else "on" if compile_on
+                         else f"off — policy '{compile_family}' can't compile" if args.compile
+                         else "off (--no-compile)"),
         "cuda_visible_devices": args.cuda,
         "dataset_repo_id": args.dataset_repo_id,
         "dataset_root": args.dataset_root,
@@ -342,6 +381,8 @@ def main() -> None:
         print(f"save_freq={save_freq}  log_freq={args.log_freq}  (checkpoints keep full "
               f"training state -> always resumable)")
         print(f"num_workers={num_workers}  ({workers_note})")
+        print(f"float8={'on (' + args.float8_recipe + ')' if args.float8 else 'off'}  "
+              f"compile={plan['compile_note']}")
         if train_eps is not None:
             print(f"train episodes: {len(train_eps)}  held-out eval episodes: "
                   f"{len(eval_eps or [])}")
