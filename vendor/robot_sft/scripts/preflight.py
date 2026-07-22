@@ -87,26 +87,26 @@ def _flag(cmd: str, flag: str) -> str | None:
     return m.group(1).strip("'\"") if m else None
 
 
-def _feature_precheck(cmd: str) -> bool:
-    """True = OK to proceed. On a definitive camera mismatch, print the fix and return False.
-    An unreadable-config ('unknown') does NOT gate — we don't block a run on a network miss."""
+def _feature_precheck(cmd: str) -> str | None:
+    """Return the command to smoke-test (a --rename_map auto-added if a camera mismatch is found),
+    or None to gate. A --rename_map already present means lerobot skips validation — nothing to
+    catch. An unreadable-config ('unknown') does NOT gate (don't block a run on a network miss)."""
+    if _flag(cmd, "rename_map") is not None:
+        return cmd
     policy_path = _flag(cmd, "policy.path")
-    if not policy_path:
-        return True  # --policy.type trains from scratch; no camera constraint
     repo_id = _flag(cmd, "dataset.repo_id")
-    if not repo_id:
-        return True
+    if not policy_path or not repo_id:
+        return cmd  # --policy.type (from scratch) or no dataset id -> no camera constraint
     r = check_features.check(repo_id, _flag(cmd, "dataset.root"), policy_path, _flag(cmd, "policy.type"))
-    if r["status"] == "mismatch":
-        print("\n[preflight] ✗ CAMERA MISMATCH — the training WILL crash in make_policy. "
-              "Fixed BEFORE launching (saved a slow model load):")
-        print(f"  dataset has : {r['provided']}")
-        print(f"  policy wants: {r['expected']}")
-        print("\nFIX:\n" + r["fix"] + "\n")
-        return False
+    if r["status"] == "mismatch" and r.get("rename_map"):
+        rename_flag = f"--rename_map='{json.dumps(r['rename_map'])}'"
+        print(f"[preflight] camera mismatch (dataset {r['provided']} vs checkpoint {r['expected']}) "
+              f"auto-fixed: added {rename_flag}"
+              + (f"; {r['padded_cameras']} auto-pad black." if r.get("padded_cameras") else "."))
+        return cmd + " " + rename_flag
     if r["status"] == "unknown":
         print(f"[preflight] camera pre-check skipped ({r.get('detail')}).")
-    return True
+    return cmd
 
 
 def smoke_command(cmd: str, real_output_dir: str, tmp_dir: str, steps: int) -> str:
@@ -157,11 +157,13 @@ def main() -> None:
         cmd = _override_flag(cmd, "float8_recipe", recipe)
         print("[preflight] fp8 (float8) training ENABLED for the smoke run")
 
-    # Fast camera-key pre-check BEFORE the heavy smoke run. Finetuning a pretrained VLA
-    # (--policy.path) whose cameras differ from the dataset crashes deep in make_policy after a
-    # slow model load; catch it here in a second from the two config JSONs (no torch, no weights).
-    if not _feature_precheck(cmd):
-        sys.exit(2)   # gate: non-zero so the agent/watchdog does NOT launch the doomed run
+    # Fast camera-key pre-check BEFORE the heavy smoke run: finetuning a pretrained VLA
+    # (--policy.path) whose cameras differ from the dataset would crash deep in make_policy after
+    # a slow model load. Auto-adds a --rename_map (1s, from the two config JSONs) so the smoke run
+    # uses the same fixed command the real run will.
+    cmd = _feature_precheck(cmd)
+    if cmd is None:
+        sys.exit(2)
 
     tmp_root = tempfile.mkdtemp(prefix="robot_sft_preflight_")
     # lerobot-train refuses a pre-existing output_dir; give it a fresh subdir.

@@ -307,25 +307,26 @@ def main() -> None:
                                   f"{args.gpus} $(which lerobot-train) ...` with the same flags; "
                                   "batch_size is per process")
 
-    # Camera pre-check when finetuning a pretrained VLA: a mismatch between the checkpoint's
-    # cameras and the dataset's crashes lerobot deep in make_policy. Catch it now (from the two
-    # config JSONs) instead of handing back a command that will fail — preflight re-checks too.
+    # Camera pre-check when finetuning a pretrained VLA. If the dataset's cameras don't match the
+    # checkpoint's, AUTO-ADD a --rename_map so the finetune just works (pretrained weights kept;
+    # any leftover checkpoint camera auto-pads black at runtime) — instead of handing back a
+    # command that crashes in make_policy. preflight re-checks. (Read from two config JSONs.)
     if args.policy_path:
         import sys as _sys
 
         _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import check_features
         fc = check_features.check(args.dataset_repo_id, args.dataset_root, args.policy_path, args.policy_type)
-        if fc["status"] == "mismatch":
-            print("\n✗ CAMERA MISMATCH — this dataset and checkpoint don't fit; the training "
-                  "would crash in make_policy.", file=_sys.stderr)
-            print(f"  dataset has : {fc['provided']}\n  policy wants: {fc['expected']}", file=_sys.stderr)
-            print("\nFIX:\n" + fc["fix"], file=_sys.stderr)
-            plan["feature_mismatch"] = fc   # recorded so the agent/UI can surface it
-            if args.out:
-                with open(args.out, "w") as f:
-                    json.dump(plan, f, indent=2)
-            _sys.exit(2)
+        if fc["status"] == "mismatch" and fc.get("rename_map"):
+            rename_flag = f"--rename_map='{json.dumps(fc['rename_map'])}'"
+            cmd = cmd + " \\\n  " + rename_flag
+            plan["launch_command"] = cmd
+            plan["camera_rename_map"] = fc["rename_map"]
+            plan["camera_padded"] = fc.get("padded_cameras")
+            print(f"\n⚠ camera mismatch (dataset {fc['provided']} vs checkpoint {fc['expected']}) "
+                  f"auto-fixed: added {rename_flag}"
+                  + (f"; {fc['padded_cameras']} auto-pad black." if fc.get("padded_cameras") else "."),
+                  file=_sys.stderr)
 
     if args.out:
         with open(args.out, "w") as f:

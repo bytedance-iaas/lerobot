@@ -115,6 +115,14 @@ def _image_keys(features: dict | None) -> set[str]:
     return {k for k in features if k.startswith(IMG_PREFIX) and "empty_camera" not in k}
 
 
+def _pair(provided: set[str], expected: set[str]) -> dict[str, str]:
+    """{dataset_key -> checkpoint_key} rename, by sorted order. pi0/pi05 have NO per-camera slot
+    embedding (each image goes through the same SigLIP, torch.cat'd into the prefix), so WHICH
+    real camera takes which checkpoint name is arbitrary — a deterministic pairing is enough.
+    Any checkpoint camera left over is auto-padded (black, attention-masked) at runtime."""
+    return dict(zip(sorted(provided), sorted(expected)))
+
+
 def check(dataset_repo_id: str, dataset_root: str | None,
           policy_path: str | None, policy_type: str | None = None) -> dict:
     """Compare dataset cameras vs the pretrained policy's. Returns a verdict dict:
@@ -137,25 +145,21 @@ def check(dataset_repo_id: str, dataset_root: str | None,
 
     if not missing:  # lerobot's rule: the policy's cameras must be a SUBSET of the dataset's.
         return {"status": "ok", "ok": True, "provided": sorted(provided),
-                "expected": sorted(expected), "fix": None}
+                "expected": sorted(expected), "fix": None, "rename_map": None}
 
-    can_rename = len(expected) <= len(provided)   # enough dataset cameras to map onto expected
-    if can_rename:
-        # 1:1 pairing is a judgment call (which real camera is "base" vs "wrist"?), so emit a
-        # template the agent/user fills — but with both lists so the pairing is obvious.
-        pairs = ", ".join(f'"{d}": "{e}"' for d, e in zip(sorted(provided), sorted(expected)))
-        fix = ("Add a --rename_map mapping your dataset cameras to the ones the checkpoint expects "
-               "(VERIFY the pairing matches the physical camera!):\n"
-               f"  --rename_map='{{{pairs}}}'")
-    else:
-        fam = policy_type or (policy_path.rstrip('/').split('/')[-1].replace('_base', '') or 'pi05')
-        fix = (f"This checkpoint needs {len(expected)} cameras but the dataset has {len(provided)} — "
-               "a rename can't invent the missing one. Train from scratch instead of finetuning:\n"
-               f"  replace  --policy.path={policy_path}  with  --policy.type={fam}\n"
-               "(it builds the policy around YOUR dataset's cameras; you lose the pretrained init).")
+    # ---- mismatch: finetune keeps working with a rename; extra cameras auto-pad ------------
+    # A rename_map both (a) aligns the dataset's camera names to the checkpoint's, and (b) makes
+    # lerobot SKIP visual-feature validation (factory.py:650). Any checkpoint camera the dataset
+    # doesn't cover is auto-fed a black, attention-masked image at runtime (modeling_pi05.py:1207),
+    # so the pretrained weights are kept. (Only hard rule: >=1 real camera — satisfied.)
+    rename = _pair(provided, expected)                       # {dataset_key: checkpoint_key}
+    padded = sorted(set(expected) - set(rename.values()))    # leftover -> auto-padded black
+    rename_json = "{" + ", ".join(f'"{d}": "{e}"' for d, e in sorted(rename.items())) + "}"
+    fix = (f"--rename_map='{rename_json}'"
+           + (f"   (checkpoint cameras {padded} auto-pad black)" if padded else ""))
     return {"status": "mismatch", "ok": False, "provided": sorted(provided),
             "expected": sorted(expected), "missing": missing, "extra": extra,
-            "can_rename": can_rename, "fix": fix}
+            "rename_map": rename, "padded_cameras": padded, "fix": fix}
 
 
 def main() -> int:

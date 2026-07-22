@@ -239,15 +239,18 @@ preflight is green (or the user accepts the risk).
 
 **Camera pre-check (finetuning a pretrained VLA).** When `--policy.path` is a pretrained
 checkpoint (`lerobot/pi05_base`, `pi0_base`, `smolvla_base`, …), both `plan_training.py`
-and `preflight.py` FIRST run `scripts/check_features.py` — a 1-second static compare of the
-dataset's `observation.images.*` keys vs the checkpoint's expected ones (two small JSONs, no
-torch, no weights). A mismatch (e.g. the checkpoint wants DROID's `base_0_rgb /
-left_wrist_0_rgb / right_wrist_0_rgb` but the dataset has `front / wrist`) exits **2** with the
-fix, instead of crashing deep in `make_policy` after a slow model load:
-- fewer/equal cameras, just renamed → a `--rename_map` (verify the physical-camera pairing);
-- **more** cameras than the dataset has (can't rename one in) → train from scratch:
-  `--policy.type=<family>` instead of `--policy.path=<checkpoint>`.
-Run it standalone too: `python scripts/check_features.py --dataset-repo-id <id> --policy-path <ckpt>`.
+and `preflight.py` run `scripts/check_features.py` — a 1-second static compare of the dataset's
+`observation.images.*` keys vs the checkpoint's expected ones (two small JSONs, no torch, no
+weights). On a mismatch (e.g. checkpoint wants DROID's `base_0_rgb / left_wrist_0_rgb /
+right_wrist_0_rgb` but the dataset has `front / wrist`) they **auto-add a `--rename_map`** so the
+finetune just works, instead of crashing deep in `make_policy` after a slow model load:
+- the dataset's cameras are renamed onto the checkpoint's (sorted order — pi0/pi05 have no
+  per-camera slot embedding, so the pairing is arbitrary; the rename is saved with the
+  preprocessor for eval);
+- any checkpoint camera the dataset doesn't cover is auto-fed a black, attention-masked image at
+  runtime (`modeling_pi05.py`), so the **pretrained weights are kept** — no need to train from
+  scratch. A `--rename_map` also makes lerobot skip visual-feature validation (`factory.py:650`).
+Run standalone: `python scripts/check_features.py --dataset-repo-id <id> --policy-path <ckpt>`.
 
 **⚠️ PITFALL: argparse prefix-matching `--out` → `--output-dir`.** `plan_training.py`
 accepts `--output-dir` (for checkpoint storage) but NOT a bare `--out` (it was only added
