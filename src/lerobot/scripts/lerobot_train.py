@@ -361,14 +361,6 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             **processor_kwargs,
         )
 
-    # fp8 (float8) training: swap eligible nn.Linear layers to torchao Float8Linear. Must run
-    # AFTER the policy is built + frozen/PEFT-wrapped (so requires_grad is final) and BEFORE
-    # the optimizer is created below (it must capture the swapped params) and before prepare().
-    if getattr(cfg, "use_float8", False):
-        from lerobot.optim import apply_float8_training
-
-        apply_float8_training(policy, recipe=cfg.float8_recipe)
-
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
