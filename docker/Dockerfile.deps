@@ -119,6 +119,8 @@ RUN uv sync --locked --extra all --no-install-project --no-cache
 #    AND TORCH_CUDA_ARCH_LIST=9.0 — the CI builder has NO GPU, and without a pinned arch TE's build
 #    probes the (absent) device and fails at config in ~5s; TORCH_CUDA_ARCH_LIST is what torch's
 #    CUDA-extension build reads, so this makes the compile GPU-free. MAX_JOBS=8 parallelises it.
+#  - onnxscript: TE 2.14's `transformer_engine.pytorch.__init__` hard-imports it (via onnx_extensions),
+#    and it is NOT pulled in by TE's deps, so `import transformer_engine.pytorch` fails without it.
 #  - cudart bridge: TE's runtime loader looks for nvidia/cuda_cudart/ but torch installs
 #    nvidia/cuda_runtime/ — a symlink fixes the "cudart shared object not found" import error.
 #
@@ -153,15 +155,17 @@ RUN set -eux; \
     NVTE_FRAMEWORK=pytorch NVTE_PYTORCH_FORCE_BUILD=TRUE NVTE_CUDA_ARCHS=90 TORCH_CUDA_ARCH_LIST="9.0" MAX_JOBS=8 \
       uv pip install --python "$PY" --default-index "$TE_PIP_INDEX" --no-cache --no-deps --no-build-isolation \
         --no-binary transformer-engine-torch "transformer-engine-torch==${TE_VERSION}"; \
+    uv pip install --python "$PY" --default-index "$TE_PIP_INDEX" --no-cache onnxscript; \
     ln -sfn cuda_runtime "$NV/cuda_cudart"
 
 # KEEP the nvcc toolkit + assembled CUDA_HOME in the image (do NOT delete after the TE build) so the
-# dev pod is a full CUDA build environment — nvcc on PATH, headers/libs assembled — for rebuilding
-# or experimenting with TransformerEngine in-pod. Costs a few hundred MB; acceptable for these
-# dev/console images. TE itself does not need this at runtime (it loads CUDA libs from torch's
-# nvidia/* dirs), so a lean variant could re-add the `rm -rf` above.
-ENV CUDA_HOME=/home/user_lerobot/cuda-home \
-    CUDNN_PATH=/home/user_lerobot/cuda-home \
-    PATH=/home/user_lerobot/cuda-home/bin:/lerobot/.venv/bin:$PATH
+# dev pod is a full CUDA build environment for rebuilding/experimenting with TE in-pod. Costs a few
+# hundred MB; acceptable for these dev/console images.
+# Put nvcc on PATH, but DELIBERATELY do NOT set CUDA_HOME/CUDNN_PATH at runtime: TE's runtime library
+# loader changes behavior when CUDA_HOME is set and then fails to open libcublas/libcudnn (it works
+# by loading them from torch's own nvidia/* dirs when CUDA_HOME is unset). nvcc self-locates its
+# toolkit relative to its own path, so it works without CUDA_HOME; for an in-pod TE REBUILD, export
+# CUDA_HOME=/home/user_lerobot/cuda-home explicitly (as docker/Dockerfile.deps itself does).
+ENV PATH=/home/user_lerobot/cuda-home/bin:/lerobot/.venv/bin:$PATH
 
 CMD ["/bin/bash"]
