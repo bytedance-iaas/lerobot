@@ -15,7 +15,7 @@
 #     --build-arg CONSOLE_COMMIT=$(git rev-parse HEAD) \
 #     --output type=image,name=<registry>/lerobot-agent-console:<tag>,push=true,compression=gzip,oci-mediatypes=true \
 #     .
-ARG BASE_IMAGE=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot:7532b0585bf9cb80c8200b9ce39466b9a1293a92
+ARG BASE_IMAGE=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot:7194f8f409ff489915a9c0fd7cb77948695f4b38
 FROM ${BASE_IMAGE}
 
 # lerobot's Dockerfile.user ends with `USER user_lerobot` (non-root). The build
@@ -61,6 +61,14 @@ RUN cd /tmp \
     && oniond help >/dev/null 2>&1 || true
 # Default bucket for oniond list/download (override at runtime with -e BUCKET=...).
 ENV BUCKET=ai-infra
+
+# HF caches on the /opt/data PVC (the deps image defaults them to /home/user_lerobot/.cache,
+# which is EPHEMERAL — so models like pi05_base re-download on every pod restart). Point them at
+# the persistent volume so a downloaded model/checkpoint survives rollouts. HF_HUB_CACHE points
+# directly at the existing models--* layout (no /hub/ subdir). HF_LEROBOT_HOME=/lerobot per convention.
+ENV HF_HOME=/opt/data/.cache/huggingface \
+    HF_HUB_CACHE=/opt/data/.cache/huggingface \
+    HF_LEROBOT_HOME=/lerobot
 
 # --- slim hermes in an isolated venv (its pins would clash with lerobot/torch) ---
 # Installed from PyPI mirrors — NO GitHub, so the CN build pool doesn't need
