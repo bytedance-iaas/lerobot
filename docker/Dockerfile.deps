@@ -107,9 +107,10 @@ RUN uv sync --locked --extra all --no-install-project --no-cache
 #    (libcublas.so.13, incompatible with torch's cu128); --no-deps blocks that. The meta is also
 #    installed (--no-deps) or TE's pypi sanity-check aborts; all three dists must be the same version.
 #  - bindings: compiled from the transformer-engine-torch sdist (--no-binary) against torch 2.11 +
-#    the cu12 core, so they link torch's libcublas.so.12. NVTE_CUDA_ARCHS=90 = Hopper (H20).
-#    MAX_JOBS=1 (serial compile) — TE's CUDA/C++ units are memory-hungry and the buildkit CI runner
-#    has far less RAM than a GPU node; parallel jobs OOM-killed the build. Slower but reliable.
+#    the cu12 core, so they link torch's libcublas.so.12. Target Hopper (H20): NVTE_CUDA_ARCHS=90
+#    AND TORCH_CUDA_ARCH_LIST=9.0 — the CI builder has NO GPU, and without a pinned arch TE's build
+#    probes the (absent) device and fails at config in ~5s; TORCH_CUDA_ARCH_LIST is what torch's
+#    CUDA-extension build reads, so this makes the compile GPU-free. MAX_JOBS=1 keeps peak RAM low.
 #  - cudart bridge: TE's runtime loader looks for nvidia/cuda_cudart/ but torch installs
 #    nvidia/cuda_runtime/ — a symlink fixes the "cudart shared object not found" import error.
 #
@@ -140,7 +141,7 @@ RUN set -eux; \
     uv pip install --python "$PY" --default-index "$TE_PIP_INDEX" --no-cache "setuptools>=61" wheel pybind11 cmake ninja; \
     uv pip install --python "$PY" --default-index "$TE_PIP_INDEX" --no-cache --no-deps \
         "transformer-engine-cu12==${TE_VERSION}" "transformer-engine==${TE_VERSION}"; \
-    NVTE_FRAMEWORK=pytorch NVTE_CUDA_ARCHS=90 MAX_JOBS=1 \
+    NVTE_FRAMEWORK=pytorch NVTE_CUDA_ARCHS=90 TORCH_CUDA_ARCH_LIST="9.0" MAX_JOBS=1 \
       uv pip install --python "$PY" --default-index "$TE_PIP_INDEX" --no-cache --no-deps --no-build-isolation \
         --no-binary transformer-engine-torch "transformer-engine-torch==${TE_VERSION}"; \
     ln -sfn cuda_runtime "$NV/cuda_cudart"; \
