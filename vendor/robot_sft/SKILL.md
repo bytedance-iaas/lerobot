@@ -224,11 +224,14 @@ Run `python scripts/check_hardware.py` and `python scripts/plan_training.py`. Th
     kernel search warms up 10+ min (and uses more GPU memory), while reduce-overhead compiles in
     ~a minute. Use `--compile-mode max-autotune` on a long run. **preflight strips compile** so the
     2-step smoke isn't swamped by warm-up.
-  - **fp8 training — TEMPORARILY DISABLED.** The old torchao float8 path was removed from lerobot
-    (benchmarks showed bf16-no-compile was actually fastest, and fp8 used more memory). fp8 is being
-    reworked onto **NVIDIA TransformerEngine, scoped to pi0/pi05**. Until that lands, **`--float8`
-    (in both `plan_training.py` and `preflight.py`) ERRORS out** instead of emitting dead flags —
-    train in plain bf16. See `references/policy_selection.md`.
+  - **fp8 training (pi0/pi05 via TransformerEngine):** add **`--float8`** to `plan_training.py` for
+    a **pi0/pi05** policy on a **Hopper/Ada GPU (H20/H100, sm_89/90+)** — it appends
+    `--policy.vlm_mlp_fp8_enable=true --policy.dtype=bfloat16 --policy.vlm_mlp_fp8_recipe_kind=delayed_scaling`,
+    fusing each VLM MLP into a fp8 `te.LayerNormMLP`. **Errors for non-pi0/pi05** policies and needs
+    the **TE-enabled lerobot image**. `--float8-recipe delayed_scaling|float8_block_scaling`. NOT on
+    older GPUs (TE errors at runtime), so only pass it when `check_hardware` reports an H20/Hopper.
+    preflight inherits it from the plan (`--session`). fp8 is mainly a **memory** lever — re-benchmark
+    before assuming a speedup. See `references/policy_selection.md`.
     **⚠️ Do NOT pass `--out` — argparse prefix-matches it to `--output-dir`, silently overriding
     the output-dir you set. Redirect stdout with `> file` instead.**
 - Checks **GPU count + free memory** (pick idle GPUs), **disk space** for checkpoints

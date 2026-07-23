@@ -134,17 +134,13 @@ def main() -> None:
     ap.add_argument("--mem-frac", type=float, default=0.85,
                     help="target fraction of GPU memory to fill when suggesting a bigger batch")
     ap.add_argument("--float8", action="store_true",
-                    help="TEMPORARILY DISABLED (torchao removed; TransformerEngine port pending). "
-                         "Passing --float8 now errors; smoke-test in bf16.")
-    ap.add_argument("--float8-recipe", default="rowwise",
-                    help="(unused — fp8 temporarily disabled)")
+                    help="ensure the smoke run uses TransformerEngine fp8 "
+                         "(--policy.vlm_mlp_fp8_enable=true --policy.dtype=bfloat16). Normally "
+                         "inherited from the launch command; use this to force it for a standalone "
+                         "--command. pi0/pi05 + Hopper/Ada GPU only.")
+    ap.add_argument("--float8-recipe", default="delayed_scaling",
+                    choices=["delayed_scaling", "float8_block_scaling"])
     args = ap.parse_args()
-
-    if args.float8:
-        print("error: --float8 is temporarily disabled (torchao fp8 removed from lerobot; the "
-              "TransformerEngine replacement is not wired up yet). Smoke-test in bf16.",
-              file=sys.stderr)
-        sys.exit(2)
 
     plan = None
     if args.session:
@@ -154,6 +150,16 @@ def main() -> None:
         cmd, real_out = args.command, args.output_dir or ""
     else:
         ap.error("provide --session or --command")
+
+    # TE fp8 is normally already in the launch command (plan_training --float8). The --session path
+    # inherits it automatically; only override_flag-inject when explicitly asked (idempotent), so a
+    # standalone --command run smoke-tests the SAME fp8 config the real run will use.
+    if args.float8 or (plan and plan.get("float8")):
+        recipe = (plan.get("float8_recipe") if plan else None) or args.float8_recipe
+        cmd = _override_flag(cmd, "policy.dtype", "bfloat16")
+        cmd = _override_flag(cmd, "policy.vlm_mlp_fp8_enable", "true")
+        cmd = _override_flag(cmd, "policy.vlm_mlp_fp8_recipe_kind", recipe)
+        print("[preflight] TransformerEngine fp8 training ENABLED for the smoke run")
 
     # Fast camera-key pre-check BEFORE the heavy smoke run: finetuning a pretrained VLA
     # (--policy.path) whose cameras differ from the dataset would crash deep in make_policy after

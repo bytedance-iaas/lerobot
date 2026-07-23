@@ -167,12 +167,17 @@ def main() -> None:
                     help="command runner: 'uv' → 'uv run lerobot-train', "
                          "'python-module' → 'python -u -m lerobot.scripts.lerobot_train'")
     ap.add_argument("--float8", action="store_true",
-                    help="TEMPORARILY DISABLED. fp8 training is being reworked from torchao onto "
-                         "NVIDIA TransformerEngine (pi0/pi05 only). The old torchao path was "
-                         "removed from lerobot; passing --float8 now ERRORS instead of emitting "
-                         "dead flags. Train in bf16 until the TE path lands.")
-    ap.add_argument("--float8-recipe", default="rowwise",
-                    help="(unused — fp8 temporarily disabled, see --float8)")
+                    help="fp8 training via NVIDIA TransformerEngine (te.LayerNormMLP) for the VLM "
+                         "MLP layers. pi0/pi05 ONLY — appends --policy.vlm_mlp_fp8_enable=true "
+                         "--policy.dtype=bfloat16. HOPPER/ADA GPUs ONLY (H20/H100, sm_89/90+); on "
+                         "older cards TE errors at runtime, so only pass it when check_hardware "
+                         "reports an H20/Hopper. Needs the TE-enabled lerobot image. Errors for "
+                         "non-pi0/pi05 policies. See references/policy_selection.md.")
+    ap.add_argument("--float8-recipe", default="delayed_scaling",
+                    choices=["delayed_scaling", "float8_block_scaling"],
+                    help="TE fp8 recipe → --policy.vlm_mlp_fp8_recipe_kind. delayed_scaling "
+                         "(default): per-tensor, 16-step amax history. float8_block_scaling: "
+                         "block-wise (1D acts/grads, 2D weights).")
     ap.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False,
                     help="torch.compile the policy (--policy.compile_model=true). Default OFF: "
                          "MEASURED on pi05/H20 it gave NO steady-state speedup (1.61 vs 1.54 s/step) "
@@ -279,23 +284,31 @@ def main() -> None:
     parts.append(f"--log_freq={args.log_freq}")
     parts.append("--env_eval_freq=0")        # eval is out-of-band (eval_watcher on held-out episodes); flag is env_eval_freq, NOT eval_freq
     parts.append("--wandb.enable=false")
-    if args.float8:
-        import sys as _sys
-        print("error: --float8 is temporarily disabled. The torchao fp8 path was removed from "
-              "lerobot and the TransformerEngine replacement (pi0/pi05) is not wired up yet. "
-              "Re-run without --float8 (bf16).", file=_sys.stderr)
-        _sys.exit(2)
 
-    # torch.compile — ON by default. It's what makes fp8 a real speedup (fuses the quant/dequant
-    # around the fp8 GEMMs) and helps bf16 too. Only pi0/pi05/pi0_fast/smolvla/diffusion expose a
-    # `compile_model` config field; passing it to others (ACT, …) would be an unknown-flag error,
-    # so gate on the policy family (from --policy-type, or the checkpoint config's `type`).
+    # Resolve the policy family (from --policy-type, or the checkpoint config's `type`) once — used
+    # to gate both --float8 (pi0/pi05 only) and --compile (compile-capable policies only).
     import sys as _sys
     compile_family = args.policy_type
     if not compile_family and args.policy_path:
         _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import check_features as _cf
         compile_family = (_cf.policy_config(args.policy_path) or {}).get("type")
+
+    # fp8 via TransformerEngine — pi0/pi05 ONLY (the only policies with the te.LayerNormMLP VLM-MLP
+    # config fields). fp8 composes with bf16 autocast (master weights stay bf16), so set dtype too.
+    # Needs a Hopper/Ada GPU at runtime + the TE-enabled lerobot image.
+    if args.float8:
+        if compile_family not in ("pi0", "pi05"):
+            print(f"error: --float8 (TransformerEngine fp8) is only supported for pi0/pi05, not "
+                  f"'{compile_family or 'unknown'}'. Re-run without --float8 (bf16).", file=_sys.stderr)
+            _sys.exit(2)
+        parts.append("--policy.dtype=bfloat16")
+        parts.append("--policy.vlm_mlp_fp8_enable=true")
+        parts.append(f"--policy.vlm_mlp_fp8_recipe_kind={args.float8_recipe}")
+
+    # torch.compile — OFF by default (MEASURED no steady-state speedup on pi05/H20, ~5 min warmup).
+    # Only pi0/pi05/pi0_fast/smolvla/diffusion expose a `compile_model` config field; passing it to
+    # others (ACT, …) would be an unknown-flag error, so gate on the policy family.
     compile_supported = compile_family in _COMPILE_POLICIES
     compile_on = args.compile and compile_supported
     if compile_on:
@@ -322,8 +335,8 @@ def main() -> None:
         "eval_cadence_note": eval_cadence_note,
         "output_dir": out_dir,
         "repo": args.repo,
-        "float8": False,  # fp8 temporarily disabled (torchao removed; TE port pending) — --float8 exits early
-        "float8_recipe": None,
+        "float8": args.float8,  # TE fp8 (te.LayerNormMLP) for pi0/pi05 VLM MLP
+        "float8_recipe": args.float8_recipe if args.float8 else None,
         "compile": compile_on,
         "compile_note": ("on" if compile_on
                          else f"off — policy '{compile_family}' can't compile" if args.compile
@@ -380,7 +393,8 @@ def main() -> None:
         print(f"save_freq={save_freq}  log_freq={args.log_freq}  (checkpoints keep full "
               f"training state -> always resumable)")
         print(f"num_workers={num_workers}  ({workers_note})")
-        print(f"compile={plan['compile_note']}")
+        print(f"fp8(TE)={'on (' + args.float8_recipe + ')' if args.float8 else 'off'}  "
+              f"compile={plan['compile_note']}")
         if train_eps is not None:
             print(f"train episodes: {len(train_eps)}  held-out eval episodes: "
                   f"{len(eval_eps or [])}")

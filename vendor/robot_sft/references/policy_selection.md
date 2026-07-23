@@ -66,15 +66,27 @@ User wants to train on a robot dataset
 - PaliGemma tokenizer (`google/paligemma-3b-pt-224`) is gated — must accept license on HF
 - `hf auth login --token` has shell glob issues with `***` — use `export HF_TOKEN=...` instead
 
-### fp8 (float8) training — TEMPORARILY DISABLED
+### fp8 (float8) training — pi0/pi05 via TransformerEngine
 
-fp8 is being reworked. The old **torchao** path (`--use_float8=true --float8_recipe=rowwise`)
-was **removed from lerobot** and no longer exists — an online benchmark on pi05/H20 showed
-plain **bf16 without compile was actually the fastest** (1.54 s/step steady, ~67 GB), while
-torchao fp8 was *slower* and used *more* memory. Don't pass `--use_float8`; the flag is gone.
+fp8 uses **NVIDIA TransformerEngine**: each VLM (PaliGemma) layer's
+`post_attention_layernorm` + gate/up/down MLP is fused into one `te.LayerNormMLP`
+(RMSNorm + FC1 geglu + FC2 in fp8). **pi0/pi05 only** (the only policies with the
+config fields); the action expert stays bf16. Enable via `plan_training.py --float8`,
+which appends:
 
-The replacement uses **NVIDIA TransformerEngine** (`te.LayerNormMLP` with delayed-scaling
-HYBRID fp8 on the Gemma FFN layers), **scoped to pi0/pi05 only**. It is not wired into lerobot
-yet, so for now `plan_training.py --float8` and `preflight.py --float8` **error out on purpose**
-rather than emit dead flags. **Train in plain bf16** until the TE path lands and this section is
-rewritten with the real `--policy.vlm_mlp_fp8_enable=true` flags.
+```
+--policy.vlm_mlp_fp8_enable=true --policy.dtype=bfloat16 \
+--policy.vlm_mlp_fp8_recipe_kind=delayed_scaling
+```
+
+- **Recipe** (`--float8-recipe`): `delayed_scaling` (default, per-tensor 16-step amax
+  history, HYBRID E4M3 fwd/E5M2 bwd) or `float8_block_scaling` (block-wise).
+- **Hopper/Ada GPU only** — needs fp8 tensor cores: H20 / H100 / L40S (sm_89/90+).
+  On older cards TE errors at runtime, so only pass `--float8` when `check_hardware`
+  reports an H20/Hopper. plan_training also **errors if the policy isn't pi0/pi05**.
+- **Needs the TE-enabled lerobot image** (TransformerEngine baked into the deps image).
+- fp8 composes with bf16 autocast — master weights stay bf16 (`--policy.dtype=bfloat16`).
+- The old **torchao** path (`--use_float8`) was removed; don't use it.
+- Note: an earlier pi05/H20 benchmark found plain bf16-no-compile was fastest for the
+  torchao path — re-benchmark this TE path before assuming a speedup; treat fp8 as
+  primarily a **memory** lever.
