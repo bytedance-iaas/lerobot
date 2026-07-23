@@ -106,11 +106,18 @@ RUN uv sync --locked --extra all --no-install-project --no-cache
 #  - core: the PREBUILT cu12 wheel with --no-deps. TE's meta/bindings hard-depend on the cu13 core
 #    (libcublas.so.13, incompatible with torch's cu128); --no-deps blocks that. The meta is also
 #    installed (--no-deps) or TE's pypi sanity-check aborts; all three dists must be the same version.
+#  - cccl: nvidia-cuda-cccl-cu12 (CUB/Thrust/libcu++ headers, incl. <nv/target> that cuda_fp16.h
+#    pulls in) is NOT a torch dependency, so a fresh venv lacks it and the TE compile fails with
+#    "nv/target: No such file or directory". Install it BEFORE assembling CUDA_HOME so the header
+#    merge picks it up.
 #  - bindings: compiled from the transformer-engine-torch sdist (--no-binary) against torch 2.11 +
-#    the cu12 core, so they link torch's libcublas.so.12. Target Hopper (H20): NVTE_CUDA_ARCHS=90
+#    the cu12 core, so they link torch's libcublas.so.12. NVTE_PYTORCH_FORCE_BUILD=TRUE is REQUIRED:
+#    the sdist's bdist_wheel first tries to download a prebuilt wheel from GitHub releases, which is
+#    unreachable from the CN builder (intermittent "Remote end closed") — FORCE_BUILD skips that and
+#    always compiles from source. Target Hopper (H20): NVTE_CUDA_ARCHS=90
 #    AND TORCH_CUDA_ARCH_LIST=9.0 — the CI builder has NO GPU, and without a pinned arch TE's build
 #    probes the (absent) device and fails at config in ~5s; TORCH_CUDA_ARCH_LIST is what torch's
-#    CUDA-extension build reads, so this makes the compile GPU-free. MAX_JOBS=1 keeps peak RAM low.
+#    CUDA-extension build reads, so this makes the compile GPU-free. MAX_JOBS=8 parallelises it.
 #  - cudart bridge: TE's runtime loader looks for nvidia/cuda_cudart/ but torch installs
 #    nvidia/cuda_runtime/ — a symlink fixes the "cudart shared object not found" import error.
 #
@@ -129,6 +136,8 @@ RUN set -eux; \
     NV=$VENV/lib/python3.12/site-packages/nvidia; \
     TK=$HOME/cuda-nvcc; CUDA_HOME=$HOME/cuda-home; \
     export CUDA_HOME CUDNN_PATH=$CUDA_HOME PATH=$CUDA_HOME/bin:$PATH; \
+    uv pip install --python "$PY" --default-index "$TE_PIP_INDEX" --no-cache \
+        "nvidia-cuda-cccl-cu12~=12.8.0" "setuptools>=61" wheel pybind11 cmake ninja; \
     curl -fSL --retry 3 "$CUDA_NVCC_TAR" -o /tmp/nvcc.tar.xz; \
     mkdir -p "$TK"; tar -xf /tmp/nvcc.tar.xz -C "$TK" --strip-components=1; rm /tmp/nvcc.tar.xz; \
     mkdir -p "$CUDA_HOME/bin" "$CUDA_HOME/include" "$CUDA_HOME/lib64"; \
@@ -138,10 +147,9 @@ RUN set -eux; \
     for d in "$NV"/*/include; do cp -asfn "$d/." "$CUDA_HOME/include/" 2>/dev/null || true; done; \
     for d in "$NV"/*/lib; do for so in "$d"/*.so*; do [ -e "$so" ] && ln -sf "$so" "$CUDA_HOME/lib64/" || true; done; done; \
     nvcc --version | tail -1; \
-    uv pip install --python "$PY" --default-index "$TE_PIP_INDEX" --no-cache "setuptools>=61" wheel pybind11 cmake ninja; \
     uv pip install --python "$PY" --default-index "$TE_PIP_INDEX" --no-cache --no-deps \
         "transformer-engine-cu12==${TE_VERSION}" "transformer-engine==${TE_VERSION}"; \
-    NVTE_FRAMEWORK=pytorch NVTE_CUDA_ARCHS=90 TORCH_CUDA_ARCH_LIST="9.0" MAX_JOBS=1 \
+    NVTE_FRAMEWORK=pytorch NVTE_PYTORCH_FORCE_BUILD=TRUE NVTE_CUDA_ARCHS=90 TORCH_CUDA_ARCH_LIST="9.0" MAX_JOBS=8 \
       uv pip install --python "$PY" --default-index "$TE_PIP_INDEX" --no-cache --no-deps --no-build-isolation \
         --no-binary transformer-engine-torch "transformer-engine-torch==${TE_VERSION}"; \
     ln -sfn cuda_runtime "$NV/cuda_cudart"; \
