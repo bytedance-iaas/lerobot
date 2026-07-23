@@ -63,11 +63,12 @@ RUN cd /tmp \
 ENV BUCKET=ai-infra
 
 # HF caches on the /opt/data PVC (the deps image defaults them to /home/user_lerobot/.cache,
-# which is EPHEMERAL — so models like pi05_base re-download on every pod restart). Point them at
-# the persistent volume so a downloaded model/checkpoint survives rollouts. HF_HUB_CACHE points
-# directly at the existing models--* layout (no /hub/ subdir). HF_LEROBOT_HOME=/lerobot per convention.
+# which is EPHEMERAL — so models like pi05_base re-download on every pod restart). Point HF_HOME at
+# the persistent volume so a downloaded model/checkpoint survives rollouts. Do NOT set HF_HUB_CACHE
+# explicitly — let it default to $HF_HOME/hub (the STANDARD models--* layout, where the gated
+# paligemma-3b-pt-224 tokenizer lives); an explicit non-/hub override makes HF miss cached repos and
+# try to re-download them (gated → 403). HF_LEROBOT_HOME=/lerobot per convention.
 ENV HF_HOME=/opt/data/.cache/huggingface \
-    HF_HUB_CACHE=/opt/data/.cache/huggingface \
     HF_LEROBOT_HOME=/lerobot
 
 # --- slim hermes in an isolated venv (its pins would clash with lerobot/torch) ---
