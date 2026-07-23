@@ -25,8 +25,6 @@
     title: Human In the Loop Data Collection
   - local: peft_training
     title: Training with PEFT (e.g., LoRA)
-  - local: fp8_training
-    title: fp8 (float8) training with torchao
   - local: rename_map
     title: Using Rename Map and Empty Cameras
   title: "Tutorials"

@@ -26,10 +26,6 @@ from .optimizers import (
     load_optimizer_state,
     save_optimizer_state,
 )
-from .float8 import (
-    apply_float8_training as apply_float8_training,
-    is_fp8_supported as is_fp8_supported,
-)
 from .schedulers import (
     CosineDecayWithWarmupSchedulerConfig as CosineDecayWithWarmupSchedulerConfig,
     DiffuserSchedulerConfig as DiffuserSchedulerConfig,
@@ -63,7 +59,4 @@ __all__ = [
     "save_optimizer_state",
     "save_scaler_state",
     "save_scheduler_state",
-    # fp8 (float8) training
-    "apply_float8_training",
-    "is_fp8_supported",
 ]

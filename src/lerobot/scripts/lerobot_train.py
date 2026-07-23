@@ -717,14 +717,6 @@ def train(cfg: TrainPipelineConfig) -> None:
     if image_augmentation is not None and is_main_process():
         logging.info(f"Image transforms run on {device} for {image_augmentation.image_keys}")
 
-    # fp8 (float8) training: swap eligible nn.Linear layers to torchao Float8Linear. Must run
-    # AFTER the policy is built + frozen/PEFT-wrapped (so requires_grad is final) and BEFORE
-    # the optimizer is created below (it must capture the swapped params) and before prepare().
-    if getattr(cfg, "use_float8", False):
-        from lerobot.optim import apply_float8_training
-
-        apply_float8_training(policy, recipe=cfg.float8_recipe)
-
     # Created BEFORE prepare on the unsharded parameters — accelerate's FSDP2 path requires the
     # model and optimizer in one prepare() call and rebinds the param groups itself.
     if is_main_process():
