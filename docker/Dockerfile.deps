@@ -93,4 +93,51 @@ COPY --chown=user_lerobot:user_lerobot setup.py pyproject.toml uv.lock README.md
 # installed by Dockerfile.user on top of this image once the source is present.
 RUN uv sync --locked --extra all --no-install-project --no-cache
 
+# Build + install NVIDIA TransformerEngine (fp8 for pi0/pi05 via te.LayerNormMLP) into the venv, on
+# top of the locked deps (needs torch present, so AFTER uv sync). Deliberately NOT in uv.lock: the
+# torch bindings are compiled from source here and the downstream Dockerfile.user image carries no
+# CUDA toolkit — so it's baked here and Dockerfile.user must `uv sync --inexact` to keep it. This
+# whole recipe was validated end-to-end on an H20 (see the memory note); the packaging is fiddly:
+#
+#  - nvcc: from NVIDIA's per-component redist TARBALL (~76MB), the only working source — CN mirrors
+#    for the CUDA apt repo are down and the pip nvcc wheel ships only ptxas (no nvcc/cicc). Override
+#    the URL for a mirror with --build-arg CUDA_NVCC_TAR=... . nvcc is BUILD-TIME ONLY (torch's own
+#    bundled nvidia-*-cu12 wheels supply every runtime CUDA lib), so the toolkit is deleted after.
+#  - core: the PREBUILT cu12 wheel with --no-deps. TE's meta/bindings hard-depend on the cu13 core
+#    (libcublas.so.13, incompatible with torch's cu128); --no-deps blocks that. The meta is also
+#    installed (--no-deps) or TE's pypi sanity-check aborts; all three dists must be the same version.
+#  - bindings: compiled from the transformer-engine-torch sdist (--no-binary) against torch 2.11 +
+#    the cu12 core, so they link torch's libcublas.so.12. NVTE_CUDA_ARCHS=90 = Hopper (H20); MAX_JOBS
+#    bounds compile memory so the CI runner doesn't OOM.
+#  - cudart bridge: TE's runtime loader looks for nvidia/cuda_cudart/ but torch installs
+#    nvidia/cuda_runtime/ — a symlink fixes the "cudart shared object not found" import error.
+#
+# TE_VERSION 2.14.0: below 2.17 (which the cu12/cu13 split makes painful) yet new enough to compile
+# against torch 2.11. CUDA_NVCC_VER must match torch's CUDA minor (cu128 → 12.8.x).
+ARG TE_VERSION=2.14.0
+ARG CUDA_NVCC_VER=12.8.93
+ARG CUDA_NVCC_TAR=https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/linux-x86_64/cuda_nvcc-linux-x86_64-${CUDA_NVCC_VER}-archive.tar.xz
+RUN set -eux; \
+    VENV=/lerobot/.venv; PY=$VENV/bin/python; \
+    NV=$VENV/lib/python3.12/site-packages/nvidia; \
+    TK=$HOME/cuda-nvcc; CUDA_HOME=$HOME/cuda-home; \
+    export CUDA_HOME CUDNN_PATH=$CUDA_HOME PATH=$CUDA_HOME/bin:$PATH; \
+    curl -fSL --retry 3 "$CUDA_NVCC_TAR" -o /tmp/nvcc.tar.xz; \
+    mkdir -p "$TK"; tar -xf /tmp/nvcc.tar.xz -C "$TK" --strip-components=1; rm /tmp/nvcc.tar.xz; \
+    mkdir -p "$CUDA_HOME/bin" "$CUDA_HOME/include" "$CUDA_HOME/lib64"; \
+    cp -asfn "$TK/bin/." "$CUDA_HOME/bin/"; \
+    cp -asfn "$TK/include/." "$CUDA_HOME/include/"; \
+    ln -sfn "$TK/nvvm" "$CUDA_HOME/nvvm"; \
+    for d in "$NV"/*/include; do cp -asfn "$d/." "$CUDA_HOME/include/" 2>/dev/null || true; done; \
+    for d in "$NV"/*/lib; do for so in "$d"/*.so*; do [ -e "$so" ] && ln -sf "$so" "$CUDA_HOME/lib64/" || true; done; done; \
+    nvcc --version | tail -1; \
+    uv pip install --python "$PY" --no-cache "setuptools>=61" wheel pybind11 cmake ninja; \
+    uv pip install --python "$PY" --no-cache --no-deps \
+        "transformer-engine-cu12==${TE_VERSION}" "transformer-engine==${TE_VERSION}"; \
+    NVTE_FRAMEWORK=pytorch NVTE_CUDA_ARCHS=90 MAX_JOBS=4 \
+      uv pip install --python "$PY" --no-cache --no-deps --no-build-isolation \
+        --no-binary transformer-engine-torch "transformer-engine-torch==${TE_VERSION}"; \
+    ln -sfn cuda_runtime "$NV/cuda_cudart"; \
+    rm -rf "$TK" "$CUDA_HOME"
+
 CMD ["/bin/bash"]
