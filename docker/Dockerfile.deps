@@ -117,6 +117,11 @@ RUN uv sync --locked --extra all --no-install-project --no-cache
 ARG TE_VERSION=2.14.0
 ARG CUDA_NVCC_VER=12.8.93
 ARG CUDA_NVCC_TAR=https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/linux-x86_64/cuda_nvcc-linux-x86_64-${CUDA_NVCC_VER}-archive.tar.xz
+# The TE wheels are NOT in uv.lock, so these `uv pip install`s use UV_DEFAULT_INDEX — which is
+# pinned to pypi.org above (for lockfile reproducibility). pypi.org is slow/unreliable from the CN
+# build cluster and the cu12 core wheel is ~430MB, so route ONLY these unlocked installs through a
+# fast CN PyPI mirror. Override with --build-arg TE_PIP_INDEX=... .
+ARG TE_PIP_INDEX=https://mirrors.ivolces.com/pypi/simple
 RUN set -eux; \
     VENV=/lerobot/.venv; PY=$VENV/bin/python; \
     NV=$VENV/lib/python3.12/site-packages/nvidia; \
@@ -131,11 +136,11 @@ RUN set -eux; \
     for d in "$NV"/*/include; do cp -asfn "$d/." "$CUDA_HOME/include/" 2>/dev/null || true; done; \
     for d in "$NV"/*/lib; do for so in "$d"/*.so*; do [ -e "$so" ] && ln -sf "$so" "$CUDA_HOME/lib64/" || true; done; done; \
     nvcc --version | tail -1; \
-    uv pip install --python "$PY" --no-cache "setuptools>=61" wheel pybind11 cmake ninja; \
-    uv pip install --python "$PY" --no-cache --no-deps \
+    uv pip install --python "$PY" --default-index "$TE_PIP_INDEX" --no-cache "setuptools>=61" wheel pybind11 cmake ninja; \
+    uv pip install --python "$PY" --default-index "$TE_PIP_INDEX" --no-cache --no-deps \
         "transformer-engine-cu12==${TE_VERSION}" "transformer-engine==${TE_VERSION}"; \
     NVTE_FRAMEWORK=pytorch NVTE_CUDA_ARCHS=90 MAX_JOBS=4 \
-      uv pip install --python "$PY" --no-cache --no-deps --no-build-isolation \
+      uv pip install --python "$PY" --default-index "$TE_PIP_INDEX" --no-cache --no-deps --no-build-isolation \
         --no-binary transformer-engine-torch "transformer-engine-torch==${TE_VERSION}"; \
     ln -sfn cuda_runtime "$NV/cuda_cudart"; \
     rm -rf "$TK" "$CUDA_HOME"
