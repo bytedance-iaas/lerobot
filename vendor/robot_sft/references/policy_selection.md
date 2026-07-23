@@ -79,8 +79,14 @@ which appends:
 --policy.vlm_mlp_fp8_recipe_kind=delayed_scaling
 ```
 
-- **Recipe** (`--float8-recipe`): `delayed_scaling` (default, per-tensor 16-step amax
-  history, HYBRID E4M3 fwd/E5M2 bwd) or `float8_block_scaling` (block-wise).
+- **Recipe** (`--float8-recipe` → `--policy.vlm_mlp_fp8_recipe_kind`), HYBRID E4M3 fwd/E5M2 bwd:
+  - `delayed_scaling` (**default**) — per-tensor delayed scaling, 16-step amax history. This is
+    the TE analogue of the **old torchao `tensorwise`** (one scale per whole tensor).
+  - `float8_block_scaling` — block-wise: **1D row-wise** for activations/grads, 2D tiles for
+    weights. This is the TE analogue of the **old torchao `rowwise`** (per-row scaling). Finer
+    granularity → better numerics on outliers, slightly more overhead.
+  Migration: if you used torchao `--float8_recipe=rowwise`, use `--float8-recipe float8_block_scaling`
+  here; `tensorwise` → `delayed_scaling`.
 - **Hopper/Ada GPU only** — needs fp8 tensor cores: H20 / H100 / L40S (sm_89/90+).
   On older cards TE errors at runtime, so only pass `--float8` when `check_hardware`
   reports an H20/Hopper. plan_training also **errors if the policy isn't pi0/pi05**.

@@ -175,9 +175,11 @@ def main() -> None:
                          "non-pi0/pi05 policies. See references/policy_selection.md.")
     ap.add_argument("--float8-recipe", default="delayed_scaling",
                     choices=["delayed_scaling", "float8_block_scaling"],
-                    help="TE fp8 recipe → --policy.vlm_mlp_fp8_recipe_kind. delayed_scaling "
-                         "(default): per-tensor, 16-step amax history. float8_block_scaling: "
-                         "block-wise (1D acts/grads, 2D weights).")
+                    help="TE fp8 recipe → --policy.vlm_mlp_fp8_recipe_kind. "
+                         "delayed_scaling (default): per-tensor delayed scaling, 16-step amax "
+                         "history — the TE analogue of the old torchao 'tensorwise'. "
+                         "float8_block_scaling: block-wise (1D row-wise for activations/grads, "
+                         "2D tiles for weights) — the TE analogue of the old torchao 'rowwise'.")
     ap.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False,
                     help="torch.compile the policy (--policy.compile_model=true). Default OFF: "
                          "MEASURED on pi05/H20 it gave NO steady-state speedup (1.61 vs 1.54 s/step) "
