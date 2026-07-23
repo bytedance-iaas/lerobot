@@ -101,8 +101,9 @@ RUN uv sync --locked --extra all --no-install-project --no-cache
 #
 #  - nvcc: from NVIDIA's per-component redist TARBALL (~76MB), the only working source — CN mirrors
 #    for the CUDA apt repo are down and the pip nvcc wheel ships only ptxas (no nvcc/cicc). Override
-#    the URL for a mirror with --build-arg CUDA_NVCC_TAR=... . nvcc is BUILD-TIME ONLY (torch's own
-#    bundled nvidia-*-cu12 wheels supply every runtime CUDA lib), so the toolkit is deleted after.
+#    the URL for a mirror with --build-arg CUDA_NVCC_TAR=... . TE doesn't need nvcc at runtime
+#    (torch's bundled nvidia-*-cu12 wheels supply the runtime CUDA libs), but we KEEP the toolkit +
+#    CUDA_HOME in the image (see the ENV at the end) so the dev pod can rebuild/experiment with TE.
 #  - core: the PREBUILT cu12 wheel with --no-deps. TE's meta/bindings hard-depend on the cu13 core
 #    (libcublas.so.13, incompatible with torch's cu128); --no-deps blocks that. The meta is also
 #    installed (--no-deps) or TE's pypi sanity-check aborts; all three dists must be the same version.
@@ -152,7 +153,15 @@ RUN set -eux; \
     NVTE_FRAMEWORK=pytorch NVTE_PYTORCH_FORCE_BUILD=TRUE NVTE_CUDA_ARCHS=90 TORCH_CUDA_ARCH_LIST="9.0" MAX_JOBS=8 \
       uv pip install --python "$PY" --default-index "$TE_PIP_INDEX" --no-cache --no-deps --no-build-isolation \
         --no-binary transformer-engine-torch "transformer-engine-torch==${TE_VERSION}"; \
-    ln -sfn cuda_runtime "$NV/cuda_cudart"; \
-    rm -rf "$TK" "$CUDA_HOME"
+    ln -sfn cuda_runtime "$NV/cuda_cudart"
+
+# KEEP the nvcc toolkit + assembled CUDA_HOME in the image (do NOT delete after the TE build) so the
+# dev pod is a full CUDA build environment — nvcc on PATH, headers/libs assembled — for rebuilding
+# or experimenting with TransformerEngine in-pod. Costs a few hundred MB; acceptable for these
+# dev/console images. TE itself does not need this at runtime (it loads CUDA libs from torch's
+# nvidia/* dirs), so a lean variant could re-add the `rm -rf` above.
+ENV CUDA_HOME=/home/user_lerobot/cuda-home \
+    CUDNN_PATH=/home/user_lerobot/cuda-home \
+    PATH=/home/user_lerobot/cuda-home/bin:/lerobot/.venv/bin:$PATH
 
 CMD ["/bin/bash"]
