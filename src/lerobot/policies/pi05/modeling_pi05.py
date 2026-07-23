@@ -72,6 +72,13 @@ from ..common.vla_utils import (
     prepare_attention_masks_4d,
     resize_with_pad_torch,
 )
+from ..pi_te_fp8 import (
+    build_vlm_mlp_fp8_recipe,
+    configure_vlm_mlp_fp8,
+    get_mlp_weight_dtype,
+    remap_fp8_state_dict_keys,
+    vlm_mlp_fp8_autocast,
+)
 from ..pretrained import PreTrainedPolicy, RTCActionSelectKwargs, T
 from ..rtc.modeling_rtc import RTCProcessor
 from .configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
@@ -304,7 +311,16 @@ def compute_layer_complete(
             att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
         with _no_grad_if(i == 0 and suppress_prefix_grads):
             out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos])
-            if norm_backend is None:
+            if getattr(layer.mlp, "absorbs_post_attention_layernorm", False):
+                # FP8 fused path (VLM only): te.LayerNormMLP has absorbed post_attention_layernorm,
+                # so skip the external norm -- including norm_backend's fused residual_norm -- and
+                # feed the residual straight into the fused MLP. The VLM branch has adarms_cond
+                # None, so the gate is None and the second residual is a plain add. (The expert
+                # keeps adaRMS and takes one of the two branches below.)
+                out_emb = cast(Tensor, _gated_residual(hidden_states, out_emb, gates[i]))
+                after_first_residual = out_emb.clone()
+                gate = None
+            elif norm_backend is None:
                 # first residual
                 out_emb = cast(Tensor, _gated_residual(hidden_states, out_emb, gates[i]))
                 after_first_residual = out_emb.clone()
@@ -314,7 +330,7 @@ def compute_layer_complete(
                     layer.post_attention_layernorm, hidden_states, out_emb, gates[i], adarms_cond[i]
                 )
             # Convert to bfloat16 if the next layer (mlp) uses bfloat16
-            if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
+            if get_mlp_weight_dtype(layer.mlp) == torch.bfloat16:
                 out_emb = out_emb.to(dtype=torch.bfloat16)
             out_emb = layer.mlp(out_emb)
             # second residual
@@ -379,12 +395,23 @@ class PaliGemmaWithExpertModel(
         image_size: int = DEFAULT_IMAGE_SIZE,
         freeze_vision_encoder: bool = False,
         train_expert_only: bool = False,
+        config: PI05Config | None = None,
     ):
         if use_adarms is None:
             use_adarms = [False, False]
         super().__init__()
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
+
+        # VLM MLP FP8 (Transformer Engine). Recipe is built once here; the swap happens after
+        # the model is materialized in its final dtype (see below). All no-ops unless enabled.
+        # The VLM has plain RMSNorm (foldable); the action expert (adaRMS) stays bf16.
+        self._vlm_mlp_fp8_config = config
+        self.vlm_mlp_fp8_enable = getattr(config, "vlm_mlp_fp8_enable", False) if config is not None else False
+        self.vlm_mlp_fp8_recipe = build_vlm_mlp_fp8_recipe(config)
+        self.vlm_mlp_quant_inference = (
+            getattr(config, "vlm_mlp_quant_inference", True) if config is not None else True
+        )
 
         vlm_config_hf = CONFIG_MAPPING["paligemma"]()
         vlm_config_hf._vocab_size = 257152  # noqa: SLF001
@@ -427,6 +454,10 @@ class PaliGemmaWithExpertModel(
         self.precision = precision
         self.to_bfloat16_for_selected_params(precision)
         self._set_requires_grad()
+
+        # Fuse VLM language-model MLPs into te.LayerNormMLP for FP8 (no-op unless enabled).
+        # Runs AFTER to_bfloat16_for_selected_params so weights are copied in their final dtype.
+        configure_vlm_mlp_fp8(self.paligemma.model.language_model.layers, config)
 
     def to_bfloat16_for_selected_params(self, precision: torch.dtype = torch.bfloat16):
         if precision == torch.bfloat16:
@@ -531,14 +562,19 @@ class PaliGemmaWithExpertModel(
         if inputs_embeds is None:
             raise ValueError("inputs_embeds must be a [prefix, suffix] pair (either entry may be None)")
         if inputs_embeds[1] is None:
-            prefix_output = self.paligemma.model.language_model.forward(
-                inputs_embeds=inputs_embeds[0],
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                adarms_cond=adarms_cond[0] if adarms_cond is not None else None,
-            )
+            # Standalone VLM prefill runs the fused te.LayerNormMLP layers, so it needs the
+            # FP8 autocast too (no-op when FP8 disabled or eval + quant_inference=False).
+            with vlm_mlp_fp8_autocast(
+                self._vlm_mlp_fp8_config, self.vlm_mlp_fp8_recipe, self.training
+            ):
+                prefix_output = self.paligemma.model.language_model.forward(
+                    inputs_embeds=inputs_embeds[0],
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    adarms_cond=adarms_cond[0] if adarms_cond is not None else None,
+                )
             prefix_past_key_values = prefix_output.past_key_values
             prefix_output = prefix_output.last_hidden_state
             suffix_output = None
@@ -566,39 +602,44 @@ class PaliGemmaWithExpertModel(
                 and self.training
             ) or (hasattr(self, "gradient_checkpointing") and self.gradient_checkpointing and self.training)
 
-            # Process all layers with gradient checkpointing if enabled
-            for layers in zip(paligemma_layers, gemma_expert_layers, strict=True):
-                if use_gradient_checkpointing:
-                    inputs_embeds = torch.utils.checkpoint.checkpoint(
-                        compute_layer_complete,
-                        inputs_embeds,
-                        attention_mask,
-                        position_ids,
-                        adarms_cond,
-                        use_reentrant=False,
-                        preserve_rng_state=False,
-                        layers=layers,
-                        rotary_emb=rotary_emb,
-                        fp32_attention=self.fp32_joint_attention,
-                        knowledge_insulation=self.knowledge_insulation,
-                        suppress_prefix_grads=suppress_prefix_grads,
-                        attention_fn=attention_fn,
-                        norm_backend=norm_backend,
-                    )
-                else:
-                    inputs_embeds = compute_layer_complete(
-                        inputs_embeds,
-                        attention_mask,
-                        position_ids,
-                        adarms_cond,
-                        layers=layers,
-                        rotary_emb=rotary_emb,
-                        fp32_attention=self.fp32_joint_attention,
-                        knowledge_insulation=self.knowledge_insulation,
-                        suppress_prefix_grads=suppress_prefix_grads,
-                        attention_fn=attention_fn,
-                        norm_backend=norm_backend,
-                    )
+            # Process all layers with gradient checkpointing if enabled.
+            # Hoist the TE FP8 autocast outside the layer loop so the fused VLM te.LayerNormMLP
+            # calls quantize (no-op when FP8 disabled or eval + quant_inference=False).
+            with vlm_mlp_fp8_autocast(
+                self._vlm_mlp_fp8_config, self.vlm_mlp_fp8_recipe, self.training
+            ):
+                for layers in zip(paligemma_layers, gemma_expert_layers, strict=True):
+                    if use_gradient_checkpointing:
+                        inputs_embeds = torch.utils.checkpoint.checkpoint(
+                            compute_layer_complete,
+                            inputs_embeds,
+                            attention_mask,
+                            position_ids,
+                            adarms_cond,
+                            use_reentrant=False,
+                            preserve_rng_state=False,
+                            layers=layers,
+                            rotary_emb=rotary_emb,
+                            fp32_attention=self.fp32_joint_attention,
+                            knowledge_insulation=self.knowledge_insulation,
+                            suppress_prefix_grads=suppress_prefix_grads,
+                            attention_fn=attention_fn,
+                            norm_backend=norm_backend,
+                        )
+                    else:
+                        inputs_embeds = compute_layer_complete(
+                            inputs_embeds,
+                            attention_mask,
+                            position_ids,
+                            adarms_cond,
+                            layers=layers,
+                            rotary_emb=rotary_emb,
+                            fp32_attention=self.fp32_joint_attention,
+                            knowledge_insulation=self.knowledge_insulation,
+                            suppress_prefix_grads=suppress_prefix_grads,
+                            attention_fn=attention_fn,
+                            norm_backend=norm_backend,
+                        )
 
             # final norm
             final_norms = (
@@ -664,6 +705,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             image_size=config.image_resolution[0],
             freeze_vision_encoder=config.freeze_vision_encoder,
             train_expert_only=config.train_expert_only,
+            config=config,
         )
         self.paligemma_with_expert.fp32_joint_attention = self.fp32_joint_attention
 
@@ -1253,6 +1295,17 @@ class PI05Policy(PreTrainedPolicy):
     ):  # see openpi `BaseModelConfig, _fix_pytorch_state_dict_keys`
         """Fix state dict keys to match current model architecture."""
         import re
+
+        # FP8: remap a stock bf16 VLM MLP checkpoint into the fused te.LayerNormMLP layout
+        # (gate/up → fc1_weight, down → fc2_weight, post_attention_layernorm → layer_norm_weight)
+        # BEFORE the per-key fixes below. No-op when FP8 disabled or already in TE format.
+        if getattr(model_config, "vlm_mlp_fp8_enable", False):
+            num_vlm_layers = get_gemma_config(model_config.paligemma_variant).depth
+            state_dict = remap_fp8_state_dict_keys(
+                state_dict,
+                num_vlm_layers,
+                "paligemma_with_expert.paligemma.model.language_model.layers",
+            )
 
         fixed_state_dict = {}
 
