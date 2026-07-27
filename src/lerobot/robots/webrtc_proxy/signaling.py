@@ -86,9 +86,10 @@ class WebSocketSignaling:
     peer joins). Non-trickle ICE means just one offer + one answer cross the wire.
     """
 
-    def __init__(self, base_url: str, session: str, role: str) -> None:
+    def __init__(self, base_url: str, session: str, role: str, token: str | None = None) -> None:
         sep = "&" if "?" in base_url else "?"
         self._url = f"{base_url}{sep}session={session}&role={role}"
+        self._token = token
         self._client = None
         self._ws = None
 
@@ -96,7 +97,8 @@ class WebSocketSignaling:
         import aiohttp
 
         self._client = aiohttp.ClientSession()
-        self._ws = await self._client.ws_connect(self._url)
+        headers = {"Authorization": f"Bearer {self._token}"} if self._token else None
+        self._ws = await self._client.ws_connect(self._url, headers=headers)
 
     async def send(self, description: RTCSessionDescription) -> None:
         await self._ws.send_json({"kind": "sdp", "type": description.type, "sdp": description.sdp})

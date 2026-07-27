@@ -68,7 +68,7 @@ WebRTC gives us two kinds of pipe; we use both deliberately (`protocol.py`):
 
 | Carrier | Payload | Reliability | Why |
 |---|---|---|---|
-| **media track** (RTP/UDP) | camera frames (VP8/H.264) | lossy, no retransmit | uncompressed 30 Hz ≈ 220 Mbps — must encode; loss tolerated |
+| **media track** (RTP/UDP) | camera frames (VP8/H.264) | lossy, no retransmit | raw 640×480×3@30 ≈ 220 Mbps (why we must encode, never raw on a DataChannel); the *encoded* track is ≈1–5 Mbps, adaptive |
 | DataChannel `state` | joints + capture `t`,`seq` + applied feedback | **configurable** (default unreliable) | see profiles below |
 | DataChannel `action` | goal joints + `seq` + `obs_seq` | **configurable** (default unreliable) | see profiles below |
 | DataChannel `control` | onboarding RPC (find_port, list_cameras, grab, plan) | **reliable, ordered** (always) | one-shot commands must arrive |
@@ -241,10 +241,22 @@ care:
      controllerConnId}` and buffer the early offer in **DynamoDB/Redis**; forward by
      calling the API GW management API to push to the peer's connection id. (Azure: Web
      PubSub / SignalR Service is the equivalent.)
-- **Porting `signaling_server.py`:** the in-memory `rooms`/`inbox` dicts become the
-  external per-session state (DO memory, or DynamoDB/Redis). The wire protocol
-  (`?session=&role=`, `{kind:"sdp"|"bye"}`) is unchanged, so `WebSocketSignaling` (client)
-  and the daemon/controller need **no changes**.
+  3. **火山引擎 veFaaS "Web 应用" (single-instance, multi-concurrency).** veFaaS can host a
+     long-running web server (configurable listen port, 单实例并发数, timeout). Run
+     `signaling_server.py` **unchanged** as a Web 应用 with **单实例并发数 ≥ 2** and the
+     instance count pinned to **1** — both the robot and controller WebSockets land on the
+     *same* warm instance, so the in-process `rooms` dict works as-is. Ideal for the
+     **single-user** case: no external store, the platform gateway terminates TLS (wss for
+     free on a bound domain), and `--port`/`--auth-token` read from `$PORT`/
+     `$SIGNALING_AUTH_TOKEN`. Caveats: keep min-instances ≥ 1 (or accept a cold start on
+     the daemon's first connect) and don't scale out — a second instance would split the
+     two peers. (Same single-instance trick on any FaaS that supports a long-running web
+     server + per-instance concurrency.)
+- **Porting `signaling_server.py`:** for the multi-instance shapes (1, 2) the in-memory
+  `rooms`/`inbox` dicts become external per-session state (DO memory, or DynamoDB/Redis);
+  the single-instance shape (3) needs no change at all. The wire protocol
+  (`?session=&role=`, `{kind:"sdp"|"bye"}`) is unchanged either way, so `WebSocketSignaling`
+  (client) and the daemon/controller need **no changes**.
 - **Auth lives here** (§12): the FaaS `$connect`/handshake is the natural place to
   validate a session token before pairing.
 - **TURN credentials:** the signaling FaaS is also the natural issuer of short-lived
@@ -266,11 +278,15 @@ K8s pods**.
 5. Session ends or drops → relay `bye` to the survivor → daemon **safes the arm**, resets,
    loops for the next session (it outlives any one session).
 
-## 12. Security & multi-tenancy `[planned]`
+## 12. Security & multi-tenancy
 
-- **AuthN/Z at signaling** (FaaS `$connect`): a session token binds a user to a
-  `session_id` and to *their* daemon; reject mismatched pairings. One daemon ↔ one
-  controller per `session_id` (no cross-tenant routing today).
+- **Shared token** `[done]` — `signaling_server --auth-token <str>`; every peer presents
+  it (`Authorization: Bearer …`, constant-time compared) or is rejected (401) before
+  pairing. Gates the door against scanners. **Limitation:** one token for everyone — it
+  does NOT isolate sessions/tenants (anyone holding it can join any `session_id`).
+- **Per-session signed token** `[planned]` (FaaS `$connect`): a short-lived JWT binds a
+  user to a `session_id` and role; reject mismatched pairings. This is what stops
+  cross-tenant hijacking; the shared token is only the first gate.
 - **DTLS-SRTP** encrypts media/data end-to-end for free (WebRTC mandatory).
 - **TURN credentials** are short-lived, per-session (TURN REST).
 - **Daemon identity:** the Mac daemon authenticates to the relay; a stolen `session_id`
@@ -294,5 +310,6 @@ K8s pods**.
 2. **Paradigm** (§6): real-time per-frame vs intent + local autonomy — gates the action
    channel design.
 3. **Media plane at scale**: aiortc-per-session vs LiveKit/mediasoup SFU.
-4. **FaaS signaling target**: Durable Objects vs API-GW-WS + store — drives how
-   `signaling_server.py`'s room state is externalized.
+4. **FaaS signaling target**: single-user → 火山 veFaaS "Web 应用" single-instance
+   (relay runs unchanged, §11.2.3). Multi-tenant → Durable Objects vs API-GW-WS + store
+   (externalize the room state).
