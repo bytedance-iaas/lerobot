@@ -21,12 +21,17 @@ robot class (and its ``aiortc`` dependency) loads lazily on first access so the
 
 from .configuration_webrtc_proxy import WebRTCCameraSpec, WebRTCProxyRobotConfig
 
-__all__ = ["WebRTCCameraSpec", "WebRTCProxyRobot", "WebRTCProxyRobotConfig"]
+__all__ = [
+    "CameraLayoutMismatch",
+    "WebRTCCameraSpec",
+    "WebRTCProxyRobot",
+    "WebRTCProxyRobotConfig",
+]
 
 
 def __getattr__(name: str):
-    if name == "WebRTCProxyRobot":
-        from .proxy_robot import WebRTCProxyRobot
+    if name in ("WebRTCProxyRobot", "CameraLayoutMismatch"):
+        from . import proxy_robot
 
-        return WebRTCProxyRobot
+        return getattr(proxy_robot, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
