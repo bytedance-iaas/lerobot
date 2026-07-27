@@ -101,7 +101,12 @@ CHAT_DIRECTIVE = (
     "结构化信息；代码或命令放进 ``` 代码块。不要输出完整 HTML 页面或 <script>/<style>。\n"
     "运行环境：lerobot 源码在 `/lerobot`，其 uv 虚拟环境（`/lerobot/.venv`）已在 PATH 上——"
     "直接用 `python` / `lerobot-*` 命令即可，无需激活。若确需 `uv run`，务必加 `--no-sync`"
-    "（否则 uv 会尝试联网重新同步依赖，很慢）。\n\n"
+    "（否则 uv 会尝试联网重新同步依赖，很慢）。\n"
+    "**重要——单 agent 执行**：所有工作都由你（主 agent / main agent）亲自、顺序完成。"
+    "**不要**派生、委派或编排任何 subagent（不要用 task / delegation / 子 agent / 多 agent）。"
+    "即使 robot_sft 技能里写的是“多 agent 流水线”“每个阶段由子 agent 执行”，在本环境中一律改为："
+    "你自己按阶段顺序执行、逐段把 session 状态落盘到 `/opt/data`，靠重读 session 状态续跑——"
+    "不靠子 agent。这样避免上下文丢失、额外开销和 ACP 中断问题。\n\n"
 )
 
 # SINGLE SOURCE OF TRUTH for the chat model + endpoint is hermes' config.yaml
