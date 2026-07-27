@@ -176,3 +176,8 @@ outputs/
 *.urdf
 *.xml
 *.part
+
+# Local long-task tracking (AI agent external memory) — not shared
+feature_list.md
+# Local long-task tracking (AI agent external memory) — not shared
+claude-progress.txt
