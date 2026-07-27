@@ -12,6 +12,27 @@ export HERMES_HOME="${HERMES_HOME:-/opt/data}"
 mkdir -p "$HERMES_HOME"
 SEED="/opt/hermes-seed"
 
+# --- CPU thread caps: match the cgroup quota, NOT the node's core count -------------------
+# The container sees every core on the node (nproc=180) but is cgroup-limited (e.g. 16 cores).
+# torch/OpenMP/MKL size their thread pools from the visible count, so torch defaults to ~90
+# threads that then thrash over the 16 real cores -> heavy CFS throttling + SLOW imports, model
+# loads, fp8 state-dict remaps, and preprocessing (MEASURED: a CPU matmul was ~2x slower at 90
+# threads vs 16). Derive the real quota from cgroup v2 cpu.max and pin the common knobs. Every
+# child (console server, hermes acp, lerobot-train / preflight subprocesses) inherits these.
+# Respects any value already set in the environment.
+if [ -r /sys/fs/cgroup/cpu.max ]; then
+  read -r _q _p < /sys/fs/cgroup/cpu.max || true
+  if [ "$_q" != "max" ] && [ "${_p:-0}" -gt 0 ] 2>/dev/null; then
+    CORES=$(( _q / _p )); [ "$CORES" -lt 1 ] && CORES=1
+    export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$CORES}"
+    export MKL_NUM_THREADS="${MKL_NUM_THREADS:-$CORES}"
+    export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-$CORES}"
+    export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-$CORES}"
+    export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-$CORES}"
+    echo "==> CPU quota ${CORES} cores -> capped OMP/MKL/OpenBLAS/numexpr/veclib threads to ${CORES} (node has $(nproc) cores)"
+  fi
+fi
+
 # Fresh PVC (no config yet) → seed config + skill from the baked image snapshot.
 if [ ! -s "$HERMES_HOME/config.yaml" ] && [ -d "$SEED" ]; then
   echo "==> seeding HERMES_HOME from baked snapshot (offline)"
