@@ -115,11 +115,15 @@ COPY scripts ./scripts
 RUN /lerobot/.venv/bin/python scripts/patch_diffusers_torchao.py
 # hermes' ACP layer (acp/connection.py) catches EVERY request-handler exception, wraps it
 # into a generic `RequestError.internal_error(...)` and `raise err from None` — DISCARDING the
-# traceback. So a real bug inside a tool handler (e.g. `process wait` hitting None.startswith)
-# reaches the web chat as an opaque "Internal error" with no file:line, and the session gets
-# stuck undebuggably. Patch ACP to log the real traceback FIRST. Runs in the HERMES venv (that
-# is where acp/ lives). Idempotent; no-op if hermes changes.
+# traceback. So a real bug inside a tool handler reaches the web chat as an opaque "Internal
+# error" with no file:line, and the session gets stuck undebuggably. Patch ACP to log the real
+# traceback FIRST. Runs in the HERMES venv (that is where acp/ lives). Idempotent.
 RUN /opt/hermes/.venv/bin/python scripts/patch_acp_logging.py
+# The logging patch above unmasked the actual bug: acp_adapter/server.py reads
+# `result.get("final_response", "")`, but an INTERRUPTED turn sets that key to None (a
+# present-but-None value bypasses the "" default), so `final_response.startswith(...)` raises
+# 'NoneType' has no attribute 'startswith' -> "Internal error" -> stuck chat. Coerce to "".
+RUN /opt/hermes/.venv/bin/python scripts/patch_acp_interrupt.py
 # Session listing runs INSIDE the hermes venv (it imports hermes_state), so this one
 # file lives next to that venv and is invoked with its interpreter, not ours.
 COPY hermes_session_api.py /opt/hermes/session_api.py
