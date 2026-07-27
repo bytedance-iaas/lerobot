@@ -178,18 +178,28 @@ python src/lerobot/async_inference/robot_client.py \
 
 > 一句话选型：要**人在环的遥操作 / 数据采集 / 实时视频**，用上面的 §2 遥操作路径；要**纯策略的远程推理部署**，用本节的 async_inference 路径——动作块机制天生比逐帧 WebRTC 更抗延迟。
 
+### 3. fp8（float8）训练 · NVIDIA TransformerEngine
+
+在 Hopper / Ada 架构 GPU（H20 / H100 / L40S）上，**pi0 / pi05 现在支持 fp8（float8）训练**：每个 VLM（PaliGemma）层的 `post_attention_layernorm` + gate/up/down MLP 被融合成一个 **`te.LayerNormMLP`**（RMSNorm + FC1 geglu + FC2 全程 fp8），动作专家（action expert）保持 bf16。主权重仍是 bf16，fp8 与 bf16 autocast 叠加——既省显存、在 VLA 上还更快。
+
+- **一键开启**：`robot_sft` 的 `plan_training.py` 加 `--float8` 即可（**仅 pi0 / pi05**，其它策略会直接报错拒绝）；等价于给 `lerobot-train` 传 `--policy.vlm_mlp_fp8_enable=true --policy.dtype=bfloat16`。
+- **两种 recipe**（HYBRID：E4M3 前向 / E5M2 反向）：`delayed_scaling`（默认，逐张量延迟缩放，16 步 amax 历史）与 `float8_block_scaling`（块级——激活/梯度 1D 行缩放、权重 2D tile，数值更稳、开销略高）。
+- **实测收益**（pi05 / 单卡 H20）：相比 bf16 约 **1.37× 提速、显存少 ~2.9 GB**。
+- **从 bf16 checkpoint 起训**：直接加载 `pi05_base` 等 bf16 权重即可，TE 的 fp8 缩放元数据（`_extra_state`）自动新初始化并在训练中标定——权重照常加载，无需预转换。
+- **依赖**：需要 TransformerEngine（已内置于 lerobot 镜像）+ Hopper/Ada 的 fp8 tensor core；旧卡会在运行时报错，所以 `plan_training.py` 只在检测到 H20/Hopper 时才允许 `--float8`。
+
 ---
 
 ## 二、控制台自带的能力
 
-### 3. 内置 AI Agent · 豆包驱动
+### 4. 内置 AI Agent · 豆包驱动
 
 右侧就是一个 AI Agent 对话框，接入 **豆包 / 火山方舟（Volcengine Ark）** 大模型。用自然语言即可让它探索数据集、规划并启动 SFT 训练、评估 checkpoint，或直接在下方控制台里执行命令。首次使用只需填入火山方舟 API Key（**仅用于 chat，不影响终端与其他功能**）。底层由 hermes agent 驱动。
 
-### 4. 配套的 robot_sft 技能
+### 5. 配套的 robot_sft 技能
 
 Agent 预装了 **`robot_sft`** 技能：把一次机器人模仿学习 / VLA 策略的 SFT 训练，拆成一串小的、可独立验证、文件存档的阶段——数据集探查 → train/eval 切分 → 计划 + 预检（含冒烟测试）→ 训练（自愈看门狗 + 定期离线评估 + 监控面板）。崩溃或上下文重置也不丢进度：重读会话状态即可继续。上面「直接访问 TOS 数据集」的能力也由它串起来。
 
-### 5. 自动发现并打开控制台里的服务
+### 6. 自动发现并打开控制台里的服务
 
 在下方 Linux 终端里启动的 web 服务（如 webrtc 远程遥操作面板、训练监控面板），控制台会**自动发现**；点右上角「＋ 打开」即可把它作为一个标签页在这里打开，也可手动输入端口 / 网址。Agent 输出的 HTML 同样会在这里打开——**终端、Agent、内嵌浏览器三者在同一个页面里协同**。
