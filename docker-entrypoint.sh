@@ -18,6 +18,21 @@ if [ ! -s "$HERMES_HOME/config.yaml" ] && [ -d "$SEED" ]; then
   cp -a "$SEED/." "$HERMES_HOME/"
 fi
 
+# Enforce console policy on EVERY boot. config.yaml lives on the PVC and SHADOWS the image seed,
+# so an image rollout alone never updates an existing PVC — we must re-assert this each start
+# (same reason the skill needs a symlink).
+#   - delegation.orchestrator_enabled=false : the main agent does ALL work in ONE session; no
+#     subagent/task delegation. This is the fix for "switch session shows only the first line":
+#     with delegation on, robot_sft spawned a `source=subagent` CHILD session per stage, so the
+#     main session the console loads held only the first user message while the real work (25/21/16
+#     messages) lived in hidden subagent children. Off → the whole conversation stays in the main
+#     session → switch replays full history. Pairs with CHAT_DIRECTIVE's system-prompt steer.
+#   NOTE: compression stays ENABLED (default) — it is unrelated to this bug and must stay on.
+if command -v hermes >/dev/null 2>&1; then
+  hermes config set delegation.orchestrator_enabled false >/dev/null 2>&1 || echo "WARN: could not set delegation.orchestrator_enabled"
+  echo "==> enforced: delegation.orchestrator_enabled=false (compression left ENABLED)"
+fi
+
 # robot_sft skill: keep it OFF the PVC so it TRACKS THE IMAGE and updates on every
 # rollout. The skill content lives in the image at /opt/agent-console/vendor/robot_sft;
 # the PVC's skills/robot_sft is only a SYMLINK to it (hermes follows it — verified).
