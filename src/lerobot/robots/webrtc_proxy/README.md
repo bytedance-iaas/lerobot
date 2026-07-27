@@ -43,8 +43,12 @@ run the relay + daemon + controller as separate loops in one process — see
 - **`alignment.py`** — `AlignmentBuffer`: thread-safe pairing of state↔frame by capture
   **seq** (难点 A; joints+frame share a seq, the frame's seq rides its pts). A dropped
   frame/state just skips that seq — no cascade. See `DESIGN.md` §5.1.
+- **`transport.py`** — pluggable transport: the `Transport` interface (named data
+  channels + a seq-tagged video stream) + `AiortcTransport` (default WebRTC P2P). The
+  proxy logic is transport-agnostic, so a different backend (e.g. a LiveKit SFU for
+  cross-public-net / scale) can implement `Transport` without touching the rest.
 - **`capture_agent.py`** — Mac endpoint. Owns the capture clock, pushes state + video
-  (seq in pts), applies actions, runs the **watchdog** (难点 C).
+  (seq in pts) via the transport, applies actions, runs the **watchdog** (难点 C).
 - **`proxy_robot.py`** — `WebRTCProxyRobot` (sync `Robot` API) + `_ProxyEndpoint`
   (async answerer) + `_EventLoopThread` (sync↔async bridge).
 - **`signaling.py`** — `Signaling` protocol + `WebSocketSignaling` client (real
@@ -137,8 +141,19 @@ print(r.get_observation().keys()); print(r.list_ports()); r.disconnect()
 PY
 ```
 
-Across the public internet the only change is `ice_servers=[...]` (STUN/TURN, M4);
-the daemon registers from behind NAT, the relay never sees media.
+Across NAT, start the **signaling relay with `--stun-url`** — it hands each peer its STUN
+servers on connect (an `{"kind":"ice"}` message; peers need no ICE config). STUN gives a
+server-reflexive (public) candidate, so aiortc connects **directly** as long as one side
+is reachable (e.g. a cloud controller with a public IP + a home daemon dialing out — media
+stays peer-to-peer, no relay hop). aiortc is **direct-only**; if *both* ends sit behind
+restrictive/symmetric NAT (or a peer only egresses via an HTTP proxy), use the **LiveKit
+backend** for the relay — we don't run a TURN/coturn under aiortc. See `DESIGN.md` §11.1.
+
+```bash
+# relay with STUN (public, or domestic, or self-hosted):
+python -m lerobot.robots.webrtc_proxy.signaling_server --host 0.0.0.0 --port 8765 \
+    --auth-token <T> --stun-url stun:stun.l.google.com:19302   # CN: stun:stun.qq.com:3478
+```
 
 Tests (suites needing the transport skip automatically without aiortc/aiohttp):
 
@@ -146,6 +161,46 @@ Tests (suites needing the transport skip automatically without aiortc/aiohttp):
 # NOTE: -p no:hydra_pytest works around an unrelated broken pytest plugin in this env.
 uv run pytest tests/robots/test_webrtc_proxy_*.py -p no:hydra_pytest -q
 ```
+
+## LiveKit backend (experimental, optional)
+
+`aiortc` (default) is P2P and self-contained. The pluggable transport also has a
+**LiveKit (SFU)** backend for cross-public-internet / NAT / scale: both ends dial
+*outward* to a LiveKit server (LiveKit Cloud or self-hosted), so neither needs an
+inbound path. Verified end-to-end against a local `livekit-server --dev` and LiveKit
+Cloud. Install the extra: `uv sync --extra webrtc-livekit`.
+
+Both ends must use `--transport livekit` (an aiortc peer and a LiveKit room don't
+interoperate). The daemon needs no `--signaling-url` (LiveKit does its own signaling).
+Each process **self-signs its own token** from a shared API key/secret — set the
+LiveKit env vars once and you never paste a JWT (the room is `--session`; identities
+default to `robot` / `controller`):
+
+```bash
+# local dev server (key/secret default to devkey/secret)
+livekit-server --dev
+export LIVEKIT_URL=ws://127.0.0.1:7880 LIVEKIT_API_KEY=devkey LIVEKIT_API_SECRET=secret
+
+# Mac daemon (publisher) — self-signs identity=robot from the env
+uv run python -m lerobot.robots.webrtc_proxy.mac_daemon --session so100 \
+    --transport livekit --real-camera 0   # drop --real-camera for synthetic frames
+
+# cloud controller (subscriber) — self-signs identity=controller
+uv run python examples/webrtc_remote_so100/cloud_teleop_so100.py --transport livekit
+```
+
+For production, don't ship the API secret to the Mac — pass a pre-signed, scoped token
+with `--livekit-token` (minted by a cloud token server) instead of the key/secret.
+
+The opt-in e2e test runs the same two-process path:
+
+```bash
+LEROBOT_LIVEKIT_URL=ws://127.0.0.1:7880 \
+    LEROBOT_LIVEKIT_API_KEY=devkey LEROBOT_LIVEKIT_API_SECRET=secret \
+    uv run pytest tests/robots/test_webrtc_proxy_livekit.py -p no:hydra_pytest -q
+```
+
+NAT / restrictive-egress reachability (why SFU, not P2P) is covered in `DESIGN.md` §11.1.1.
 
 ## Known limitations (M1 — to fix in later milestones)
 
@@ -170,11 +225,11 @@ uv run pytest tests/robots/test_webrtc_proxy_*.py -p no:hydra_pytest -q
   `list_cameras` return real ids. Default stays `SyntheticInventory`. Persisting the
   chosen port/camera→role mapping into a daemon config (and using it to open the bus)
   is M2.
-- **Same-host networking only (so far).** WebSocket signaling + the daemon work, but
-  with `ice_servers=[]` (host candidates) only same-host / same-LAN peers connect.
-  Real public-net NAT traversal needs STUN/TURN(coturn) urls in `ice_servers` and a
-  self-managed K8s media path (hostNetwork, announced/external IP) — that's M4 and
-  needs real infra, untested here.
+- **aiortc reach = direct UDP.** Host candidates connect same-host / same-LAN; **STUN**
+  (relay `--stun-url`, auto-distributed on connect) adds a public srflx candidate so peers
+  connect directly across NAT when one side is reachable. aiortc runs **no TURN relay**:
+  if *both* ends are behind restrictive/symmetric NAT, or a peer only egresses via an HTTP
+  proxy, use the **LiveKit backend** (the relay path) instead.
 - **Daemon reconnect is per-session, single controller.** One `session_id` ↔ one
   daemon ↔ one controller at a time. Multi-tenant routing / auth on the relay is later.
 - **send_action returns the optimistic goal** (no real clip/ack from the Mac yet). M2.

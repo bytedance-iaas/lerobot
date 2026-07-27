@@ -40,7 +40,6 @@ import time
 from functools import cached_property
 
 import numpy as np
-from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
 
 from lerobot.types import RobotAction, RobotObservation
 
@@ -49,57 +48,48 @@ from .alignment import AlignmentBuffer
 from .capture_agent import _fit_frame
 from .configuration_webrtc_proxy import WebRTCProxyRobotConfig
 from .control import ControlClient
-from .protocol import (
-    CH_ACTION,
-    CH_CONTROL,
-    CH_STATE,
-    VIDEO_CLOCK_RATE,
-    VIDEO_PTS_PER_SEQ,
-    ActionMsg,
-    StateMsg,
-)
+from .protocol import CH_ACTION, CH_CONTROL, CH_STATE, ActionMsg, StateMsg
 from .signaling import Signaling, WebSocketSignaling
+from .transport import Transport, make_transport
 
 logger = logging.getLogger(__name__)
 
 
 class _ProxyEndpoint:
-    """Async answerer: receives state/action/control channels + a video track."""
+    """Cloud answerer: receives state + video, sends actions, drives the control plane.
 
-    def __init__(self, buffer: AlignmentBuffer, cam_name: str, ice_servers: list[str] | None = None) -> None:
+    Transport-agnostic — talks to a :class:`Transport` (default aiortc).
+    """
+
+    def __init__(
+        self,
+        buffer: AlignmentBuffer,
+        cam_name: str,
+        ice_servers: list[str] | None = None,
+        transport_backend: str = "aiortc",
+        livekit_url: str | None = None,
+        livekit_token: str | None = None,
+        transport: Transport | None = None,
+    ) -> None:
         self.buffer = buffer
         self.cam_name = cam_name
-        # iceServers=[] => host candidates only (loopback / same-host). M4 supplies STUN/TURN.
-        ice = [RTCIceServer(urls=u) for u in (ice_servers or [])]
-        self.pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=ice))
-        self._ch_action = None
-        self.connected = asyncio.Event()
         self._action_seq = 0
         # Closed-loop feedback reported by the Mac on the state stream (telemetry).
         self.last_applied_seq = -1
         self.last_applied_t = 0.0
         self._control = ControlClient()
-        self._register()
-
-    def _register(self) -> None:
-        @self.pc.on("datachannel")
-        def _on_channel(channel):  # noqa: ANN001
-            if channel.label == CH_STATE:
-                channel.on("message", self._on_state)
-            elif channel.label == CH_ACTION:
-                self._ch_action = channel
-            elif channel.label == CH_CONTROL:
-                self._control.attach(channel)
-
-        @self.pc.on("track")
-        def _on_track(track):  # noqa: ANN001
-            asyncio.ensure_future(self._consume(track))
-
-        @self.pc.on("connectionstatechange")
-        async def _on_state_change():
-            logger.info("proxy connectionState=%s", self.pc.connectionState)
-            if self.pc.connectionState == "connected":
-                self.connected.set()
+        self._transport = transport or make_transport(
+            transport_backend,
+            role="subscriber",
+            channels={CH_STATE: False, CH_ACTION: False, CH_CONTROL: True},  # reliability set by publisher
+            ice_servers=ice_servers,
+            livekit_url=livekit_url,
+            livekit_token=livekit_token,
+        )
+        self.connected = self._transport.connected
+        self._transport.channel(CH_STATE).on_message(self._on_state)
+        self._control.attach(self._transport.channel(CH_CONTROL))
+        self._transport.set_frame_handler(self._on_frame)
 
     def _on_state(self, raw: str) -> None:
         try:
@@ -112,37 +102,17 @@ class _ProxyEndpoint:
             self.last_applied_seq = msg.applied_seq
             self.last_applied_t = msg.applied_t
 
-    async def _consume(self, track) -> None:  # noqa: ANN001
-        while True:
-            try:
-                frame = await track.recv()
-            except Exception:
-                logger.info("proxy: video track ended")
-                return
-            # Recover the capture seq carried in pts (round-trips through VP8). A dropped
-            # frame just leaves a gap in seq — no cascade. (Relative to the first received
-            # frame; see DESIGN.md §5.1.)
-            # seconds = pts * time_base; seq = seconds * clock / step. (time_base is
-            # normalized in case the receiver reports a different one than the sender.)
-            seconds = float(frame.pts) * float(frame.time_base)
-            seq = round(seconds * VIDEO_CLOCK_RATE / VIDEO_PTS_PER_SEQ)
-            img = frame.to_ndarray(format="rgb24")
-            self.buffer.add_frame(seq, img)
+    def _on_frame(self, seq: int, img: np.ndarray) -> None:
+        # seq was recovered from the frame pts by the transport. A dropped frame just
+        # leaves a gap — no cascade. (Relative to the first received frame; DESIGN §5.1.)
+        self.buffer.add_frame(seq, img)
 
     async def run(self, signaling: Signaling) -> None:
-        await signaling.open()
-        offer = await signaling.recv()
-        if not isinstance(offer, RTCSessionDescription):
-            raise RuntimeError(f"proxy expected an SDP offer, got {type(offer)!r}")
-        await self.pc.setRemoteDescription(offer)
-        await self.pc.setLocalDescription(await self.pc.createAnswer())
-        await signaling.send(self.pc.localDescription)
+        await self._transport.open(signaling)
 
     async def send_action(self, goal: dict[str, float], obs_seq: int = -1) -> dict[str, float]:
-        if self._ch_action is None or self._ch_action.readyState != "open":
-            raise RuntimeError("action channel not open")
         self._action_seq += 1
-        self._ch_action.send(
+        self._transport.channel(CH_ACTION).send(
             ActionMsg(t=time.monotonic(), seq=self._action_seq, goal=goal, obs_seq=obs_seq).to_json()
         )
         return goal
@@ -151,7 +121,7 @@ class _ProxyEndpoint:
         return await self._control.call(method, params, timeout)
 
     async def close(self) -> None:
-        await self.pc.close()
+        await self._transport.close()
 
 
 class _EventLoopThread:
@@ -233,9 +203,12 @@ class WebRTCProxyRobot(Robot):
     def connect(self, calibrate: bool = True) -> None:
         if self._connected:
             raise RuntimeError("WebRTCProxyRobot already connected")
-        if not self.config.signaling_url or not self.config.signaling_url.startswith("ws"):
+        # aiortc reaches the daemon over our WS signaling relay; livekit signals itself.
+        if self.config.transport_backend == "aiortc" and (
+            not self.config.signaling_url or not self.config.signaling_url.startswith("ws")
+        ):
             raise ValueError(
-                "WebRTCProxyRobot needs a WebSocket signaling_url (ws://host:port/ws) to reach a Mac daemon"
+                "WebRTCProxyRobot (aiortc) needs a WebSocket signaling_url (ws://host:port/ws)"
             )
 
         self._loop = _EventLoopThread()
@@ -245,16 +218,33 @@ class WebRTCProxyRobot(Robot):
         # asyncio.Queue must be constructed *on the loop thread* so it binds to the
         # right running loop. Building them in the caller thread silently deadlocks.
         async def _bringup() -> None:
-            self._endpoint = _ProxyEndpoint(self._buffer, self.cam_name, ice_servers=self.config.ice_servers)
-            # Pure controller: reach the remote Mac daemon over the signaling relay.
-            self._ws_sig = WebSocketSignaling(
+            self._endpoint = _ProxyEndpoint(
+                self._buffer,
+                self.cam_name,
+                ice_servers=self.config.ice_servers,
+                transport_backend=self.config.transport_backend,
+                livekit_url=self.config.livekit_url,
+                livekit_token=self.config.livekit_token,
+            )
+            # aiortc reaches the daemon over our WS signaling relay; livekit signals itself
+            # (the transport ignores the signaling arg).
+            if self.config.transport_backend == "aiortc":
+                self._ws_sig = WebSocketSignaling(
+                    self.config.signaling_url,
+                    self.config.session_id,
+                    role="controller",
+                    token=self.config.signaling_token,
+                )
+            # Staged so a connect timeout points at the stuck phase (signaling vs media).
+            logger.info(
+                "connecting: signaling %s (session=%s)…",
                 self.config.signaling_url,
                 self.config.session_id,
-                role="controller",
-                token=self.config.signaling_token,
             )
             await self._endpoint.run(self._ws_sig)
+            logger.info("connecting: signaling done; waiting for media (ICE) to connect…")
             await self._endpoint.connected.wait()
+            logger.info("connecting: media connected")
             # Push our desired obs size so the Mac resizes/encodes to it (bandwidth).
             # Correctness doesn't depend on this — get_observation re-fits to the spec.
             with contextlib.suppress(Exception):
@@ -264,7 +254,18 @@ class WebRTCProxyRobot(Robot):
                     timeout=5.0,
                 )
 
-        self._loop.run(_bringup(), timeout=self.config.connect_timeout_s)
+        try:
+            self._loop.run(_bringup(), timeout=self.config.connect_timeout_s)
+        except TimeoutError as e:
+            raise TimeoutError(
+                f"WebRTCProxyRobot connect timed out after {self.config.connect_timeout_s}s. Check: "
+                "(1) the signaling relay is reachable at the signaling_url; "
+                "(2) the Mac daemon is connected to the SAME relay with --session "
+                f"'{self.config.session_id}' and a matching --auth-token; "
+                "(3) for a cross-NAT/public link, STUN/TURN is configured on the relay — host-only ICE "
+                "(ice_servers=[]) can't traverse the internet. See the 'connecting:' logs above for the "
+                "phase it stalled in (signaling vs media)."
+            ) from e
         self._wait_first_obs(self.config.connect_timeout_s)
         self._connected = True
         logger.info("WebRTCProxyRobot connected (%s)", self.config.signaling_url)

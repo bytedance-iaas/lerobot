@@ -47,7 +47,7 @@ Every LeRobot policy / record / teleop path talks to hardware only through
  │                    │                                      │ AlignmentBuffer         │
  │   ╞═══════════ WebRTC P2P (media track + DataChannels) ═══════════╡                 │
  │   │  camera→ media (RTP/UDP) ;  joints/action/control → DataChannels               │
- └───┼────────────────┘   (direct, or via coturn TURN relay if NAT blocks P2P)        │
+ └───┼────────────────┘   (aiortc: direct UDP, host+STUN; relay → LiveKit backend)     │
      └──────────────────────────────────────────────────────────────┴────────────────┘
 ```
 
@@ -198,22 +198,97 @@ What runs in K8s is **whatever consumes `WebRTCProxyRobot`** — a record job, a
 inference server, or a teleop-session backend pod. Each session = one controller pod ↔
 one Mac daemon.
 
-The **media path is the constraint**, not the CPU:
+**Decision (backend split).** A clean line, no TURN relay under aiortc:
 
-- **UDP, large dynamic port range.** Put the media-terminating pod on
-  `hostNetwork: true` (or a node with a routable IP) so RTP/UDP isn't mangled by
-  Service/NAT port mapping.
-- **ICE must advertise the node's public/external IP**, not the pod's cluster IP. The
-  classic failure: signaling connects, SDP exchanges, but **media never flows** — almost
-  always a mis-set announced/external IP.
-- **STUN** (cheap, self-host) for hole-punching; **TURN (coturn)** as the fallback when
-  P2P fails — **mandatory in production**, it relays media and eats bandwidth. Deploy
-  coturn on `hostNetwork`/dedicated nodes with a public IP and an open relay port range;
-  inject its URLs into `ice_servers` on both peers (`RTCConfiguration`).
-- **Media framework choice.** `aiortc` (current) gives decoded `ndarray` frames straight
-  into the LeRobot pipeline — perfect for the adapter, but single-connection / weak at
-  scale. For many concurrent users, move the media plane to **LiveKit / mediasoup** (SFU)
-  and demote aiortc to the "stream → LeRobot obs" adapter.
+- **aiortc = direct UDP.** Host candidates connect on a LAN; **STUN** adds a
+  server-reflexive (public) candidate so peers also connect **directly** across NAT when at
+  least one side is reachable (e.g. a cloud controller with a public IP + a home daemon
+  dialing out — verified to connect with STUN alone, media direct, no relay hop). STUN only
+  *discovers* the address; media stays peer-to-peer. The **signaling relay distributes STUN
+  on connect** (an `{"kind":"ice"}` message; `signaling_server.py` `IceConfig`,
+  `--stun-url`), so peers need no ICE config. aiortc does **not** run a TURN relay.
+- **LiveKit (SFU) = the relay.** When you genuinely need media relayed (both ends behind
+  restrictive/symmetric NAT, or you want zero-ops NAT traversal / multi-user / scale), use
+  the LiveKit backend. Its SFU bundles signaling + TURN + forwarding in one server and both
+  peers dial outward. We do **not** bolt a coturn onto aiortc to duplicate this — a
+  self-hosted single coturn is a dumb extra hop, whereas the SFU is purpose-built.
+
+So: **direct → aiortc (host + STUN); relay → LiveKit.** This keeps aiortc simple (no
+coturn / `hostNetwork` / announced-IP / port-range ops) and gives relay to the backend
+built for it.
+
+The **media path** per backend:
+
+- **aiortc:** UDP P2P (host or STUN-srflx). Connects when at least one side is reachable;
+  if *both* sit behind restrictive/symmetric NAT (no reachable side), it can't connect —
+  that's the LiveKit case, by design.
+- **LiveKit:** both peers dial *outward* to the SFU; no inbound path / announced IP / port
+  range to manage on our side. `aiortc` (default) gives decoded `ndarray` frames straight
+  into the LeRobot pipeline — great for the adapter, but single-connection / weak at scale.
+  The transport is pluggable (`transport.py` `Transport` interface; pick via
+  `transport_backend`): `AiortcTransport` is the default; `transport_livekit.py` is a
+  working (experimental, optional) `LiveKitTransport`, the chosen SFU because it handles
+  signaling + TURN + scale AND has a Python SDK to pull frames into LeRobot. It is
+  **verified end-to-end** against both a local `livekit-server --dev` and LiveKit Cloud
+  (obs + action + control round-trip with fresh aligned observations); see the opt-in
+  `tests/robots/test_webrtc_proxy_livekit.py`.
+
+**The two topologies side by side:**
+
+```
+aiortc backend — direct UDP P2P; the signaling relay only brokers SDP + STUN config.
+
+  Mac daemon (home / NAT)          signaling_server (public)        Cloud controller
+  ┌─────────────────────┐   ws    ┌──────────────────────┐   ws   ┌─────────────────────┐
+  │ mac_daemon          │   SDP   │ relay: pair by        │   SDP  │ WebRTCProxyRobot     │
+  │  CaptureAgent       │────────▶│ session_id;           │◀───────│  _ProxyEndpoint      │
+  │  SO100Follower      │  +STUN  │ push STUN on connect  │  +STUN │  AlignmentBuffer     │
+  └──────────┬──────────┘   cfg   └──────────────────────┘   cfg  └──────────┬──────────┘
+             │                      (relay NEVER carries media)                │
+             └════════ WebRTC media — UDP DIRECT (host / STUN srflx) ══════════┘
+                camera→RTP/UDP  ·  joints / action / control → DataChannels
+                STUN only discovers each side's public addr; the media path is peer-to-peer.
+                Connects when ≥1 side is reachable (LAN, or one public + STUN). No relay hop.
+```
+
+```
+livekit backend — SFU; both peers dial OUTWARD, media ALWAYS via the server.
+
+  Mac daemon (home / NAT)                                    Cloud controller
+  ┌─────────────────────┐                                    ┌─────────────────────┐
+  │ mac_daemon          │                                    │ WebRTCProxyRobot     │
+  │  CaptureAgent       │                                    │  _ProxyEndpoint      │
+  │  (publisher)        │                                    │  (subscriber)        │
+  └──────────┬──────────┘                                    └──────────┬──────────┘
+             │  dial out: wss signaling + WebRTC media                   │  dial out
+             │              ┌────────────────────────────────┐          │
+             └─────────────▶│        LiveKit SFU             │◀──────────┘
+               publish       │  (LiveKit Cloud or self-hosted │   subscribe
+               video + data  │   livekit-server)              │   video + data
+                             │  signaling + TURN + forwarding │
+                             └────────────────────────────────┘
+                no inbound needed (NAT-friendly); the SFU is always in the media path.
+                Use when both ends are behind hard NAT, or for zero-ops / multi-user / scale.
+```
+
+### 11.1.1 NAT / restrictive-egress reachability `[direct → aiortc, relay → LiveKit]`
+
+The two ends' network conditions pick the backend:
+
+- **aiortc = direct UDP (host + STUN).** Connects directly when at least one side is
+  reachable: same LAN (host), or one side public + STUN for the other's srflx (the common
+  cloud-controller + home-daemon case). If **both** ends are behind restrictive/symmetric
+  NAT with no reachable side — or a peer can only egress via an `HTTP(S)_PROXY` (aiortc
+  can't route media through an HTTP forward proxy) — aiortc can't connect. Use LiveKit.
+- **LiveKit (SFU) = the relay.** **Both** peers *dial outward* to the SFU — neither needs
+  an inbound path — covering the **NAT side** cleanly (outbound + SFU-side TURN). For a
+  **proxy-only side**:
+  - *signaling* (wss:443) traverses the HTTP proxy fine (it is just HTTPS/CONNECT);
+  - *media* still needs the WebRTC client to tunnel ICE/TURN (TURN/TLS:443) through that
+    proxy, which libwebrtc supports only partially and the Python SDK does not expose.
+    Typical failure shape: **room connects, no track/data flows** — verify on the real
+    proxied host; if media won't traverse, place the controller where it has direct egress
+    (the usual cloud deployment, which is the normal topology anyway).
 
 Scaling note: one controller pod per active session (stateful, holds a PeerConnection +
 the bg loop). Autoscale on session count; sessions are sticky to their pod for their
@@ -259,12 +334,13 @@ care:
   (client) and the daemon/controller need **no changes**.
 - **Auth lives here** (§12): the FaaS `$connect`/handshake is the natural place to
   validate a session token before pairing.
-- **TURN credentials:** the signaling FaaS is also the natural issuer of short-lived
-  coturn credentials (TURN REST API) handed to each peer at session start.
+- **STUN config:** the signaling relay also hands each peer its STUN servers on connect
+  (for aiortc's direct cross-NAT P2P). A media **relay** (both ends behind hard NAT) is the
+  LiveKit backend's job, not coturn under aiortc — see §11.1.
 
 So the split is clean: **signaling = stateless-ish FaaS** (cheap, bursty, per-session
-affinity via DO/store); **media = P2P or coturn** (never in FaaS); **control logic =
-K8s pods**.
+affinity via DO/store); **media = direct P2P (aiortc) or the LiveKit SFU** (never in FaaS);
+**control logic = K8s pods**.
 
 ### 11.3 Session lifecycle across the system
 
@@ -272,8 +348,9 @@ K8s pods**.
    the WebRTC offer → relay **buffers** it.
 2. A cloud controller pod starts a session → opens WS (`role=controller`, same
    `session_id`) → relay flushes the buffered offer → controller answers → relay forwards.
-3. ICE (STUN, else coturn) establishes the P2P media+data path. **Relay drops out of the
-   data path.**
+3. ICE (host + STUN) establishes the **direct** P2P media+data path. **Relay drops out of
+   the data path.** (If both ends are unreachable behind hard NAT, that's the LiveKit
+   backend's case instead — see §11.1.)
 4. Stream obs / send actions / run control-plane RPCs.
 5. Session ends or drops → relay `bye` to the survivor → daemon **safes the arm**, resets,
    loops for the next session (it outlives any one session).
@@ -288,7 +365,6 @@ K8s pods**.
   user to a `session_id` and role; reject mismatched pairings. This is what stops
   cross-tenant hijacking; the shared token is only the first gate.
 - **DTLS-SRTP** encrypts media/data end-to-end for free (WebRTC mandatory).
-- **TURN credentials** are short-lived, per-session (TURN REST).
 - **Daemon identity:** the Mac daemon authenticates to the relay; a stolen `session_id`
   must not let an attacker drive someone's arm. Tokens + per-daemon keys.
 
@@ -300,7 +376,7 @@ K8s pods**.
 | M2 | Real `so_follower` (joints/action/torque) + SO-100 example | `[done]` |
 | M3 | WS signaling + Mac daemon + control plane (discovery, plan, grab) | `[done]` (same-host) |
 | — | Seq-based obs pairing (pts carrier); provenance + applied feedback; configurable channel reliability | `[done]` |
-| M4 | Public-net: coturn, K8s media (hostNetwork/announced IP), FaaS signaling, auth | `[planned]` |
+| M4 | Public-net: STUN distribution `[done]`; K8s media (hostNetwork/announced IP), FaaS signaling, auth | `[planned]` |
 | M5 | Paradigm: real-time vs intent+local-autonomy; SFU for scale | `[planned]` |
 
 ## 14. Open questions

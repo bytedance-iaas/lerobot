@@ -30,31 +30,13 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
-from fractions import Fraction
 
 import numpy as np
-from aiortc import (
-    MediaStreamTrack,
-    RTCConfiguration,
-    RTCIceServer,
-    RTCPeerConnection,
-    RTCSessionDescription,
-)
-from av import VideoFrame
 
 from .control import ControlServer, DeviceInventory, SyntheticInventory
-from .protocol import (
-    CH_ACTION,
-    CH_CONTROL,
-    CH_STATE,
-    RELIABLE_KWARGS,
-    VIDEO_CLOCK_RATE,
-    VIDEO_PTS_PER_SEQ,
-    ActionMsg,
-    StateMsg,
-    channel_kwargs,
-)
+from .protocol import CH_ACTION, CH_CONTROL, CH_STATE, ActionMsg, StateMsg
 from .signaling import Signaling
+from .transport import Transport, make_transport
 
 logger = logging.getLogger(__name__)
 
@@ -75,34 +57,16 @@ def _fit_frame(img: np.ndarray, height: int, width: int) -> np.ndarray:
     return np.ascontiguousarray(img)
 
 
-class _SyntheticCameraTrack(MediaStreamTrack):
-    """Outbound video track fed by the capture loop via an asyncio queue.
-
-    The capture seq is encoded into each frame's pts (``pts = seq * VIDEO_PTS_PER_SEQ``)
-    so the cloud can pair the frame to the state with the same seq.
-    """
-
-    kind = "video"
-
-    def __init__(self, queue: asyncio.Queue[tuple[int, np.ndarray]]) -> None:
-        super().__init__()
-        self._queue = queue
-
-    async def recv(self) -> VideoFrame:
-        seq, img = await self._queue.get()
-        frame = VideoFrame.from_ndarray(img, format="rgb24")
-        # Carry the capture seq in pts so the cloud can pair this frame to its state.
-        frame.pts = seq * VIDEO_PTS_PER_SEQ
-        frame.time_base = Fraction(1, VIDEO_CLOCK_RATE)
-        return frame
-
-
 class CaptureAgent:
-    """Synthetic Mac-side endpoint of the WebRTC proxy link."""
+    """Mac-side endpoint of the proxy link: publishes state + camera, applies actions.
+
+    Transport-agnostic: it talks to a :class:`Transport` (default aiortc). Swap the
+    transport for another backend (e.g. LiveKit) without touching this logic.
+    """
 
     def __init__(
         self,
-        signaling: Signaling,
+        signaling: Signaling | None,  # None for livekit (it does its own signaling)
         motors: list[str],
         cam_name: str,
         cam_height: int,
@@ -116,12 +80,13 @@ class CaptureAgent:
         robot=None,  # a connected lerobot Robot (so_follower) — drives joints+action+torque (M2)
         reliable_state: bool = False,  # True for record (no lost obs); False for teleop/eval (fresh)
         reliable_action: bool = False,
+        transport_backend: str = "aiortc",  # "aiortc" (default) | "livekit"
+        livekit_url: str | None = None,
+        livekit_token: str | None = None,
+        transport: Transport | None = None,  # explicit transport overrides the backend
     ) -> None:
         self.signaling = signaling
         self.motors = list(motors)
-        self._ice_servers = list(ice_servers or [])
-        self._state_kwargs = channel_kwargs(reliable_state)
-        self._action_kwargs = channel_kwargs(reliable_action)
         self.cam_name = cam_name
         self.cam_h = cam_height
         self.cam_w = cam_width
@@ -129,18 +94,23 @@ class CaptureAgent:
         self.action_timeout_s = action_timeout_s
         self._on_safe_stop = on_safe_stop
 
-        # iceServers=[] => host candidates only (loopback / same-host two-process).
-        # M4 passes STUN/TURN urls here for real public-net peers.
-        ice = [RTCIceServer(urls=u) for u in self._ice_servers]
-        self.pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=ice))
-        self._frame_q: asyncio.Queue[tuple[int, np.ndarray]] = asyncio.Queue(maxsize=2)
-        self._ch_state = None
-        self._ch_action = None
-        self._ch_control = None
+        # The transport offers + sends video, exposes the data channels. The publisher
+        # (Mac) sets channel reliability; control is always reliable.
+        self._transport = transport or make_transport(
+            transport_backend,
+            role="publisher",
+            channels={CH_STATE: reliable_state, CH_ACTION: reliable_action, CH_CONTROL: True},
+            ice_servers=ice_servers,
+            livekit_url=livekit_url,
+            livekit_token=livekit_token,
+        )
+        self.closed = self._transport.closed  # set when the link drops
+        self._transport.channel(CH_ACTION).on_message(self._on_action)
         self._control = ControlServer(
             inventory if inventory is not None else SyntheticInventory(),
             on_camera_plan=self._apply_camera_plan,
         )
+        self._control.attach(self._transport.channel(CH_CONTROL))
         self._camera = camera
         self._robot = robot
         self._last_real_frame: np.ndarray | None = None
@@ -158,37 +128,15 @@ class CaptureAgent:
         self._safed = False
         self._tasks: list[asyncio.Task] = []
         self._stop = asyncio.Event()
-        self.closed = asyncio.Event()  # set when the peer connection drops
 
     # ----- lifecycle -------------------------------------------------------
     async def run(self) -> None:
-        """Connect (as offerer) and start the capture/watchdog loops.
+        """Establish the transport (offer) and start the capture/watchdog loops.
 
-        Opens its own signaling, offers, waits for the answer, then returns once the
-        loops are running. Use :pymeth:`wait_closed` to block until the link drops.
+        Returns once the loops are running; use :pymeth:`wait_closed` to block until
+        the link drops.
         """
-
-        @self.pc.on("connectionstatechange")
-        async def _on_conn_state() -> None:
-            logger.info("CaptureAgent connectionState=%s", self.pc.connectionState)
-            if self.pc.connectionState in ("failed", "closed", "disconnected"):
-                self.closed.set()
-
-        await self.signaling.open()
-        self._ch_state = self.pc.createDataChannel(CH_STATE, **self._state_kwargs)
-        self._ch_action = self.pc.createDataChannel(CH_ACTION, **self._action_kwargs)
-        self._ch_action.on("message", self._on_action)
-        self._ch_control = self.pc.createDataChannel(CH_CONTROL, **RELIABLE_KWARGS)
-        self._control.attach(self._ch_control)
-
-        self.pc.addTrack(_SyntheticCameraTrack(self._frame_q))
-
-        await self.pc.setLocalDescription(await self.pc.createOffer())
-        await self.signaling.send(self.pc.localDescription)
-        answer = await self.signaling.recv()
-        if not isinstance(answer, RTCSessionDescription):
-            raise RuntimeError(f"capture agent expected an SDP answer, got {type(answer)!r}")
-        await self.pc.setRemoteDescription(answer)
+        await self._transport.open(self.signaling)
 
         if self._robot is not None and self._io is not None:
             # New session: re-enable torque (a previous session's safe-stop may have cut it).
@@ -212,11 +160,11 @@ class CaptureAgent:
 
     async def close(self) -> None:
         self._stop.set()
-        self.closed.set()
         for t in self._tasks:
             t.cancel()
-        await self.pc.close()
-        await self.signaling.close()
+        await self._transport.close()
+        if self.signaling is not None:
+            await self.signaling.close()
         if self._io is not None:
             # Let a pending safe-stop (disable_torque) finish, then stop the io thread.
             self._io.shutdown(wait=True)
@@ -310,23 +258,19 @@ class CaptureAgent:
             else:
                 joints, img = self._capture_sample(t, seq)
 
-            if self._ch_state is not None and self._ch_state.readyState == "open":
-                # Piggyback the last applied action (seq + time) so the cloud can
-                # confirm landing and measure round-trip without an extra channel.
-                self._ch_state.send(
-                    StateMsg(
-                        t=t,
-                        seq=seq,
-                        joints=joints,
-                        applied_seq=self._action_seq,
-                        applied_t=self._last_action_t,
-                    ).to_json()
-                )
-            # The frame carries its seq in pts (set by the track). Drop the oldest
-            # pending frame rather than block the capture clock.
-            if self._frame_q.full():
-                _ = self._frame_q.get_nowait()
-            self._frame_q.put_nowait((seq, img))
+            # Piggyback the last applied action (seq + time) so the cloud can confirm
+            # landing and measure round-trip without an extra channel.
+            self._transport.channel(CH_STATE).send(
+                StateMsg(
+                    t=t,
+                    seq=seq,
+                    joints=joints,
+                    applied_seq=self._action_seq,
+                    applied_t=self._last_action_t,
+                ).to_json()
+            )
+            # The frame carries its seq in its pts (set inside the transport).
+            self._transport.send_frame(seq, img)
 
             next_t += self.period
             await asyncio.sleep(max(0.0, next_t - time.monotonic()))

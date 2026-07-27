@@ -134,6 +134,14 @@ webrtc = [
     "aiohttp>=3.9.0,<4.0.0",  # WebSocket signaling client + relay server
     "lerobot[av-dep]",
 ]
+# Optional alternative transport backend (SFU; cross-public-net / scale). EXPERIMENTAL.
+# `livekit` provides livekit.rtc (the transport); `livekit-api` provides livekit.api,
+# used to self-sign room tokens (mac_daemon/cloud_teleop --livekit-api-key/secret).
+webrtc-livekit = [
+    "lerobot[webrtc]",
+    "livekit>=0.18.0,<2.0.0",
+    "livekit-api>=0.8.0,<2.0.0",
+]
 # ── User-facing composite extras (map to CLI scripts) ─────
 # lerobot-record, lerobot-replay, lerobot-calibrate, lerobot-teleoperate, etc.
 core_scripts = ["lerobot[dataset]", "lerobot[hardware]", "lerobot[viz]"]
