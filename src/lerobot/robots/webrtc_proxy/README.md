@@ -28,9 +28,8 @@ run the relay + daemon + controller as separate loops in one process — see
  Mac daemon (offerer)                       Cloud controller (answerer)
  CaptureAgent                               WebRTCProxyRobot  (Robot subclass)
   ├─ capture loop @ capture_fps              ├─ get_observation()  ← AlignmentBuffer
-  │   ├─ joints+ts  ─ DataChannel state ───▶ │      (pairs by CAPTURE timestamp)
-  │   ├─ {seq,ts}   ─ DataChannel framemeta ▶│
-  │   └─ frame      ─ media track (H264/VP8)▶│   _ProxyEndpoint (async, bg loop)
+  │   ├─ joints + seq ─ DataChannel state ─▶ │      (pairs state↔frame by SEQ)
+  │   └─ frame(seq in pts) ─ media track ──▶ │   _ProxyEndpoint (async, bg loop)
   ├─ action handler ◀ DataChannel action ─── ┤   send_action()  → action DataChannel
   └─ watchdog (P0 safe-stop)                 └─ _EventLoopThread bridges sync↔async
 ```
@@ -41,11 +40,11 @@ run the relay + daemon + controller as separate loops in one process — see
   answers `list_ports` / `list_cameras` / `grab_camera` / `find_port_*` /
   `set_camera_plan`; `ControlClient` (cloud) matches responses by id. Port/camera IDs
   stay Mac-local.
-- **`alignment.py`** — `AlignmentBuffer`: thread-safe nearest-neighbour pairing of
-  state↔frame by Mac-side `time.monotonic()` capture timestamp (难点 A). Public-net
-  jitter becomes latency, never reordering.
-- **`capture_agent.py`** — Mac endpoint (synthetic in M1). Owns the capture clock,
-  pushes state/framemeta/video, applies actions, runs the **watchdog** (难点 C).
+- **`alignment.py`** — `AlignmentBuffer`: thread-safe pairing of state↔frame by capture
+  **seq** (难点 A; joints+frame share a seq, the frame's seq rides its pts). A dropped
+  frame/state just skips that seq — no cascade. See `DESIGN.md` §5.1.
+- **`capture_agent.py`** — Mac endpoint. Owns the capture clock, pushes state + video
+  (seq in pts), applies actions, runs the **watchdog** (难点 C).
 - **`proxy_robot.py`** — `WebRTCProxyRobot` (sync `Robot` API) + `_ProxyEndpoint`
   (async answerer) + `_EventLoopThread` (sync↔async bridge).
 - **`signaling.py`** — `Signaling` protocol + `WebSocketSignaling` client (real
@@ -150,19 +149,22 @@ uv run pytest tests/robots/test_webrtc_proxy_*.py -p no:hydra_pytest -q
 
 ## Known limitations (M1 — to fix in later milestones)
 
-- **framemeta 1:1 pop assumes a lossless link.** The cloud tags each decoded video
-  frame with the next `framemeta` `{seq,t}` in order. On a real link with frame
-  drops this de-syncs. Production must carry `seq` in an RTP header extension or
-  in-pixel. (M3)
+- **Frame seq rides `pts`, recovered relative to the first received frame.** Robust to
+  mid-stream frame loss (a drop just skips a seq), but the receiver re-bases the first
+  received frame to pts=0, so if the *initial* frame is lost the seq offset shifts.
+  Mitigated by resetting seq per session; production should carry an absolute seq in an
+  RTP header extension. See `DESIGN.md` §5.1.
 - **Single camera.** M1 transports one media track. Multi-camera = one track each. (M2)
-- **Source: camera real, arm still synthetic.** `--real-camera` streams a real
-  opencv camera over the media track (`CaptureAgent` reads `camera.read_latest()`).
-  The daemon opens at the requested capture size, falling back to native if the
-  camera rejects it; `_fit_frame` + the cloud's defensive re-fit guarantee the
-  declared obs shape, so `--width/--height` need not match the cloud config exactly
-  (the cloud also pushes its spec via `set_camera_plan` at connect). Joints
-  (`_capture_sample`), `_apply_action` and `_safe_stop` are still stubs — M2 wires
-  them to a real `so_follower` (read present position, drive goal, cut torque).
+- **Real robot (M2).** Pass a connected lerobot `Robot` (e.g. `SO100Follower`) to the
+  daemon (`run_daemon(robot=...)`): joints + camera come from one `robot.get_observation()`
+  (shared capture instant), actions call `robot.send_action`, and the watchdog cuts
+  torque via `robot.bus.disable_torque()`. All serial-bus access runs on one worker
+  thread so the public-net loop never blocks and the bus is never touched concurrently.
+  See `examples/webrtc_remote_so100`. Without a robot, the synthetic source (or a bare
+  `--real-camera`) still works for transport testing.
+- **Camera sizing.** The daemon opens at the requested capture size, falling back to
+  native if the camera rejects it; `_fit_frame` + the cloud's defensive re-fit guarantee
+  the declared obs shape, and the cloud pushes its spec via `set_camera_plan` at connect.
 - **Device inventory: real but read-only.** `--real-devices` enumerates the Mac's
   actual ports + cameras (`LocalDeviceInventory`), so cloud-driven `find_port` /
   `list_cameras` return real ids. Default stays `SyntheticInventory`. Persisting the

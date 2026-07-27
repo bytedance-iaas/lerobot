@@ -12,110 +12,72 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Capture-timestamp alignment buffer (handoff 难点 A).
+"""Capture-seq alignment buffer (handoff 难点 A).
 
-The cloud receives proprioceptive state and camera frames on *separate* channels
-that traverse the public internet with independent jitter. Pairing them by
-*arrival* time would let network jitter corrupt the temporal ordering of a
-recorded dataset. Instead we pair by the Mac-side *capture* timestamp carried with
-each sample, so public-net jitter only adds latency — never reorders.
+The cloud receives proprioceptive state (state DataChannel) and camera frames
+(media track) on *separate* channels with independent jitter/loss. Each carries the
+Mac-side capture **seq** of the cycle that produced it (joints + image come from one
+``robot.get_observation()`` on the Mac, so they share a seq; the frame's seq rides
+its ``pts``). Pairing by seq is therefore *exact* — a state and a frame with the same
+seq are from the same capture instant — and robust to loss: a dropped frame or state
+just means that seq is incomplete; we use the freshest seq present on both sides.
 
-``AlignmentBuffer`` keeps a short bounded history of state and frame samples and,
-on demand, returns the most recent state paired with the camera frame whose
-capture timestamp is nearest to that state's. It is deliberately tiny and
-thread-safe via a single lock: producers (asyncio receive callbacks) push from one
-thread, the consumer (``get_observation``) pulls from another.
+Deliberately tiny and thread-safe via a single lock: producers (asyncio receive
+callbacks) push from one thread, the consumer (``get_observation``) pulls from
+another.
 """
 
 from __future__ import annotations
 
-import bisect
 import threading
-from collections import deque
 from dataclasses import dataclass
-from typing import Generic, TypeVar
 
 import numpy as np
-
-T = TypeVar("T")
-
-
-@dataclass
-class _Sample(Generic[T]):
-    t: float
-    value: T
 
 
 @dataclass(frozen=True)
 class AlignedObs:
-    """Result of pairing one state sample with its nearest-in-time camera frame."""
+    """A state and a camera frame from the same capture seq."""
 
-    t_state: float
+    seq: int
+    t: float  # Mac capture time.monotonic() of this cycle (from the state)
     joints: dict[str, float]
-    frame: np.ndarray | None  # HxWx3 uint8 RGB, or None if no frame buffered yet
-    t_frame: float | None
-    seq_state: int
-
-    @property
-    def skew_ms(self) -> float | None:
-        """Absolute capture-time gap between the paired state and frame, in ms."""
-        if self.t_frame is None:
-            return None
-        return abs(self.t_state - self.t_frame) * 1e3
+    frame: np.ndarray  # HxWx3 uint8 RGB
 
 
 class AlignmentBuffer:
-    """Bounded, thread-safe nearest-neighbour pairing of state and frames by capture ts."""
+    """Bounded, thread-safe pairing of state and frames by capture seq."""
 
-    def __init__(self, maxlen: int = 64, pair_tolerance_s: float = 0.1) -> None:
-        # frames kept in a time-sorted structure for nearest-neighbour search.
-        self._frame_t: deque[float] = deque(maxlen=maxlen)
-        self._frame_v: deque[np.ndarray] = deque(maxlen=maxlen)
-        self._states: deque[_Sample[dict[str, float]]] = deque(maxlen=maxlen)
-        self._state_seq: deque[int] = deque(maxlen=maxlen)
+    def __init__(self, maxlen: int = 128) -> None:
+        self._states: dict[int, tuple[float, dict[str, float]]] = {}  # seq -> (t, joints)
+        self._frames: dict[int, np.ndarray] = {}  # seq -> frame
+        self._maxlen = maxlen
         self._lock = threading.Lock()
 
-    def add_state(self, t: float, joints: dict[str, float], seq: int) -> None:
+    def add_state(self, seq: int, t: float, joints: dict[str, float]) -> None:
         with self._lock:
-            self._states.append(_Sample(t, dict(joints)))
-            self._state_seq.append(seq)
+            self._states[seq] = (t, dict(joints))
+            self._evict(self._states)
 
-    def add_frame(self, t: float, frame: np.ndarray) -> None:
+    def add_frame(self, seq: int, frame: np.ndarray) -> None:
         with self._lock:
-            self._frame_t.append(t)
-            self._frame_v.append(frame)
+            self._frames[seq] = frame
+            self._evict(self._frames)
 
-    def _nearest_frame_locked(self, t: float) -> tuple[float | None, np.ndarray | None]:
-        if not self._frame_t:
-            return None, None
-        times = list(self._frame_t)  # deque is append-sorted by capture order == time order
-        i = bisect.bisect_left(times, t)
-        # candidates straddling t: i-1 and i
-        best_idx, best_dt = None, None
-        for j in (i - 1, i):
-            if 0 <= j < len(times):
-                dt = abs(times[j] - t)
-                if best_dt is None or dt < best_dt:
-                    best_dt, best_idx = dt, j
-        if best_idx is None:
-            return None, None
-        return times[best_idx], self._frame_v[best_idx]
+    def _evict(self, d: dict) -> None:
+        # Bounded ring: drop the lowest (oldest) seqs once over capacity.
+        while len(d) > self._maxlen:
+            del d[min(d)]
 
     def assemble(self) -> AlignedObs | None:
-        """Pair the newest state with its nearest frame. None if no state yet."""
+        """The freshest seq present on BOTH sides, or None if there is no such pair."""
         with self._lock:
-            if not self._states:
+            common = self._states.keys() & self._frames.keys()
+            if not common:
                 return None
-            state = self._states[-1]
-            seq = self._state_seq[-1]
-            t_frame, frame = self._nearest_frame_locked(state.t)
-            return AlignedObs(
-                t_state=state.t,
-                joints=dict(state.value),
-                frame=frame,
-                t_frame=t_frame,
-                seq_state=seq,
-            )
+            seq = max(common)
+            t, joints = self._states[seq]
+            return AlignedObs(seq=seq, t=t, joints=dict(joints), frame=self._frames[seq])
 
     def has_state(self) -> bool:
         with self._lock:
