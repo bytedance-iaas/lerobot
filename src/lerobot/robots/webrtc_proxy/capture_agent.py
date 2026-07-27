@@ -33,9 +33,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
+from . import tiling
 from .control import ControlServer, DeviceInventory, SyntheticInventory
 from .protocol import CH_ACTION, CH_CONTROL, CH_STATE, ActionMsg, StateMsg
-from .signaling import Signaling
+from .signaling import Signaling, SignalingClosed
 from .transport import Transport, make_transport
 
 logger = logging.getLogger(__name__)
@@ -68,15 +69,17 @@ class CaptureAgent:
         self,
         signaling: Signaling | None,  # None for livekit (it does its own signaling)
         motors: list[str],
-        cam_name: str,
-        cam_height: int,
-        cam_width: int,
+        cam_name: str | None = None,  # single-camera (back-compat); else use `cameras`
+        cam_height: int | None = None,
+        cam_width: int | None = None,
         capture_fps: int = 30,
         action_timeout_s: float = 0.5,
         on_safe_stop: Callable[[], None] | None = None,
         inventory: DeviceInventory | None = None,
         ice_servers: list[str] | None = None,
         camera=None,  # an opened lerobot Camera (read_latest); None => synthetic frames
+        cameras: dict[str, tuple[int, int]] | None = None,  # multi-cam: name -> (height, width)
+        cameras_src: dict | None = None,  # multi-cam: name -> opened Camera (read_latest)
         robot=None,  # a connected lerobot Robot (so_follower) — drives joints+action+torque (M2)
         reliable_state: bool = False,  # True for record (no lost obs); False for teleop/eval (fresh)
         reliable_action: bool = False,
@@ -87,9 +90,15 @@ class CaptureAgent:
     ) -> None:
         self.signaling = signaling
         self.motors = list(motors)
+        # Single camera keeps cam_name/cam_h/cam_w (dynamic via set_camera_plan); multi
+        # camera uses a fixed `cameras` map. _capture_sample tiles whichever applies, and a
+        # single camera tiles to the identity frame (so single-cam stays byte-identical).
+        self._multi_cameras = dict(cameras) if cameras else None
         self.cam_name = cam_name
         self.cam_h = cam_height
         self.cam_w = cam_width
+        self._cams_src = dict(cameras_src) if cameras_src else ({cam_name: camera} if camera else {})
+        self._last_frames: dict[str, np.ndarray] = {}  # per-camera last good frame
         self.period = 1.0 / capture_fps
         self.action_timeout_s = action_timeout_s
         self._on_safe_stop = on_safe_stop
@@ -111,9 +120,7 @@ class CaptureAgent:
             on_camera_plan=self._apply_camera_plan,
         )
         self._control.attach(self._transport.channel(CH_CONTROL))
-        self._camera = camera
         self._robot = robot
-        self._last_real_frame: np.ndarray | None = None
         # All serial-bus access (read joints, send action, toggle torque) goes through
         # ONE worker thread so the public-net event loop never blocks on serial and the
         # bus is never touched concurrently. None when there is no real robot.
@@ -146,7 +153,31 @@ class CaptureAgent:
             asyncio.ensure_future(self._capture_loop()),
             asyncio.ensure_future(self._watchdog_loop()),
         ]
+        # Recycle fast: keep watching the signaling channel so the relay's "bye" (controller
+        # left) ends the session in sub-second time, instead of waiting ~10-30s for WebRTC's
+        # own ICE/DTLS disconnect detection. Only for aiortc (livekit has its own signaling).
+        if self.signaling is not None:
+            self._tasks.append(asyncio.ensure_future(self._watch_signaling()))
         logger.info("CaptureAgent connected; streaming %d motors + camera %r", len(self.motors), self.cam_name)
+
+    async def _watch_signaling(self) -> None:
+        """End the session promptly when the relay reports the controller left ("bye").
+
+        After the offer/answer exchange the signaling socket is otherwise idle; reading it
+        lets us notice the peer's departure immediately and recycle for the next session,
+        rather than waiting for the media link's slow timeout.
+        """
+        try:
+            while not self._stop.is_set():
+                await self.signaling.recv()  # blocks; raises SignalingClosed on bye / close
+        except SignalingClosed:
+            logger.info("signaling: controller left (bye) -> ending session for fast recycle")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("signaling watcher error")
+        finally:
+            self.closed.set()  # unblock wait_closed() -> daemon loops to the next session
 
     async def wait_closed(self) -> None:
         """Block until the WebRTC link to the controller drops."""
@@ -170,40 +201,54 @@ class CaptureAgent:
             self._io.shutdown(wait=True)
 
     # ----- capture / actuation -------------------------------------------
+    def _specs(self) -> list[tuple[str, int, int]]:
+        """Ordered (name, h, w) per camera. Single camera tracks the (plan-mutable)
+        cam_name/cam_h/cam_w; multi camera is the fixed ``cameras`` map."""
+        if self._multi_cameras is not None:
+            return tiling.ordered_specs(self._multi_cameras)
+        return [(self.cam_name, self.cam_h, self.cam_w)]
+
     def _capture_sample(self, t: float, seq: int) -> tuple[dict[str, float], np.ndarray]:
-        """One sample: joints + a camera frame.
+        """One sample: joints + a (possibly multi-camera, tiled) frame.
 
-        With a real ``robot``, both come from a single ``robot.get_observation()`` (so
-        they share a capture instant). Else: a real camera if attached, otherwise a
-        synthetic seq-coloured frame; joints are a synthetic sinusoid.
+        With a real ``robot``, joints and every camera come from a single
+        ``robot.get_observation()`` (so they share a capture instant). Else: each camera is
+        a real one if attached (``cameras_src``), otherwise a synthetic per-camera coloured
+        frame; joints hold the last commanded pose. Frames are tiled into one (single
+        camera => identity), preserving the one-frame-per-seq pipeline.
         """
-        if self._robot is not None:
-            obs = self._robot.get_observation()
+        specs = self._specs()
+        obs = self._robot.get_observation() if self._robot is not None else None
+        if obs is not None:
             joints = {k: float(v) for k, v in obs.items() if k.endswith(".pos")}
-            frame = obs.get(self.cam_name)
-            if frame is not None:
-                self._last_real_frame = _fit_frame(frame, self.cam_h, self.cam_w)
-            img = self._last_real_frame
-            if img is None:
-                img = np.zeros((self.cam_h, self.cam_w, 3), dtype=np.uint8)
-            return joints, img
-
-        # Synthetic arm: hold the last commanded pose, so a jog visibly moves the joints
-        # (lets you test the full loop without real hardware). Camera stays live below.
-        joints = dict(self._last_goal)
-        if self._camera is not None:
-            try:
-                img = _fit_frame(self._camera.read_latest(max_age_ms=1000), self.cam_h, self.cam_w)
-                self._last_real_frame = img
-            except Exception:
-                # Camera warming up / momentarily stale: reuse last good frame (or black).
-                img = self._last_real_frame
-                if img is None:
-                    img = np.zeros((self.cam_h, self.cam_w, 3), dtype=np.uint8)
         else:
-            img = np.empty((self.cam_h, self.cam_w, 3), dtype=np.uint8)
-            img[:] = (seq % 256, (seq * 5) % 256, 128)
-        return joints, img
+            joints = dict(self._last_goal)  # synthetic arm: hold last commanded pose
+
+        frames: dict[str, np.ndarray] = {}
+        for idx, (name, h, w) in enumerate(specs):
+            frames[name] = self._camera_frame(name, h, w, seq, idx, obs)
+        return joints, tiling.tile(frames, specs)
+
+    def _camera_frame(self, name, h, w, seq, idx, obs) -> np.ndarray:  # noqa: ANN001
+        """One camera's frame at ``(h, w)``: from the robot obs, a real camera, or synthetic."""
+        if obs is not None:
+            frame = obs.get(name)
+            if frame is not None:
+                self._last_frames[name] = _fit_frame(frame, h, w)
+        else:
+            src = self._cams_src.get(name)
+            if src is not None:
+                try:
+                    self._last_frames[name] = _fit_frame(src.read_latest(max_age_ms=1000), h, w)
+                except Exception:
+                    pass  # camera warming up / stale: fall through to last good (or synthetic)
+            elif name not in self._last_frames:
+                # Synthetic, distinct per camera (idx) so each tile is identifiable.
+                img = np.empty((h, w, 3), dtype=np.uint8)
+                img[:] = ((seq + idx * 64) % 256, (seq * 5) % 256, (idx * 80) % 256)
+                return img
+        got = self._last_frames.get(name)
+        return got if got is not None else np.zeros((h, w, 3), dtype=np.uint8)
 
     def _apply_action(self, goal: dict[str, float]) -> dict[str, float]:
         """Drive the arm (runs on the io thread). Returns the action actually sent."""

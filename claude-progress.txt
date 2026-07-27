@@ -14,6 +14,17 @@ Task scope: (1) LiveKit 传输 backend 端到端跑通 +(2) 给 aiortc 路径加
 - 同时补:cloud_teleop --auth-token(连鉴权 relay);proxy_robot.connect 分阶段日志 +
   超时报错(指出卡信令还是媒体);webrtc-livekit extra 补 livekit-api(自签 token 用)。
 
+== 子任务3:多相机(tiled)+ 通用机器人入口(已实现并测,43 passed)==
+- 多相机:单 track 拼帧(tiling.py:ordered_specs/tile/untile,纵向堆叠、按宽 pad、无损切回)。
+  采集端 CaptureAgent 拼,云端 get_observation 切;Transport/AlignmentBuffer/信令不动;
+  单相机=identity(旧行为不变)。选拼帧而非多 track:aiortc Python 编码受 GIL,一个编码器更省。
+  3 相机端到端测试(tests/test_webrtc_proxy_multicam.py,验证切片不串)。
+- 通用机器人:mac_daemon 加 `--robot.type=… --robot.port=…`(draccus,非破坏式 parse_known_args
+  + 模块级 _RobotWrap 包装 RobotConfig);make_robot_from_config 建任意已注册机器人(so100/101/
+  koch/omx/lekiwi…),connect 后从 robot.observation_features 自动推 motors+cameras 传给 run_daemon。
+  云端 WebRTCProxyRobotConfig 需声明相同 schema(daemon 连上会 log 出来)。看门狗仍假设
+  robot.bus.disable_torque()(无 bus 的机器人需自定义 on_safe_stop)。
+
 == (历史)子任务2 v2:aiortc coturn TURN —— 已撤销,见上 v3 ==
 - signaling_server.py:IceConfig(STUN/TURN url + 现签凭据)+ _coturn_credentials
   (username="<expiry>:<sess:role>", credential=base64(HMAC_SHA1(secret,username)));
