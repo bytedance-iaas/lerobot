@@ -467,10 +467,25 @@ class HermesACP:
         """Used after the Volcengine key changes (a new session picks it up)."""
         async with self._start_lock:
             if self.alive:
+                old = self.proc
                 try:
-                    self.proc.terminate()
+                    old.terminate()
                 except ProcessLookupError:
                     pass
+                # WAIT for the old process to actually die before spawning the new one.
+                # terminate() alone raced: the old process's read-loop ended AFTER the new
+                # spawn's initialize was registered, and its exit cleanup failed every
+                # pending future — killing the new initialize with "hermes acp exited"
+                # (the recurring restart failure). Escalate to SIGKILL if it lingers
+                # (a stuck tool can ignore SIGTERM).
+                try:
+                    await asyncio.wait_for(old.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    try:
+                        old.kill()
+                    except ProcessLookupError:
+                        pass
+                    await old.wait()
             self.proc = None
             self.session_id = None
             self._directive_sent.clear()
@@ -484,13 +499,24 @@ class HermesACP:
         # session's context so the agent always sees it — instead of only auto-discovering it
         # when a message happens to match its description. CHAT_SKILL defaults to robot_sft.
         skill_args = ["--skills", CHAT_SKILL] if CHAT_SKILL else []
-        self.proc = await asyncio.create_subprocess_exec(
-            HERMES_BIN, *skill_args, "acp", "--accept-hooks",
-            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL, cwd=WORKDIR, env=env,
-        )
-        self._pending = {}
-        asyncio.create_task(self._read_loop(self.proc))
+        # stderr goes to a log file, NOT DEVNULL: when the acp process dies, its dying
+        # words (traceback / fatal error) are the only evidence — DEVNULL made every
+        # "hermes acp exited" undebuggable.
+        stderr_path = Path(os.environ.get("HERMES_HOME", "/opt/data")) / "logs" / "acp_stderr.log"
+        stderr_path.parent.mkdir(parents=True, exist_ok=True)
+        stderr_f = open(stderr_path, "ab")
+        try:
+            self.proc = await asyncio.create_subprocess_exec(
+                HERMES_BIN, *skill_args, "acp", "--accept-hooks",
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                stderr=stderr_f, cwd=WORKDIR, env=env,
+            )
+        finally:
+            stderr_f.close()  # child holds its own fd copy
+        # Fresh pending map PER PROCESS, and the read loop is bound to (proc, its map):
+        # an old process's exit cleanup must never touch a newer process's requests.
+        self._pending = pending = {}
+        asyncio.create_task(self._read_loop(self.proc, pending))
         await self._request("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
         log.info("hermes acp ready")
 
@@ -573,7 +599,10 @@ class HermesACP:
         await self._write({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
         return await fut
 
-    async def _read_loop(self, proc: asyncio.subprocess.Process) -> None:
+    async def _read_loop(self, proc: asyncio.subprocess.Process, pending: dict) -> None:
+        # `pending` is THIS process's request map (see _spawn). Never use self._pending
+        # here: after a restart that attribute points at the NEW process's map, and the
+        # old loop's exit cleanup would fail the new process's in-flight requests.
         while True:
             line = await proc.stdout.readline()
             if not line:
@@ -583,27 +612,33 @@ class HermesACP:
             except json.JSONDecodeError:
                 continue
             if "id" in msg and ("result" in msg or "error" in msg):
-                fut = self._pending.pop(msg["id"], None)
+                fut = pending.pop(msg["id"], None)
                 if fut and not fut.done():
                     fut.set_result(msg.get("result") or {"_error": msg.get("error")})
             elif msg.get("method") == "session/update":
-                if self.on_update:
+                # Drop stale updates from a superseded process (post-restart stragglers).
+                if self.on_update and self.proc is proc:
                     try:
                         await self.on_update(msg["params"].get("update", {}))
                     except Exception:  # noqa: BLE001
                         log.debug("on_update failed", exc_info=True)
             elif msg.get("method") == "session/request_permission":
-                await self._reply_permission(msg)
+                if self.proc is proc:
+                    await self._reply_permission(msg)
             elif "id" in msg:  # server->client request we don't implement (e.g. fs/*)
-                await self._write({"jsonrpc": "2.0", "id": msg["id"],
-                                   "error": {"code": -32601, "message": "unsupported"}})
-        # process exited — drop the session so the next turn respawns
-        for fut in self._pending.values():
+                if self.proc is proc:
+                    await self._write({"jsonrpc": "2.0", "id": msg["id"],
+                                       "error": {"code": -32601, "message": "unsupported"}})
+        # process exited — fail ONLY this process's in-flight requests, and only reset
+        # live session state if we are still the current process (not superseded by restart).
+        for fut in pending.values():
             if not fut.done():
                 fut.set_exception(RuntimeError("hermes acp exited"))
-        self._pending = {}
-        self.session_id = None
-        log.warning("hermes acp process exited")
+        pending.clear()
+        if self.proc is proc:
+            self.session_id = None
+        log.warning("hermes acp process exited (rc=%s%s)", proc.returncode,
+                    "" if self.proc is proc else ", superseded")
 
     async def _reply_permission(self, msg: dict) -> None:
         params = msg.get("params", {})

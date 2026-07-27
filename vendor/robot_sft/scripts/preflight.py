@@ -184,6 +184,7 @@ def main() -> None:
                             start_new_session=True)
     start = time.time()
     timed_out = False
+    last_beat = start
     while proc.poll() is None:
         if time.time() - start > args.timeout:
             timed_out = True
@@ -195,6 +196,24 @@ def main() -> None:
         if gpu_ids:  # track peak memory of the training GPUs during the smoke run
             u, t = sample_gpu_mem(gpu_ids)
             peak_mb, total_mb = max(peak_mb, u), max(total_mb, t)
+        # Heartbeat: the smoke run's own output goes to the log FILE, so without this the
+        # console shows nothing for up to --timeout seconds (looks dead / stuck). Surface
+        # progress: elapsed, GPU memory, and the training log's most recent line.
+        now = time.time()
+        if now - last_beat >= 30:
+            last_beat = now
+            tail = ""
+            try:
+                with open(log_path, "rb") as lf:
+                    lf.seek(max(0, os.path.getsize(log_path) - 2048))
+                    lines = [ln.strip() for ln in
+                             lf.read().decode("utf-8", "replace").splitlines() if ln.strip()]
+                    tail = lines[-1][:160] if lines else ""
+            except OSError:
+                pass
+            mem = f" gpu={peak_mb}/{total_mb}MB" if peak_mb else ""
+            print(f"[preflight] running {int(now - start)}s/{args.timeout}s{mem}"
+                  + (f" | {tail}" if tail else ""), flush=True)
         time.sleep(5)
     logf.close()
 
