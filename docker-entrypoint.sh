@@ -29,8 +29,25 @@ fi
 #     session → switch replays full history. Pairs with CHAT_DIRECTIVE's system-prompt steer.
 #   NOTE: compression stays ENABLED (default) — it is unrelated to this bug and must stay on.
 if command -v hermes >/dev/null 2>&1; then
-  hermes config set delegation.orchestrator_enabled false >/dev/null 2>&1 || echo "WARN: could not set delegation.orchestrator_enabled"
-  echo "==> enforced: delegation.orchestrator_enabled=false (compression left ENABLED)"
+  hermes config set delegation.orchestrator_enabled false >/dev/null 2>&1 || true
+  # The REAL subagent kill-switch is disabling the "delegation" TOOLSET. orchestrator_enabled=false
+  # ONLY disables the async orchestrator — the basic `delegate` tool still spawns single subagents
+  # (verified: it kept creating source=subagent child sessions). Must be a YAML LIST: `hermes config
+  # set` stringifies JSON to '["delegation"]' which frozenset()s into chars and is inert. Edit
+  # config.yaml with the hermes interpreter; only rewrites when the entry is missing. Idempotent.
+  /opt/hermes/.venv/bin/python - "$HERMES_HOME/config.yaml" <<'PY' 2>/dev/null || echo "WARN: could not disable the delegation toolset"
+import sys, yaml
+p = sys.argv[1]
+c = yaml.safe_load(open(p)) or {}
+a = c.setdefault("agent", {})
+dt = a.get("disabled_toolsets")
+dt = dt if isinstance(dt, list) else []
+if "delegation" not in dt:
+    dt.append("delegation")
+    a["disabled_toolsets"] = dt
+    yaml.safe_dump(c, open(p, "w"), default_flow_style=False, allow_unicode=True, sort_keys=False)
+PY
+  echo "==> enforced: agent.disabled_toolsets includes 'delegation' (subagents OFF); compression left ENABLED"
 fi
 
 # robot_sft skill: keep it OFF the PVC so it TRACKS THE IMAGE and updates on every
