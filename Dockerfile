@@ -134,14 +134,17 @@ COPY vendor ./vendor
 # model). To change the model, edit this block only — nothing in server.py / index.html / app.js.
 ENV ARK_MODELS=doubao-seed-2-0-pro-260215,deepseek-v4-pro-260425
 
-# --- seed hermes config + bake the robot_sft skill INTO the image ----------- #
-# Drop the vendored skill into $HERMES_HOME/skills (hermes auto-discovers it),
-# then snapshot the seeded home to /opt/hermes-seed. At runtime a fresh PVC mount
-# shadows $HERMES_HOME, so the entrypoint restores skill+config from the snapshot
-# with a local copy — NO GitHub at build OR runtime.
-# (No `|| true`: if the skill can't be baked in, fail the build loudly.)
+# --- seed hermes config + LINK the robot_sft skill from the image ----------- #
+# The skill CONTENT stays in the image at /opt/agent-console/vendor/robot_sft; the
+# skills dir only holds a SYMLINK to it. hermes follows the symlink and discovers the
+# skill as "local/enabled" (verified). This keeps robot_sft OFF the PVC so it tracks
+# the image and updates on every rollout — instead of a real copy on the PVC that the
+# entrypoint would shadow forever (the entrypoint force-relinks on each boot too).
+# Then snapshot the seeded home (config + the symlink) to /opt/hermes-seed for the
+# fresh-PVC path. NO GitHub at build OR runtime.
+# (No `|| true`: if the skill can't be linked, fail the build loudly.)
 RUN mkdir -p "${HERMES_HOME}/skills" \
-    && cp -a /opt/agent-console/vendor/robot_sft "${HERMES_HOME}/skills/robot_sft" \
+    && ln -sfn /opt/agent-console/vendor/robot_sft "${HERMES_HOME}/skills/robot_sft" \
     && hermes config set model.provider custom \
     && hermes config set model.base_url https://ark.cn-beijing.volces.com/api/v3 \
     && hermes config set model.default doubao-seed-2-0-pro-260215 \
