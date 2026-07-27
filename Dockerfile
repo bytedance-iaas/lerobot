@@ -79,8 +79,17 @@ ENV HF_HOME=/opt/data/.cache/huggingface \
 # ACP extra only; no node/browser/messaging/matrix/voice/web-search/mcp.
 ARG HERMES_VERSION=0.17.0
 ARG HERMES_EXTRA_INDEX=https://mirrors.aliyun.com/pypi/simple/
+# HERMES_STREAM_STALE_TIMEOUT: the "no chunks received" streaming watchdog
+# (chat_completion_helpers.py). The code default is base=180, scaled to a floor of
+# 240s @>50K ctx / 300s @>100K ctx. A REASONING model (deepseek-v4-pro: up to 128K
+# thinking budget) can legitimately think for many minutes BEFORE the first output
+# chunk once the context is large — Ark buffers that reasoning, so hermes sees zero
+# chunks and kills the "stale" connection at 240s → RemoteProtocolError → the web
+# chat gets stuck. Raise the base to 600s so the model's thinking phase is never
+# reaped as a false stall (a genuinely hung socket still trips it, just later).
 ENV HERMES_HOME=/opt/data \
-    HERMES_DISABLE_LAZY_INSTALLS=1
+    HERMES_DISABLE_LAZY_INSTALLS=1 \
+    HERMES_STREAM_STALE_TIMEOUT=600
 RUN command -v uv >/dev/null 2>&1 || python -m pip install --no-cache-dir uv \
     && uv venv /opt/hermes/.venv \
     && VIRTUAL_ENV=/opt/hermes/.venv uv pip install --native-tls --no-cache-dir \
@@ -104,6 +113,13 @@ COPY scripts ./scripts
 # (installed for fp8) removed → a scary "Unable to import torchao Tensor objects" at import.
 # Patch diffusers to import each Tensor optionally. Idempotent; no-op if diffusers changes.
 RUN /lerobot/.venv/bin/python scripts/patch_diffusers_torchao.py
+# hermes' ACP layer (acp/connection.py) catches EVERY request-handler exception, wraps it
+# into a generic `RequestError.internal_error(...)` and `raise err from None` — DISCARDING the
+# traceback. So a real bug inside a tool handler (e.g. `process wait` hitting None.startswith)
+# reaches the web chat as an opaque "Internal error" with no file:line, and the session gets
+# stuck undebuggably. Patch ACP to log the real traceback FIRST. Runs in the HERMES venv (that
+# is where acp/ lives). Idempotent; no-op if hermes changes.
+RUN /opt/hermes/.venv/bin/python scripts/patch_acp_logging.py
 # Session listing runs INSIDE the hermes venv (it imports hermes_state), so this one
 # file lives next to that venv and is invoked with its interpreter, not ours.
 COPY hermes_session_api.py /opt/hermes/session_api.py
