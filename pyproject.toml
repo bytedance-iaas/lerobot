@@ -127,6 +127,13 @@ viz = [
     "rerun-sdk>=0.24.0,<0.34.0",
     "foxglove-sdk>=0.25.1,<0.26.0",
 ]
+# WebRTCProxyRobot transport (cloud-side proxy <-> Mac-side capture agent over WebRTC).
+# aiortc pulls in PyAV (decoded frames as ndarray) + DataChannels; see src/lerobot/robots/webrtc_proxy.
+webrtc = [
+    "aiortc>=1.9.0,<2.0.0",
+    "aiohttp>=3.9.0,<4.0.0",  # WebSocket signaling client + relay server
+    "lerobot[av-dep]",
+]
 # ── User-facing composite extras (map to CLI scripts) ─────
 # lerobot-record, lerobot-replay, lerobot-calibrate, lerobot-teleoperate, etc.
 core_scripts = ["lerobot[dataset]", "lerobot[hardware]", "lerobot[viz]"]
