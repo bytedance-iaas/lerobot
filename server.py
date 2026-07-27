@@ -833,10 +833,16 @@ async def handle_chat(request: web.Request) -> web.WebSocketResponse:
         sid = acp.session_id
         await acp.cancel()
         try:
-            await asyncio.wait_for(asyncio.shield(t), timeout=1.5)
+            # Give session/cancel a REALISTIC grace period. 1.5s meant nearly every Stop
+            # escalated to the process-kill path: interrupting a running tool + winding the
+            # turn down takes seconds. (Historically cancel ALSO crashed on interrupt —
+            # final_response=None → None.startswith, patched in the hermes venv — so the
+            # timeout fired 100% of the time and Stop always nuked the process, losing the
+            # in-flight turn's messages.) Restart is the last resort, not the normal path.
+            await asyncio.wait_for(asyncio.shield(t), timeout=12.0)
             return False                              # hermes honored cancel; run_turn sent done/error
         except asyncio.TimeoutError:
-            pass
+            log.warning("session/cancel not honored in 12s — hard-restarting hermes acp")
         await acp.restart()                           # force: kill the stuck turn + its tool
         if not t.done():
             t.cancel()

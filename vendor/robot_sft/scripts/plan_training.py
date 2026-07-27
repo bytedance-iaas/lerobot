@@ -190,6 +190,14 @@ def main() -> None:
                     help="torch.compile mode (default reduce-overhead: fast warm-up, most of the "
                          "win). Use max-autotune for a long run to squeeze the last bit — but on a "
                          "4B VLA its kernel search warms up 10+ min and uses more GPU memory.")
+    ap.add_argument("--rename-map", default=None, metavar="JSON",
+                    help="camera-key rename passed THROUGH to lerobot-train as "
+                         "--rename_map='<json>' (e.g. from check_features.py's fix). "
+                         "This is a lerobot-train flag, not a planning input — accepted "
+                         "here as a passthrough so the full command can be planned in one "
+                         "call. Not needed with --policy.type (config derives from the "
+                         "dataset); mainly for finetuning a checkpoint whose camera names "
+                         "differ (preflight also auto-adds it when detectable).")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--out", default=None,
                     help="write JSON plan to this file (instead of stdout)")
@@ -307,6 +315,16 @@ def main() -> None:
         parts.append("--policy.dtype=bfloat16")
         parts.append("--policy.vlm_mlp_fp8_enable=true")
         parts.append(f"--policy.vlm_mlp_fp8_recipe_kind={args.float8_recipe}")
+
+    # Camera-key rename: pure passthrough to lerobot-train (validate it's JSON so a typo fails
+    # HERE with a clear message instead of deep inside lerobot's config parsing).
+    if args.rename_map:
+        try:
+            json.loads(args.rename_map)
+        except json.JSONDecodeError as e:
+            print(f"error: --rename-map is not valid JSON ({e}): {args.rename_map}", file=_sys.stderr)
+            _sys.exit(2)
+        parts.append(f"--rename_map='{args.rename_map}'")
 
     # torch.compile — OFF by default (MEASURED no steady-state speedup on pi05/H20, ~5 min warmup).
     # Only pi0/pi05/pi0_fast/smolvla/diffusion expose a `compile_model` config field; passing it to

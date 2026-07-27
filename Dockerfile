@@ -124,6 +124,11 @@ RUN /opt/hermes/.venv/bin/python scripts/patch_acp_logging.py
 # present-but-None value bypasses the "" default), so `final_response.startswith(...)` raises
 # 'NoneType' has no attribute 'startswith' -> "Internal error" -> stuck chat. Coerce to "".
 RUN /opt/hermes/.venv/bin/python scripts/patch_acp_interrupt.py
+# Stock hermes persists ACP messages to state.db ONLY at turn boundaries, so an acp process
+# dying MID-TURN (crash, or the console's Stop/restart) lost the entire in-flight conversation
+# — the session kept just the opening prompt. Patch SessionManager to autosave every 10s and
+# flush on SIGTERM (replace_messages is atomic, so periodic writes are safe).
+RUN /opt/hermes/.venv/bin/python scripts/patch_acp_autosave.py
 # Session listing runs INSIDE the hermes venv (it imports hermes_state), so this one
 # file lives next to that venv and is invoked with its interpreter, not ours.
 COPY hermes_session_api.py /opt/hermes/session_api.py

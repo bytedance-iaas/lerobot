@@ -57,15 +57,25 @@ def resolve(kind: str, ref: str, cache_dir: str) -> dict:
         return {"source": "tos", "repo_id": ref, "local_path": None}   # streaming path, untouched
 
     name = ref.rstrip("/").split("/")[-1]   # oniond is org-less: strip `org/`
+    # Announce each phase to stderr: this script runs for minutes (download) and a silent
+    # stretch reads as "stuck" — the caller tails the log for progress (see SKILL.md).
+    print(f"[fetch] checking oniond bucket for {kind} '{name}' (≤60s)...", file=sys.stderr, flush=True)
     if shutil.which("oniond") and _oniond_has(kind, name):
         os.makedirs(cache_dir, exist_ok=True)
+        print(f"[fetch] oniond download {kind} '{name}' -> {cache_dir} "
+              f"(aria2 progress follows)...", file=sys.stderr, flush=True)
         proc = subprocess.run(["oniond", "download", kind, name, "--dir", cache_dir],  # nosec
                               env=_oniond_env(), stdout=sys.stderr, stderr=sys.stderr)
         local = os.path.join(cache_dir, name)
         if proc.returncode == 0 and os.path.isdir(local) and os.listdir(local):
+            print(f"[fetch] oniond download complete: {local}", file=sys.stderr, flush=True)
             return {"source": "oniond", "repo_id": ref, "local_path": local}
         print(f"[fetch] oniond download of {kind} '{name}' failed — falling back to HF.",
-              file=sys.stderr)
+              file=sys.stderr, flush=True)
+    else:
+        print(f"[fetch] '{name}' not in oniond bucket — using HF (hf-mirror); lerobot will "
+              f"download on first use (can take minutes, watch its own progress).",
+              file=sys.stderr, flush=True)
     return {"source": "hf", "repo_id": ref, "local_path": None}   # lerobot downloads via hf-mirror
 
 

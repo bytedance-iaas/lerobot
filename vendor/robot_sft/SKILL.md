@@ -257,6 +257,20 @@ dir and classifies the result — catching auth / `/dev/shm` / feature-mismatch 
 bugs in ~1–3 min instead of after a 6-hour launch. Do not proceed to stage e until
 preflight is green (or the user accepts the risk).
 
+**⚠️ SLOW COMMANDS MUST STREAM PROGRESS — never run them synchronously.** The terminal
+tool returns output only when the command *finishes*, so a synchronous `preflight.py`
+(1–3+ min), `fetch.py` (dataset/model download, minutes to hours), or any command expected
+to take >30 s shows the user NOTHING until it ends — it looks dead/stuck. Instead:
+1. Launch in the background with output to a log:
+   `python scripts/preflight.py --session <dir> > /tmp/preflight_run.log 2>&1 &`
+   (same pattern for `fetch.py` → `/tmp/fetch_run.log`).
+2. Poll every ~20–30 s with a QUICK command: `tail -5 /tmp/preflight_run.log`, and relay
+   the latest progress line (both scripts print heartbeats: preflight every 30 s with
+   elapsed/GPU-mem/last-log-line; fetch prints download progress) to the user each poll.
+3. Detect completion by the process exiting (`kill -0 <pid>` fails, or the final JSON
+   verdict / summary appears in the log), then report the full result.
+Never leave the user >60 s without a visible progress update during any slow stage.
+
 **Camera pre-check (finetuning a pretrained VLA).** When `--policy.path` is a pretrained
 checkpoint (`lerobot/pi05_base`, `pi0_base`, `smolvla_base`, …), both `plan_training.py`
 and `preflight.py` run `scripts/check_features.py` — a 1-second static compare of the dataset's
@@ -271,6 +285,12 @@ finetune just works, instead of crashing deep in `make_policy` after a slow mode
   runtime (`modeling_pi05.py`), so the **pretrained weights are kept** — no need to train from
   scratch. A `--rename_map` also makes lerobot skip visual-feature validation (`factory.py:650`).
 Run standalone: `python scripts/check_features.py --dataset-repo-id <id> --policy-path <ckpt>`.
+
+**`--rename_map` is a `lerobot-train` flag, not a planning input.** To set one explicitly,
+either append `--rename_map='<json>'` to the final training command, or pass
+`--rename-map '<json>'` to `plan_training.py` — a pure passthrough that validates the JSON and
+appends `--rename_map='<json>'` to the generated command. NOT needed when training from scratch
+with `--policy.type`: there the config derives its cameras from the dataset, so nothing to rename.
 
 **⚠️ PITFALL: argparse prefix-matching `--out` → `--output-dir`.** `plan_training.py`
 accepts `--output-dir` (for checkpoint storage) but NOT a bare `--out` (it was only added
