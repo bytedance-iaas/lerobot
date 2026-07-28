@@ -141,7 +141,7 @@ COPY vendor ./vendor
 # never hardcodes them). The chat-header dropdown's *alternative* models are the ONLY other place,
 # and they live here too, in one env var (server.py reads ARK_MODELS + always adds the live hermes
 # model). To change the model, edit this block only — nothing in server.py / index.html / app.js.
-ENV ARK_MODELS=doubao-seed-2-0-pro-260215,deepseek-v4-pro-260425
+ENV ARK_MODELS=doubao-seed-evolving,deepseek-v4-pro-260425
 
 # --- seed hermes config + LINK the robot_sft skill from the image ----------- #
 # The skill CONTENT stays in the image at /opt/agent-console/vendor/robot_sft; the
@@ -156,7 +156,7 @@ RUN mkdir -p "${HERMES_HOME}/skills" \
     && ln -sfn /opt/agent-console/vendor/robot_sft "${HERMES_HOME}/skills/robot_sft" \
     && hermes config set model.provider custom \
     && hermes config set model.base_url https://ark.cn-beijing.volces.com/api/v3 \
-    && hermes config set model.default doubao-seed-2-0-pro-260215 \
+    && hermes config set model.default doubao-seed-evolving \
     && hermes skills list | grep -qi robot_sft \
     && cp -a "${HERMES_HOME}" /opt/hermes-seed
 
