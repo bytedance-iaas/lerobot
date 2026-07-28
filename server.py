@@ -42,7 +42,6 @@ import os
 import re
 import shutil
 import signal
-import ssl
 import struct
 import termios
 from datetime import datetime, timezone
@@ -79,16 +78,9 @@ HERMES_SESSION_API = os.environ.get("HERMES_SESSION_API") or "/opt/hermes/sessio
 AUTH_USER = os.environ.get("CONSOLE_USER") or os.environ.get("AUTH_USER") or ""
 AUTH_PASS = os.environ.get("CONSOLE_PASSWORD") or os.environ.get("AUTH_PASSWORD") or ""
 AUTH_ENABLED = bool(AUTH_USER and AUTH_PASS)
-# Native TLS: if both paths are set and exist, the console serves HTTPS (wss)
-# directly — no TLS-terminating sidecar needed. Use a self-signed cert behind an
-# L4 LB, or any cert. Unset => plain HTTP (handy for local dev).
-TLS_CERT = os.environ.get("CONSOLE_TLS_CERT") or ""
-TLS_KEY = os.environ.get("CONSOLE_TLS_KEY") or ""
-
-
-def _tls_enabled() -> bool:
-    """True when both cert + key are set and present → the console serves HTTPS."""
-    return bool(TLS_CERT and TLS_KEY and os.path.exists(TLS_CERT) and os.path.exists(TLS_KEY))
+# The console serves plain HTTP :8080. TLS/HTTPS is terminated upstream — by APIG (the
+# API Gateway, which gives an HTTPS auto-domain + cert) or a CLB — so there is no
+# in-process cert handling here.
 
 
 # Skill to preload so the agent knows how to drive LeRobot SFT (requirement f).
@@ -227,7 +219,6 @@ async def handle_status(_request: web.Request) -> web.Response:
     info = read_chat_config()
     info["skill"] = CHAT_SKILL
     info["workdir"] = WORKDIR
-    info["secure"] = _tls_enabled()   # the UI shows a small warning when this is false
     return web.json_response(info)
 
 
@@ -1212,21 +1203,14 @@ def build_app() -> web.Application:
 
 
 def main() -> None:
-    ssl_ctx = None
-    if _tls_enabled():
-        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ssl_ctx.load_cert_chain(TLS_CERT, TLS_KEY)
-    scheme = "https" if ssl_ctx else "http"
-    log.info("LeRobot Agent Console %s://0.0.0.0:%s  shell=%s  LEROBOT_HOME=%s  hermes=%s",
-             scheme, PORT, SHELL, WORKDIR, HERMES_BIN)
+    # Always plain HTTP :8080 — TLS is terminated upstream by APIG / CLB.
+    log.info("LeRobot Agent Console http://0.0.0.0:%s  shell=%s  LEROBOT_HOME=%s  hermes=%s",
+             PORT, SHELL, WORKDIR, HERMES_BIN)
     if AUTH_ENABLED:
         log.info("auth: single-user HTTP Basic ENABLED (user=%s)", AUTH_USER)
     else:
         log.warning("auth: DISABLED — set CONSOLE_USER + CONSOLE_PASSWORD to protect the console")
-    if not ssl_ctx:
-        log.warning("serving plain HTTP (no TLS) — traffic is UNENCRYPTED. Set CONSOLE_TLS_CERT + "
-                    "CONSOLE_TLS_KEY to serve HTTPS.")
-    web.run_app(build_app(), host="0.0.0.0", port=PORT, ssl_context=ssl_ctx, access_log=None)
+    web.run_app(build_app(), host="0.0.0.0", port=PORT, access_log=None)
 
 
 if __name__ == "__main__":

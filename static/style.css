@@ -38,9 +38,6 @@ body {
 .crumbs { display: flex; gap: 8px; color: var(--muted); margin-left: 14px; font-size: 13.5px; }
 .crumbs b { color: var(--ink); }
 .top-right { display: flex; align-items: center; gap: 16px; }
-.http-warn { color: #92610a; background: #fff4e0; border: 1px solid #f2d69a; padding: 5px 10px;
-  border-radius: 999px; font-size: 12px; font-weight: 600; cursor: help; }
-.http-warn[hidden] { display: none; }
 .node-pill { color: #4b5160; background: #f6f7f9; border: 1px solid var(--line);
   padding: 6px 12px; border-radius: 999px; font-size: 13px; display: flex; align-items: center; gap: 8px; }
 

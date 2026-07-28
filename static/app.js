@@ -805,10 +805,6 @@
       chatReady = !!s.chat_ready;
       if (s.model) $("chat-model").value = s.model;
       $("chat-status").style.background = chatReady ? "" : "#c2c7d2";
-      // Small warning when the console is served over plain HTTP (unencrypted).
-      // Prefer the server's answer; fall back to the page protocol on older servers.
-      const insecure = s.secure === false || (s.secure === undefined && location.protocol !== "https:");
-      $("http-warn").hidden = !insecure;
     }).catch(() => {});
   }
 
