@@ -38,13 +38,15 @@ for item in ds:            # IterableDataset：迭代取，不支持 ds[i]
 **用法举例：**
 
 > 本仓库机器人侧的模块名是 **`mac_daemon`**（不是 `robot_daemon`）：`python -m lerobot.robots.webrtc_proxy.mac_daemon ...`。
+>
+> **地址一律用集群内服务名 `ws://livekit-clb:7880`**（DNS，稳定，不写 IP）。**若 `mac_daemon` 跑在集群外**（家里接机器人的那台机器，解析不到集群 DNS），把 `livekit-clb` 换成 LiveKit CLB 的**公网 IP** —— LiveKit 现在用独立 CLB、IP 是动态的,用 `kubectl get svc livekit-clb -o jsonpath='{.status.loadBalancer.ingress[0].ip}'` 查当前值,别硬编码。
 
 - **先做一次 LiveKit 连通性测试**（不接机械臂，用合成关节 + 一路真实摄像头 `--real-camera 0` 验证能连上 LiveKit、视频能推流）：
 
 ```bash
 python -m lerobot.robots.webrtc_proxy.mac_daemon \
   --transport livekit --session so100 \
-  --livekit-url ws://<你的 LiveKit 地址>:7880 \
+  --livekit-url ws://livekit-clb:7880 \
   --livekit-api-key devkey --livekit-api-secret lerobotlivekitsecret0123456789abcd \
   --real-camera 0
 ```
@@ -54,7 +56,7 @@ python -m lerobot.robots.webrtc_proxy.mac_daemon \
 ```bash
 python -m lerobot.robots.webrtc_proxy.mac_daemon \
   --transport livekit --session so100 \
-  --livekit-url ws://<你的 LiveKit 地址>:7880 \
+  --livekit-url ws://livekit-clb:7880 \
   --livekit-api-key devkey --livekit-api-secret lerobotlivekitsecret0123456789abcd \
   --robot.type=so100_follower --robot.port=/dev/tty.usbmodemXXXX \
   --robot.id=my_awesome_follower_arm \
@@ -76,7 +78,7 @@ python examples/webrtc_remote_so100/cloud_teleop_so100.py \
 |------|--------|------|
 | `--transport` | `livekit` | 传输后端，`livekit` 或 `aiortc`（默认 `aiortc`） |
 | `--session` | `so100` | 会话 id == LiveKit room；**必须与控制侧一致** |
-| `--livekit-url` | `ws://<你的 LiveKit 地址>:7880` | LiveKit 信令地址（机器人主动拨出，填真实地址，别留 `{LK}` 占位） |
+| `--livekit-url` | `ws://livekit-clb:7880` | LiveKit 信令地址（机器人主动拨出）。集群内用服务名 `livekit-clb`；集群外换成 CLB 公网 IP（见上方说明，动态） |
 | `--livekit-api-key` | `devkey` | LiveKit API key（需与服务端一致） |
 | `--livekit-api-secret` | `lerobotlivekitsecret0123456789abcd` | LiveKit API secret（需与服务端一致） |
 | `--real-camera` | `0` | 快速测试用：不接机械臂，只开这一路 opencv 摄像头（索引如 `0` 或 `/dev/videoN`）+ 合成关节；与 `--robot.*` 互斥 |
@@ -133,7 +135,7 @@ python -m lerobot.async_inference.policy_server --host=0.0.0.0 --port=8080 --fps
 ```bash
 python -m lerobot.robots.webrtc_proxy.mac_daemon \
   --transport livekit --session so100 \
-  --livekit-url ws://<你的 LiveKit 地址>:7880 \
+  --livekit-url ws://livekit-clb:7880 \
   --livekit-api-key devkey --livekit-api-secret lerobotlivekitsecret0123456789abcd \
   --robot.type=so100_follower --robot.port=/dev/tty.usbmodemXXXX \
   --robot.cameras="{ front: {type: opencv, index_or_path: 1, width: 640, height: 480, fps: 30}, wrist: {type: opencv, index_or_path: 0, width: 640, height: 480} }"
