@@ -136,11 +136,11 @@ COPY hermes_session_api.py /opt/hermes/session_api.py
 # needs NO GitHub — see vendor/robot_sft.SOURCE for the upstream commit.
 COPY vendor ./vendor
 
-# SINGLE SOURCE OF TRUTH for the chat model + endpoint. The default model and base_url are seeded
-# into hermes' config.yaml below (server.py reads them from there via /api/status → the frontend
-# never hardcodes them). The chat-header dropdown's *alternative* models are the ONLY other place,
-# and they live here too, in one env var (server.py reads ARK_MODELS + always adds the live hermes
-# model). To change the model, edit this block only — nothing in server.py / index.html / app.js.
+# SINGLE SOURCE OF TRUTH for the chat model + endpoint. `ARK_MODELS` (comma-separated) is the ONLY
+# place a model name is written: server.py reads it for the chat-header dropdown (+ always adds the
+# live hermes model), and the seed below sets `model.default` = ARK_MODELS[0] (the FIRST entry), so
+# the default is never a duplicated hardcode — to change models, edit ONLY this env var. base_url is
+# seeded too; server.py reads both from config.yaml via /api/status (the frontend never hardcodes).
 ENV ARK_MODELS=doubao-seed-evolving,deepseek-v4-pro-260425
 
 # --- seed hermes config + LINK the robot_sft skill from the image ----------- #
@@ -156,7 +156,7 @@ RUN mkdir -p "${HERMES_HOME}/skills" \
     && ln -sfn /opt/agent-console/vendor/robot_sft "${HERMES_HOME}/skills/robot_sft" \
     && hermes config set model.provider custom \
     && hermes config set model.base_url https://ark.cn-beijing.volces.com/api/v3 \
-    && hermes config set model.default doubao-seed-evolving \
+    && hermes config set model.default "$(printf '%s' "$ARK_MODELS" | cut -d, -f1)" \
     && hermes skills list | grep -qi robot_sft \
     && cp -a "${HERMES_HOME}" /opt/hermes-seed
 

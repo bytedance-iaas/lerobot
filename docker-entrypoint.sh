@@ -69,6 +69,18 @@ if "delegation" not in dt:
     yaml.safe_dump(c, open(p, "w"), default_flow_style=False, allow_unicode=True, sort_keys=False)
 PY
   echo "==> enforced: agent.disabled_toolsets includes 'delegation' (subagents OFF); compression left ENABLED"
+
+  # model.default = ARK_MODELS[0] on EVERY boot. ARK_MODELS is the single source of truth for the
+  # chat model (set in the Dockerfile ENV); the default is always its FIRST entry. Enforced here too
+  # because the PVC's config.yaml shadows the image seed — otherwise a stale/UI-drifted default
+  # (e.g. someone picked deepseek) would stick across rollouts. Users still pick any model per-session
+  # from the dropdown; this only sets the INITIAL default. No-op if ARK_MODELS is unset.
+  ARK_DEFAULT="${ARK_MODELS%%,*}"
+  if [ -n "$ARK_DEFAULT" ]; then
+    hermes config set model.default "$ARK_DEFAULT" >/dev/null 2>&1 \
+      && echo "==> enforced: model.default = ARK_MODELS[0] ($ARK_DEFAULT)" \
+      || echo "WARN: could not set model.default"
+  fi
 fi
 
 # robot_sft skill: keep it OFF the PVC so it TRACKS THE IMAGE and updates on every
