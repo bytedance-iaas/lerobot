@@ -109,10 +109,9 @@ WORKDIR /opt/agent-console
 COPY server.py ./
 COPY static ./static
 COPY scripts ./scripts
-# diffusers <0.36 (lerobot's pin) hardcodes torchao internal module paths that torchao 0.17
-# (installed for fp8) removed → a scary "Unable to import torchao Tensor objects" at import.
-# Patch diffusers to import each Tensor optionally. Idempotent; no-op if diffusers changes.
-RUN /lerobot/.venv/bin/python scripts/patch_diffusers_torchao.py
+# (Removed: patch_diffusers_torchao.py. It worked around diffusers <0.36 importing torchao 0.17
+# internal paths, but torchao is no longer installed — the fp8 path is TransformerEngine-only —
+# so diffusers never touches torchao and the patch is dead weight.)
 # hermes' ACP layer (acp/connection.py) catches EVERY request-handler exception, wraps it
 # into a generic `RequestError.internal_error(...)` and `raise err from None` — DISCARDING the
 # traceback. So a real bug inside a tool handler reaches the web chat as an opaque "Internal
