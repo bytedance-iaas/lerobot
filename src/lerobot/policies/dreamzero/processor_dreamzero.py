@@ -60,7 +60,7 @@ from lerobot.processor import (
     policy_action_to_transition,
     transition_to_policy_action,
 )
-from lerobot.processor.relative_action_processor import to_absolute_actions
+from lerobot.processor.relative_action_processor import to_absolute_actions, to_relative_actions
 from lerobot.types import EnvTransition, TransitionKey
 from lerobot.utils.constants import (
     OBS_IMAGE,
@@ -207,6 +207,7 @@ class DreamZeroPackInputsStep(ProcessorStep):
         self.config = config
         self.stats = stats or {}
         self._state_layout = _QuantileLayout(self.stats, "state", config.state_modality_keys)
+        self._action_layout = _QuantileLayout(self.stats, "action", config.action_modality_keys)
         # Raw (unnormalized) last observed state per modality key — reference for relative decode.
         self._last_raw_state: dict[str, torch.Tensor] = {}
         self._tokenizer = None  # lazy umt5
@@ -317,6 +318,38 @@ class DreamZeroPackInputsStep(ProcessorStep):
             obs.pop(OBS_STATE, None)
         else:
             bsz = obs["images"].shape[0]
+
+        # ---- ACTION (training only): relative-encode joints + q99 normalize + pad + masks ----
+        # Present only when the transition carries a ground-truth action chunk (lerobot-train).
+        # The forward mirror of DreamZeroActionDecodeStep: joint_position is made relative to the
+        # last observed state then q99-normalized with RELATIVE stats; gripper stays absolute.
+        # Outputs land in the observation dict so they reach DreamZeroPolicy.forward's action_input
+        # (action / action_mask / has_real_action) — the exact batch flattening is validated on the
+        # first real training run (dreamzero_port_plan.md M3).
+        action = transition.get(TransitionKey.ACTION)
+        if action is not None and self._action_layout.dim > 0:
+            real_dim = self._action_layout.dim
+            was_2d = action.dim() == 2
+            a = (action.unsqueeze(1) if was_2d else action)[..., :real_dim].clone().float()  # (B,T,D)
+            rel_keys = set(self.config.relative_action_keys or ())
+            if rel_keys and self._last_raw_state:
+                reference = torch.zeros(a.shape[0], real_dim, dtype=a.dtype, device=a.device)
+                mask = [False] * real_dim
+                for key, (s, e) in self._action_layout.slices.items():
+                    if key in rel_keys and key in self._last_raw_state:
+                        ref = self._last_raw_state[key].to(a.device, a.dtype)
+                        reference[:, s:e] = ref[:, : e - s]
+                        for i in range(s, e):
+                            mask[i] = True
+                a = to_relative_actions(a, reference, mask)
+            a = _q99_forward(a, self._action_layout.q01, self._action_layout.q99)
+            a_padded = torch.nn.functional.pad(a, (0, self.config.max_action_dim - real_dim))
+            action_mask = torch.zeros(*a_padded.shape, dtype=torch.bool, device=a_padded.device)
+            action_mask[..., :real_dim] = True
+            obs["action"] = a_padded
+            obs["action_mask"] = action_mask
+            obs["has_real_action"] = torch.ones(a.shape[0], dtype=torch.bool, device=a.device)
+            transition[TransitionKey.ACTION] = a_padded.squeeze(1) if was_2d else a_padded
 
         # ---- TEXT: umt5 tokenize (template + fixed negative prompt) ----
         texts = self._build_language(comp.get("task"), bsz)
