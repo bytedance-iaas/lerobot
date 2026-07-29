@@ -34,9 +34,11 @@ from lerobot.policies.dreamzero.processor_dreamzero import (  # noqa: E402
     _crop_resize_view,
     _q99_forward,
     _q99_inverse,
+    _QuantileLayout,
     _stitch_oxe_droid,
     _to_bthwc_uint8,
 )
+from lerobot.processor.relative_action_processor import to_relative_actions  # noqa: E402
 from lerobot.types import TransitionKey  # noqa: E402
 
 
@@ -99,3 +101,36 @@ def test_action_decode_relative_to_absolute():
     assert tuple(out.shape) == (b, horizon, 8)  # padding dropped
     assert torch.allclose(out[0, :, :7], exp_joint.expand(horizon, 7), atol=1e-5)
     assert torch.allclose(out[0, :, 7], torch.full((horizon,), exp_grip), atol=1e-5)
+
+
+def test_action_pack_decode_roundtrip():
+    """Training-forward (relative-encode + q99) then decode-inverse recovers the raw action."""
+    cfg = DreamZeroConfig()
+    stats = {
+        "action": {
+            "joint_position": {"q01": [-2.0] * 7, "q99": [2.0] * 7},  # RELATIVE stats
+            "gripper_position": {"q01": [0.0], "q99": [1.0]},  # ABSOLUTE stats
+        }
+    }
+    torch.manual_seed(0)
+    raw = torch.randn(1, 3, 8) * 0.3  # small so the relative action stays within [-2, 2] (no clamp)
+    raw[..., 7] = 0.4  # gripper in [0, 1]
+    ref_joint = torch.randn(1, 7) * 0.3
+
+    # forward pack (mirror of the DreamZeroPackInputsStep action block)
+    layout = _QuantileLayout(stats, "action", cfg.action_modality_keys)
+    reference = torch.zeros(1, 8)
+    reference[:, :7] = ref_joint
+    mask = [True] * 7 + [False]
+    rel = to_relative_actions(raw.clone(), reference, mask)
+    norm = _q99_forward(rel, layout.q01, layout.q99)
+    padded = torch.nn.functional.pad(norm, (0, cfg.max_action_dim - 8))
+
+    # decode-inverse
+    decode = DreamZeroActionDecodeStep(cfg, stats)
+    pack = DreamZeroPackInputsStep(cfg, stats)
+    pack._last_raw_state = {"joint_position": ref_joint}
+    decode.pack_step = pack
+    out = decode({TransitionKey.ACTION: padded.clone()})[TransitionKey.ACTION]
+
+    assert torch.allclose(out, raw, atol=1e-4)
