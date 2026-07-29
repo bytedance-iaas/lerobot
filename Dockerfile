@@ -124,11 +124,15 @@ RUN /opt/hermes/.venv/bin/python scripts/patch_acp_logging.py
 # present-but-None value bypasses the "" default), so `final_response.startswith(...)` raises
 # 'NoneType' has no attribute 'startswith' -> "Internal error" -> stuck chat. Coerce to "".
 RUN /opt/hermes/.venv/bin/python scripts/patch_acp_interrupt.py
-# Stock hermes persists ACP messages to state.db ONLY at turn boundaries, so an acp process
-# dying MID-TURN (crash, or the console's Stop/restart) lost the entire in-flight conversation
-# — the session kept just the opening prompt. Patch SessionManager to autosave every 10s and
-# flush on SIGTERM (replace_messages is atomic, so periodic writes are safe).
-RUN /opt/hermes/.venv/bin/python scripts/patch_acp_autosave.py
+# NOTE: the old `patch_acp_autosave.py` (a 10s `save_session` daemon) is DELETED, not applied.
+# It resurrected deleted sessions: `save_session -> _persist` first "ensures the session record
+# exists" (acp_adapter/session.py) and so RE-INSERTS a row that was deleted out-of-band (UI or
+# `hermes sessions delete`), then re-writes it — the session reappeared ~10s after any delete.
+# The autosave was also redundant: (a) `create_session` persists the row immediately, (b) hermes
+# appends every message incrementally via `append_message` (wired into the ACP agent through
+# `_make_agent(session_db=self._get_db())`), which is finer-grained than a 10s full replace, and
+# (c) Stop now does a graceful `session/cancel` instead of killing the acp process mid-turn. So
+# durability is covered without the daemon, and dropping it makes deletes actually stick.
 # Session listing runs INSIDE the hermes venv (it imports hermes_state), so this one
 # file lives next to that venv and is invoked with its interpreter, not ours.
 COPY hermes_session_api.py /opt/hermes/session_api.py
