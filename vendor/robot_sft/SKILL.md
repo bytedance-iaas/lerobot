@@ -86,9 +86,17 @@ distilled list of the failure modes above, each with the concrete check that pre
   session directory under `<root>/sessions/<session_id>/`.
 - **Stages** = the pipeline below (a→e). Each writes a JSON artifact and flips its status
   in `session.json`. Stages are resumable: on re-entry, skip any stage already `done`.
-- **Runs** = actual invocations of `lerobot-train` inside the train stage. A session may
-  need several runs (crash-resume, early-stop-and-restart). Each run has its own state
-  under `runs/<run_id>/`.
+- **Runs** = one independent **training lineage** (its own loss + eval + open-loop MSE curves),
+  under `runs/<run_id>/`. **A resume from a checkpoint is the SAME run — NOT a new one.** The
+  watchdog re-launches with `--resume=true` and **appends** to that run's `train.log`, so its
+  curves continue unbroken across crashes/restarts (its `restarts` counter increments; the
+  `run_id` does NOT change).
+  - **Resume/restart an interrupted training → reuse the SAME `run_id`** (re-run
+    `watchdog.py --run <same_run_id>`; it auto-resumes from `checkpoints/last`). Do **NOT**
+    `session.py add-run` — a new run starts a fresh curve and, sharing the plan's one
+    `output_dir`, hits `output_dir exists but --resume not set`.
+  - **`add-run` (a new `run-NNN`) is ONLY for a genuinely fresh attempt** — a different config,
+    a new `output_dir`, or an explicit train-from-scratch. Those are legitimately independent runs.
 
 All cross-agent communication is **files**, never memory. The session directory is the
 single source of truth. This is what makes the whole thing resumable (requirement: "随时
@@ -334,7 +342,13 @@ Only advance to stage e after an explicit "go". Never start a run on assumptions
 summary-and-confirm step is mandatory, even if the plan looks obviously fine.
 
 ### e. Train under watchdog + periodic eval  (the long pole)
-Launch training and the monitors. Three background processes, all communicating via files:
+First `session.py add-run` **ONCE** to get the `run_id` for this training lineage. **Reuse that
+same `run_id` for every resume/restart** — the watchdog auto-resumes into it and its curves
+continue unbroken. Only `add-run` again for a genuinely fresh attempt (new config / from scratch;
+see **Runs** above). Do NOT mint a new run per crash — that fragments the loss/eval curves and
+hits `output_dir exists but --resume not set`.
+
+Then launch the monitors — three background processes, all communicating via files:
 1. Start the **dashboard**: `python scripts/monitor_server.py --session <dir>`
    (background). It only *reads* the state files and serves an HTML page + JSON — it never
    runs training. It is **TensorBoard-like**: it plots, with plain `<canvas>` (no external
