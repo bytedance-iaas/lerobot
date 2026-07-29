@@ -62,20 +62,16 @@ def run_state(run_id: str):
     return _read(os.path.join(SESSION_DIR, "runs", run_id, "run.json"))
 
 
-def _latest_train_log() -> str | None:
-    logs = glob.glob(os.path.join(SESSION_DIR, "runs", "*", "train.log"))
-    return max(logs, key=os.path.getmtime) if logs else None
-
-
-def _parse_loss(path: str, max_points: int = 800):
-    """Return [[step, loss], ...] from a train.log; cached by (size, mtime)."""
+def _parse_one_log(path: str):
+    """Parse [[step, loss], ...] from ONE train.log; cached per-path by (size, mtime)."""
     try:
         st = os.stat(path)
     except OSError:
         return []
-    key = (path, st.st_size, int(st.st_mtime))
-    if _loss_cache.get("key") == key:
-        return _loss_cache["val"]
+    key = (st.st_size, int(st.st_mtime))
+    cached = _loss_cache.get(path)
+    if cached and cached[0] == key:
+        return cached[1]
     try:
         with open(path, errors="ignore") as f:
             text = f.read()
@@ -91,11 +87,27 @@ def _parse_loss(path: str, max_points: int = 800):
                 series.append([last_step, float(m.group(2))])
             except ValueError:
                 pass
+    _loss_cache[path] = (key, series)
+    return series
+
+
+def _aggregate_loss(max_points: int = 800):
+    """Loss curve merged across ALL runs of the session, so a training INTERRUPTION + resume
+    CONTINUES the curve instead of overwriting it with only the latest run's segment. lerobot
+    resume starts a new runs/<id>/train.log from the checkpoint step, so reading just the
+    newest log dropped everything before the interruption. Here we read every runs/*/train.log
+    (oldest→newest) and key points by training step; a later run's value for a step wins (resume
+    re-does from a checkpoint step, so its numbers supersede). Sorted by step, then downsampled."""
+    logs = sorted(glob.glob(os.path.join(SESSION_DIR, "runs", "*", "train.log")),
+                  key=os.path.getmtime)
+    by_step: dict = {}
+    for path in logs:                       # oldest first → a newer run overwrites overlapping steps
+        for step, loss in _parse_one_log(path):
+            by_step[step] = loss
+    series = [[s, by_step[s]] for s in sorted(by_step)]
     if len(series) > max_points:
         k = len(series) // max_points + 1
         series = series[::k]
-    _loss_cache["key"] = key
-    _loss_cache["val"] = series
     return series
 
 
@@ -155,8 +167,7 @@ def compute_assessment(loss, evals):
 
 
 def metrics_state():
-    log = _latest_train_log()
-    loss = _parse_loss(log) if log else []
+    loss = _aggregate_loss()   # merged across all runs → survives interruption+resume
     evals = _eval_series()
     # prefer the watchdog's own assessment (run.json) if present; else compute one here
     wd = None

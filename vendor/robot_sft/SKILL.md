@@ -346,14 +346,22 @@ Launch training and the monitors. Three background processes, all communicating 
    (background). It owns the training subprocess and implements the self-healing loop
    below. It checks status on a cadence of **≤5 minutes** and writes everything it observes
    to `run.json` (which the dashboard surfaces).
-3. Start the **eval watcher**: `python scripts/eval_watcher.py --session <dir> --run
-   <run_id> --gpu <idle_gpu>` (background). It watches `output_dir/checkpoints/` for each
-   new *complete* step dir (waits for `training_state/training_step.json`) and runs
-   `offline_eval.py` (open-loop replay) on the held-out episodes from stage c — on a
-   **separate GPU** when one exists so it never steals from training (lessons_learned #9;
-   on a single-GPU pod evals run between checkpoints and exit, keep `--eval-timeout`) —
-   appending mean MSE/MAE per checkpoint to `eval/eval_results.jsonl`. It is resumable
-   (skips checkpoints already scored).
+3. **Eval — branch on whether a SPARE GPU exists** (`plan_training.py` reports this as
+   `eval_mode`: `concurrent` vs `post_training`, plus an `eval_gpu_note`):
+   - **A spare idle GPU exists → concurrent eval.** Start the **eval watcher**:
+     `python scripts/eval_watcher.py --session <dir> --run <run_id> --gpu <idle_gpu>` (background,
+     on a GPU **off** the training ones). It watches `output_dir/checkpoints/` for each new
+     *complete* step dir (waits for `training_state/training_step.json`) and runs `offline_eval.py`
+     (open-loop replay) on the held-out episodes from stage c, appending mean MSE/MAE per checkpoint
+     to `eval/eval_results.jsonl`. Resumable (skips scored checkpoints).
+   - **⚠️ SINGLE-GPU (no spare — training owns the only GPU) → DO NOT run the eval watcher during
+     training** (it would contend with / OOM the training GPU; `eval_mode: post_training`). **Say so
+     UP FRONT in the plan you show the user** ("only 1 GPU → eval can't run during training; we'll
+     eval after it finishes"). Then AFTER training finishes, eval the **last few checkpoints** on the
+     freed GPU and pick the best by held-out MSE — `plan_training` prints the exact command:
+     `python scripts/offline_eval.py --model-path <output_dir>/checkpoints/<STEP>/pretrained_model
+     --dataset-repo-id <id> --episodes <held-out eps> --device cuda` (run it for the last 2–3
+     checkpoints).
    **⚠️ `offline_eval.py` does NOT support `tos://` dataset URLs** — it passes the repo_id
    to HF Hub API which rejects object-store URLs (lessons_learned #19). For a TOS dataset,
    the eval watcher will run but produce `mean_mse=None` for every checkpoint. Until fixed,

@@ -30,6 +30,18 @@ import datetime as _dt
 import json
 import math
 import os
+import subprocess
+
+
+def _total_gpu_count() -> int | None:
+    """Total GPUs on the box (nvidia-smi -L). None if it can't be determined."""
+    try:
+        out = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=10)
+        n = sum(1 for ln in out.stdout.splitlines() if ln.strip().startswith("GPU "))
+        return n or None
+    except Exception:
+        return None
+
 
 # Policy families for batch sizing: small BC heads train comfortably at large batches;
 # VLA-style policies (big frozen backbone, heavy vision tower) need far smaller ones.
@@ -378,6 +390,31 @@ def main() -> None:
                                   f"{args.gpus} $(which lerobot-train) ...` with the same flags; "
                                   "batch_size is per process")
 
+    # Eval needs a SPARE GPU: the eval_watcher runs offline_eval concurrently on an IDLE GPU
+    # (--gpu, kept off the training GPUs). If the box has no GPU beyond the ones training uses,
+    # in-training eval CANNOT run — tell the user to eval the LAST FEW checkpoints AFTER training.
+    _total_gpus = _total_gpu_count()
+    _train_gpus = len([c for c in args.cuda.split(",") if c.strip()]) if args.cuda else args.gpus
+    _spare = (_total_gpus - _train_gpus) if _total_gpus is not None else None
+    if _spare is not None and _spare < 1:
+        plan["eval_mode"] = "post_training"
+        _eps = ("--episodes " + " ".join(str(e) for e in eval_eps)) if eval_eps else \
+               "--episodes <held-out eps>"
+        plan["eval_gpu_note"] = (
+            f"SINGLE-GPU: {_total_gpus} GPU total, training uses {_train_gpus} -> NO spare GPU for "
+            "concurrent eval, so the eval_watcher will NOT run during training. Do offline eval on the "
+            "LAST FEW checkpoints AFTER training finishes (on the freed GPU) and pick the best by "
+            "held-out MSE, e.g. per checkpoint:\n"
+            f"  python scripts/offline_eval.py --model-path {out_dir}/checkpoints/<STEP>/pretrained_model "
+            f"--dataset-repo-id {args.dataset_repo_id}"
+            + (f" --dataset-root {args.dataset_root}" if args.dataset_root else "")
+            + f" {_eps} --device cuda")
+    else:
+        plan["eval_mode"] = "concurrent"
+        if _spare is None:
+            plan["eval_gpu_note"] = ("could not detect total GPU count — confirm a SPARE idle GPU "
+                                     "exists for the eval_watcher, otherwise eval after training.")
+
     # Camera pre-check when finetuning a pretrained VLA. If the dataset's cameras don't match the
     # checkpoint's, AUTO-ADD a --rename_map so the finetune just works (pretrained weights kept;
     # any leftover checkpoint camera auto-pads black at runtime) — instead of handing back a
@@ -418,6 +455,8 @@ def main() -> None:
         if train_eps is not None:
             print(f"train episodes: {len(train_eps)}  held-out eval episodes: "
                   f"{len(eval_eps or [])}")
+        if plan.get("eval_mode") == "post_training":
+            print("\n⚠ " + plan["eval_gpu_note"])
         print("\n# launch command:\n" + cmd)
         print("\n# resume after any stop:\n" + plan["resume_command"])
 
