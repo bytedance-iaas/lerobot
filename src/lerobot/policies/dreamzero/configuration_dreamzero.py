@@ -135,6 +135,21 @@ class DreamZeroConfig(PreTrainedConfig):
     relative_action: bool = True
     relative_action_keys: tuple[str, ...] = ("joint_position",)
 
+    # Per-embodiment I/O layout, from the checkpoint's meta/modality.json concat order. Each key's
+    # width is taken from its normalization stats (len of q01). Defaults are the oxe_droid/DROID
+    # layout (joint_position: 7, gripper_position: 1); other embodiments override via from_pretrained.
+    state_modality_keys: tuple[str, ...] = ("joint_position", "gripper_position")
+    action_modality_keys: tuple[str, ...] = ("joint_position", "gripper_position")
+    # Observation image feature keys in the view-stitch order the model expects
+    # (DROID: exterior_1_left, exterior_2_left, wrist_left). Empty => sorted OBS_IMAGES.* keys.
+    image_view_order: tuple[str, ...] = ()
+    # Per-view resolution the transform resizes each camera to before stitching, and the
+    # center-crop fraction applied first (DROID: 160x320, crop 0.95). The model then resizes the
+    # stitched 2H x 2W canvas to (target_video_height, target_video_width) internally.
+    per_view_height: int = 160
+    per_view_width: int = 320
+    view_crop_scale: float = 0.95
+
     # Base Wan component checkpoints. None => auto-download from the base Wan HF repo at build time
     # (matches upstream WANPolicyHead.__init__ ensure_file behaviour).
     text_encoder_pretrained_path: str | None = None
