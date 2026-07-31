@@ -166,21 +166,6 @@ class TELayerNormGemmaMLP(nn.Module):
         return self.layernorm_mlp(x)
 
 
-def _load_weights_into_te_layernorm_mlp(te_module, gate_proj, up_proj, down_proj, layernorm_weight):
-    """Copy weights from the original GemmaMLP projections and layernorm into te.LayerNormMLP.
-
-    fc1_weight shape: [2*intermediate_size, hidden_size] (gate + up concatenated)
-    fc2_weight shape: [hidden_size, intermediate_size]   (down_proj)
-    layer_norm_weight: copied from post_attention_layernorm.weight (absorbed into fused module)
-    """
-    with torch.no_grad():
-        te_module.layernorm_mlp.fc1_weight.copy_(torch.cat([gate_proj.weight, up_proj.weight], dim=0))
-        te_module.layernorm_mlp.fc2_weight.copy_(down_proj.weight)
-        # Absorb the external norm weight. TE uses zero_centered_gamma=True convention:
-        # output = (x / RMS(x)) * (1 + gamma), matching Gemma's (1 + weight) convention.
-        te_module.layernorm_mlp.layer_norm_weight.copy_(layernorm_weight)
-
-
 def get_mlp_weight_dtype(mlp):
     """Get the weight dtype of an MLP module, supporting stock GemmaMLP and TELayerNormGemmaMLP."""
     if hasattr(mlp, "up_proj") and hasattr(mlp.up_proj, "weight"):
@@ -195,9 +180,12 @@ def configure_vlm_mlp_fp8(vlm_layers, config):
 
     Iterates the VLM decoder layers and, for each, reads hidden/intermediate/device/dtype
     from the existing ``layer.mlp.gate_proj`` and eps from ``layer.post_attention_layernorm``,
-    builds a fused te.LayerNormMLP, loads the gate/up/down + norm weights into it, and
-    replaces ``layer.mlp`` in place. No-op when ``config.vlm_mlp_fp8_enable`` is False, so
-    the bf16 default path is byte-for-byte unchanged.
+    builds a fused te.LayerNormMLP and replaces ``layer.mlp`` in place. The fused module's
+    weights are NOT copied here — at construction the source mlp holds only random config-init
+    values; the real weights are loaded from the checkpoint afterwards (see
+    ``remap_fp8_state_dict_keys`` + ``load_state_dict``), which overwrite fc1/fc2/layer_norm.
+    No-op when ``config.vlm_mlp_fp8_enable`` is False, so the bf16 default path is
+    byte-for-byte unchanged.
     """
     if config is None or not getattr(config, "vlm_mlp_fp8_enable", False):
         return
@@ -241,13 +229,9 @@ def configure_vlm_mlp_fp8(vlm_layers, config):
             device=device,
             dtype=dtype,
         )
-        _load_weights_into_te_layernorm_mlp(
-            te_mlp,
-            gate_proj,
-            up_proj,
-            down_proj,
-            layer.post_attention_layernorm.weight,
-        )
+        # No weight copy here: at construction the source mlp holds random (config-init) weights;
+        # the real weights are loaded afterwards by from_pretrained (remap_fp8_state_dict_keys +
+        # load_state_dict), which overwrite the te module's fc1/fc2/layer_norm weights.
         layer.mlp = te_mlp
         converted += 1
 
