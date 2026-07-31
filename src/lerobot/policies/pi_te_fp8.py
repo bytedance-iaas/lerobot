@@ -49,6 +49,17 @@ te_checkpoint = None
 _transformer_engine_available = False
 
 
+class StateDictLoadError(RuntimeError):
+    """A genuine checkpoint key mismatch during ``from_pretrained`` (missing/unexpected keys
+    that remain after the expected fp8 ``_extra_state`` buffers are excluded).
+
+    Distinct type so it can escape the broad ``except`` in pi0/pi05 ``from_pretrained`` that
+    otherwise downgrades any load failure to a warning and returns a partially random-init
+    model. A real remap-key mismatch (e.g. the fp8 fc1/fc2/layer_norm keys never landing on the
+    fused te.LayerNormMLP) must fail loud instead of silently keeping random weights.
+    """
+
+
 def _ensure_transformer_engine() -> bool:
     """Lazily import Transformer Engine. Call only when FP8 is actually needed."""
     global te, DelayedScaling, Float8BlockScaling, Format, te_checkpoint
