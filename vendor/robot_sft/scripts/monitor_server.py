@@ -27,12 +27,18 @@ import re
 
 SESSION_DIR = ""  # set in main
 
-# lerobot-train logs: tqdm gives the exact step ("4000/10000 ["); the MetricsTracker
+# lerobot-train logs: tqdm gives the step ("4000/10000 ["); the MetricsTracker
 # line carries the loss ("... loss:0.123 grdn:...").
 STEP_RE = re.compile(r"(\d+)\s*/\s*(\d+)\s*\[")
 LOSS_RE = re.compile(r"\bloss:([0-9.eE+-]+)")
-# one combined scan so each loss is tagged with the most recent tqdm step
-TOKEN_RE = re.compile(r"(\d+)\s*/\s*\d+\s*\[|\bloss:([0-9.eE+-]+)")
+# One combined scan so each loss is tagged with the most recent tqdm step. Capture BOTH numbers
+# of "count/total [": lerobot's tqdm has no initial=, so on a resume from ckpt-K it restarts the
+# counter at 0 and sets total = cfg.steps - K (lerobot_train.py: `tqdm(total=cfg.steps - step)`).
+# The largest total ever seen IS cfg.steps, so a segment's absolute step = count + (max_total -
+# total); the offset (max_total - total) equals the checkpoint step it resumed from (0 for the
+# first run, which has total == cfg.steps). Without this the resumed segment plots from x=0 and
+# overlaps the first curve.
+TOKEN_RE = re.compile(r"(\d+)\s*/\s*(\d+)\s*\[|\bloss:([0-9.eE+-]+)")
 
 _loss_cache: dict = {}
 
@@ -90,12 +96,20 @@ def _parse_loss(path: str, max_points: int = 800):
         return []
     series = []
     last_step = 0
+    max_total = 0  # cfg.steps — the largest tqdm total, from the first (unresumed) segment
     for m in TOKEN_RE.finditer(text):
         if m.group(1) is not None:
-            last_step = int(m.group(1))
-        elif m.group(2) is not None:
+            count = int(m.group(1))
+            total = int(m.group(2))
+            # First run: total == cfg.steps == max_total => offset 0, step == count.
+            # Resume from ckpt-K: total == cfg.steps - K => offset == K, so the resumed segment
+            # continues from the checkpoint step instead of overlapping the first curve at x=0.
+            if total > max_total:
+                max_total = total
+            last_step = count + (max_total - total)
+        elif m.group(3) is not None:
             try:
-                series.append([last_step, float(m.group(2))])
+                series.append([last_step, float(m.group(3))])
             except ValueError:
                 pass
     if len(series) > max_points:
