@@ -232,6 +232,13 @@ Run `python scripts/check_hardware.py` and `python scripts/plan_training.py`. Th
     kernel search warms up 10+ min (and uses more GPU memory), while reduce-overhead compiles in
     ~a minute. Use `--compile-mode max-autotune` on a long run. **preflight strips compile** so the
     2-step smoke isn't swamped by warm-up.
+  - **fp8 training — NEVER enable it silently; ASK THE USER first.** fp8 is a *numerics* change,
+    not a free speedup, and it has a downstream consequence that has already bitten us: the saved
+    `config.json` carries `vlm_mlp_fp8_*` fields, so the checkpoint **fails to load on a lerobot
+    that lacks them** ("The fields vlm_mlp_fp8_… are not valid for PI05Config") — e.g. an eval or
+    PolicyServer box on upstream/older lerobot. Present the trade-off (memory saved vs. numerics
+    change + checkpoint portability + needs the TE-enabled image on every machine that will load
+    it) and use the user's answer. Default to **off** unless they say otherwise. Details:
   - **fp8 training (pi0/pi05 via TransformerEngine):** add **`--float8`** to `plan_training.py` for
     a **pi0/pi05** policy on a **Hopper/Ada GPU (H20/H100, sm_89/90+)** — it appends
     `--policy.vlm_mlp_fp8_enable=true --policy.dtype=bfloat16 --policy.vlm_mlp_fp8_recipe_kind=delayed_scaling`,
@@ -331,6 +338,9 @@ about-to-run values from `training_plan.json` (not the defaults) — at minimum:
 - **policy** (fresh `type`, or the finetuned `path`) and the key camera/state features
 - **steps** (and the epochs + `steps_per_epoch` they came from), **batch_size**, **num_workers**
 - **learning rate** (if set), **save_freq** and the derived **eval cadence** (≈ once per N min/h)
+- **precision**: bf16 (default) or **fp8** — state it explicitly and, when proposing fp8, say what it
+  costs: changed numerics, and a checkpoint that only loads on a TE-enabled lerobot. Never enable
+  fp8 without the user's explicit yes.
 - **output_dir**, the **GPU(s)** chosen, and the checkpoint **disk budget** `(steps/save_freq) × ckpt_size`
 - the exact **launch command** that will run
 
