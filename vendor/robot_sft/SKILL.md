@@ -407,7 +407,8 @@ picks checkpoints, it does not prove real-robot success.
 Only when the user **explicitly asks** for cross-node / multi-machine / 跨机 training (2+ GPU
 boxes). lerobot-train runs under HF **accelerate**; multi-node is DDP/FSDP across machines. robot_sft
 drives the **master** node normally (plan → preflight → watchdog + monitors + eval); the **worker**
-nodes are started **manually by the user** — robot_sft cannot reach them. See
+nodes are started **manually by the user** — by design, even when they are ssh-reachable console
+pods (the watchdog can only supervise the local master process). See
 https://huggingface.co/docs/lerobot/en/torch_accelerators (and `multi_gpu_training.mdx`).
 
 **Preconditions — enforce these and tell the user BEFORE launching:**
@@ -419,6 +420,23 @@ https://huggingface.co/docs/lerobot/en/torch_accelerators (and `multi_gpu_traini
    workers**, (c) **each node's GPU count** (assume equal GPUs/node — the simple case; unequal needs a
    per-node accelerate config file, flag that). Same lerobot **image/env** on all nodes; the
    **`--main_process_port` (default 29500) must be open** master↔workers.
+
+**Node addressing + ssh (console pods: already wired).** When the nodes are **console pods** in the
+same cluster, they can reach each other out of the box — verified: DNS resolves, TCP connects, and
+`ssh`/`scp` are **passwordless** (the image bakes a shared keypair + `authorized_keys` + sshd, and
+`StrictHostKeyChecking=no`; all pods run the SAME image so they trust each other automatically).
+- **Address pods by headless DNS, NOT pod IP** — pod IPs change on every restart/rollout:
+  `<pod-name>.<headless-service-name>` (e.g. master `lerobot-console-0.lerobot-console`,
+  worker `lerobot-console-test-0.lerobot-console-test`; append `.default.svc.cluster.local` when
+  writing it into a persisted plan). ⚠️ A **bare pod name does NOT resolve** — the service segment
+  is mandatory. Use this DNS name for `--main_process_ip` so the command survives pod restarts.
+- Use ssh to **verify the worker's dataset yourself** instead of asking the user to go do it:
+  `ssh root@<worker-dns> 'ls <dataset_root>/meta/info.json'`.
+- **Still start the workers MANUALLY** (give the user the per-node command; see below). Do NOT
+  ssh-dispatch long-running training onto another node — the watchdog can't supervise a remote
+  process, and orphaned runs/logs there are invisible to this session.
+- On **non-console** nodes (plain machines), assume no shared keys: the user runs the commands and
+  the scp themselves, addressed by IP.
 
 **Plan with cross-node totals (steps math) but master-local eval:** run `plan_training.py` with
 **`--gpus <TOTAL GPUs across ALL nodes>`** (so `global_batch = batch × total_processes` and the
@@ -458,8 +476,9 @@ cd /lerobot && uv run accelerate launch \
 - **Emit a ready-to-paste command for EACH node** — master (`--machine_rank=0`) and one per worker
   (`--machine_rank=1`, `2`, …), filling in `<MASTER_IP>`, `<N>`, `<TOTAL GPUs>`. The flags after
   `$(which lerobot-train)` are **identical on every node** (same dataset path, same `output_dir`).
-- Worker-side dataset self-check (give this to the user per worker BEFORE launch):
-  `ls <dataset_root>/meta/info.json` — must exist at the **same path** as on the master.
+- Worker-side dataset self-check BEFORE launch — `<dataset_root>/meta/info.json` must exist at the
+  **same path** as on the master. Console pods: check it yourself over ssh
+  (`ssh root@<worker-dns> 'ls <dataset_root>/meta/info.json'`); other nodes: give the user the `ls`.
 
 **Multi-node smoke test (HARD GATE — the multi-node analogue of preflight).** `preflight.py` only
 smokes the single-node command; it cannot catch the top cross-node failures (rendezvous not
@@ -486,9 +505,9 @@ step the master legitimately waits in the rendezvous for the workers — the wat
   manual:
   ```bash
   # 1. on master, copy the step dir being resumed (both pretrained_model/ and training_state/):
-  scp -r <output_dir>/checkpoints/<STEP> user@<WORKER_IP>:<output_dir>/checkpoints/
-  # Console pods: this works VERBATIM between console pods (root@<pod-ip-or-headless-dns>) — the
-  # image bakes a shared ssh keypair + sshd, so any two console pods are passwordless already.
+  # console pods: passwordless already — address the worker by headless DNS, not IP
+  scp -r <output_dir>/checkpoints/<STEP> root@<worker-pod>.<worker-svc>:<output_dir>/checkpoints/
+  # non-console nodes: the user runs this themselves — scp -r … user@<WORKER_IP>:…
   # 2. relaunch EVERY node with the SAME accelerate prefix + resume flags (only --machine_rank differs):
   ...accelerate launch … $(which lerobot-train) --resume=true \
      --config_path=<output_dir>/checkpoints/last/pretrained_model/train_config.json
