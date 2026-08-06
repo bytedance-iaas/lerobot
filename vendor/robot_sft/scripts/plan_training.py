@@ -439,6 +439,9 @@ def main() -> None:
             "master_launch_command, master_resume_command} per SKILL.md 跨机训练.")
         if not args.cuda:
             _train_gpus = _total_gpus  # conservative: assume all master-local GPUs train
+    # Computed AFTER the cross-node branch above, which may correct _train_gpus to a
+    # master-local count. Both are master-local here, so _spare is this box's idle GPUs.
+    _spare = (_total_gpus - _train_gpus) if _total_gpus is not None else None
     if _spare is not None and _spare < 1:
         plan["eval_mode"] = "post_training"
         _eps = ("--episodes " + " ".join(str(e) for e in eval_eps)) if eval_eps else \

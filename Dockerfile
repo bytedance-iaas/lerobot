@@ -50,8 +50,10 @@ RUN for f in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do \
 # registry + cluster-internal sshd; 22 is never exposed by APIG/CLB, which forward 8080
 # only): anyone with the image has the key. Upgrade path: mount a k8s Secret keypair.
 # StrictHostKeyChecking off because pod host keys regenerate on every restart.
+# rsync too: for the multi-node checkpoint copy it beats scp — resumable, delta-only on
+# re-sync, --partial survives a dropped link, and -P shows progress on multi-GB checkpoints.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends openssh-server openssh-client \
+    && apt-get install -y --no-install-recommends openssh-server openssh-client rsync \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd /root/.ssh \
     && ssh-keygen -t ed25519 -N "" -f /root/.ssh/id_ed25519 \

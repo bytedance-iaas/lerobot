@@ -411,6 +411,10 @@ nodes are started **manually by the user** — by design, even when they are ssh
 pods (the watchdog can only supervise the local master process). See
 https://huggingface.co/docs/lerobot/en/torch_accelerators (and `multi_gpu_training.mdx`).
 
+**Order of operations:** ask for the addresses → **Phase M0 (communication check, HARD GATE)** →
+plan (`plan_training.py` with cross-node totals) → persist the `multi_node` block → emit per-node
+commands → **multi-node smoke test (HARD GATE)** → real run (master under watchdog, workers by hand).
+
 **Preconditions — enforce these and tell the user BEFORE launching:**
 1. **Dataset must already be on EVERY node at the SAME path.** Each rank's dataloader reads frames
    locally (DDP only shards the batch, it does not ship data). **We require the user to prepare the
@@ -448,6 +452,41 @@ plain node.
   process, and orphaned runs/logs there are invisible to this session.
 - On **non-console** nodes (plain machines), assume no shared keys: the user runs the commands and
   the scp themselves, addressed by IP.
+
+### Phase M0 — 多机通信校验 (HARD GATE: run this BEFORE planning or launching anything)
+Cross-node runs fail in ways that look like a hang, not an error (rendezvous never completes, NCCL
+silently retries, a worker reads a dataset that isn't there). Verify connectivity **first**, cheaply,
+and only then plan the run. Run every check from the **master**; when the nodes are pods on this same
+image you can do all of it yourself over ssh — otherwise hand the worker-side ones to the user.
+Report each check's result; **do not proceed while any of them fails.**
+
+```bash
+W=<worker-addr>          # exactly as the user gave it (DNS name preferred over pod IP)
+M=<master-addr>          # the master as the WORKERS must reach it
+OUT=<output_dir>; DS=<dataset_root>
+
+# 1. address resolves + is reachable, master -> worker
+getent hosts "$W" && ssh -o ConnectTimeout=8 root@"$W" hostname
+# 2. reverse path: the worker must reach the master (rendezvous is bidirectional)
+ssh root@"$W" "getent hosts $M"
+# 3. same image/env on both sides (versions MUST match — a mismatch corrupts training subtly)
+python -c 'import torch,importlib.metadata as m;print(torch.__version__, m.version("lerobot"))'
+ssh root@"$W" "cd /lerobot && python -c 'import torch,importlib.metadata as m;print(torch.__version__, m.version(\"lerobot\"))'"
+# 4. dataset present on the worker at the SAME path
+ssh root@"$W" "ls $DS/meta/info.json"
+# 5. worker GPU count (must match what you pass as gpus_per_node)
+ssh root@"$W" "nvidia-smi --query-gpu=name --format=csv,noheader | wc -l"
+# 6. the rendezvous port is free on the master and reachable from the worker
+ss -ltn | grep -w 29500 || echo "29500 free on master (good)"
+# 7. shared output_dir path exists on the worker (each rank writes/reads its own local copy)
+ssh root@"$W" "mkdir -p $OUT && echo output_dir ok"
+```
+Checks 1–2 catch the addressing mistakes (bare pod name, stale pod IP, one-way reachability);
+3 catches env drift; 4 is the #1 cause of a worker dying seconds after launch; 5 feeds
+`num_processes`; 6–7 catch port/path problems before they turn into a silent hang.
+**Only after all of M0 passes** do you plan the run — and the multi-node *smoke test* (below) is
+still a separate, later gate: M0 proves the nodes can talk, the smoke test proves accelerate/NCCL
+actually rendezvous and train.
 
 **Plan with cross-node totals (steps math) but master-local eval:** run `plan_training.py` with
 **`--gpus <TOTAL GPUs across ALL nodes>`** (so `global_batch = batch × total_processes` and the
@@ -517,9 +556,11 @@ step the master legitimately waits in the rendezvous for the workers — the wat
   manual:
   ```bash
   # 1. on master, copy the step dir being resumed (both pretrained_model/ and training_state/):
-  # console pods: passwordless already — address the worker by headless DNS, not IP
-  scp -r <output_dir>/checkpoints/<STEP> root@<worker-pod>.<worker-svc>:<output_dir>/checkpoints/
-  # non-console nodes: the user runs this themselves — scp -r … user@<WORKER_IP>:…
+  # prefer rsync (pre-installed): resumable, delta-only, --partial survives a dropped link,
+  # -P shows progress on multi-GB checkpoints. Address the worker exactly as the user gave it.
+  rsync -aP --partial <output_dir>/checkpoints/<STEP> root@<worker-addr>:<output_dir>/checkpoints/
+  # scp works too (same keys):  scp -r <output_dir>/checkpoints/<STEP> root@<worker-addr>:…
+  # non-console nodes: no shared keys — the user runs the copy themselves.
   # 2. relaunch EVERY node with the SAME accelerate prefix + resume flags (only --machine_rank differs):
   ...accelerate launch … $(which lerobot-train) --resume=true \
      --config_path=<output_dir>/checkpoints/last/pretrained_model/train_config.json
