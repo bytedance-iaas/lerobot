@@ -566,6 +566,14 @@ minutes in rendezvous + model load (a VLA like pi05 is slow to load) emitting no
 - **The worker's log must be written ON THE WORKER**: `ssh root@$W 'cmd > /path/worker.log 2>&1'`
   (redirect INSIDE the quotes). Unquoted, `ssh root@$W cmd > worker.log` redirects on the MASTER and
   the worker-side file stays empty — a real trap that costs a whole run to notice.
+- **⚠️ NEVER inline the training command in an ssh argument — ship a SCRIPT.** Text passed as an
+  ssh argument goes through TWO shell expansions on the remote side (sshd's login shell, then your
+  `bash -lc`), so nested quotes are eaten: `--dataset.episodes='[0, 1, 2]'` and
+  `--rename_map='{"front": …}'` arrive mangled and lerobot dies in YAML parsing — with an error
+  that points at the config, not at the quoting. Write the command into a script file on the worker
+  (send the body over **stdin**, e.g. `ssh root@$W 'cat > /path/rank.sh'`), then run that script.
+  `multinode.py launch` does exactly this (and `run_remote` feeds every command over stdin to
+  `bash -l -s`), which is another reason not to hand-roll the ssh.
 - **Poll every ~20–30 s and relay a one-line status from EACH node**, naming the phase so "alive but
   slow" is distinguishable from "hung":
   ```bash

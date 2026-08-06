@@ -56,11 +56,32 @@ def run_local(cmd: str, timeout: int = 60) -> tuple[int, str]:
 
 
 def run_remote(addr: str, cmd: str, timeout: int = 60) -> tuple[int, str]:
-    """Run cmd on `addr` under a LOGIN shell so ~/.bashrc creds load. Note the quoting:
-    the redirect/pipe must be INSIDE the remote command, or it happens locally."""
-    full = ["ssh", *SSH_OPTS, f"root@{addr}", f"bash -lc {shlex.quote(cmd)}"]
+    """Run cmd on `addr` under a LOGIN shell so ~/.bashrc creds load.
+
+    The command is fed over STDIN (`bash -l -s`), never as an ssh argument. Passing it as an
+    argument puts the text through TWO shell expansions on the remote side — sshd's own login
+    shell and then `bash -lc` — so nested quotes get eaten: a flag like
+    `--dataset.episodes='[0, 1]'` arrives mangled and lerobot dies in YAML parsing. Over stdin
+    there is no argv quoting layer at all, so the text arrives byte-for-byte.
+    """
+    full = ["ssh", *SSH_OPTS, f"root@{addr}", "bash -l -s"]
     try:
-        p = subprocess.run(full, capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(full, input=cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return 255, f"ssh timeout after {timeout}s"
+    return _result(p)
+
+
+def write_remote_file(addr: str, path: str, content: str, timeout: int = 30) -> tuple[int, str]:
+    """Create `path` on `addr` with exactly `content` (sent over stdin).
+
+    Only the trivial `cat > path` goes through argv (no nested quotes to mangle); the payload —
+    which may contain single quotes, brackets, JSON — rides stdin untouched. This is why the
+    launcher ships a SCRIPT instead of a giant one-line command.
+    """
+    full = ["ssh", *SSH_OPTS, f"root@{addr}", f"cat > {shlex.quote(path)}"]
+    try:
+        p = subprocess.run(full, input=content, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return 255, f"ssh timeout after {timeout}s"
     return _result(p)
@@ -249,19 +270,30 @@ def cmd_launch(a) -> int:
               file=sys.stderr)
         return 2
     pids: dict[str, str] = {}
+    script_path = a.worker_log.rsplit("/", 1)[0] + "/worker_rank.sh"
     for i, w in enumerate(a.worker, start=1):
         cmd = a.command.replace("--machine_rank=0", f"--machine_rank={i}")
         if cmd == a.command:
             print(f"ERROR: could not set rank for {w}: no literal --machine_rank=0 in --command",
                   file=sys.stderr)
             return 2
-        # Redirect INSIDE the remote shell, else the log is created on the master and the
-        # worker-side file stays empty (a failure mode that costs a whole run to notice).
-        remote = f"cd /lerobot && setsid nohup {cmd} > {shlex.quote(a.worker_log)} 2>&1 & echo $!"
-        rc, out = run_remote(w, remote, timeout=30)
+        # Ship a SCRIPT, don't inline the command: flags like --dataset.episodes='[0, 1]' carry
+        # quotes/brackets that get eaten when the text passes through ssh's argv + a remote shell,
+        # and lerobot then dies parsing YAML. The script body travels over stdin verbatim.
+        # `-l` so ~/.bashrc creds (HF_TOKEN) load; redirect INSIDE the script so the log is created
+        # on the WORKER (a master-side redirect leaves the worker log empty).
+        body = f"#!/usr/bin/env bash\nset -x\ncd /lerobot\nexec {cmd}\n"
+        rc, out = write_remote_file(w, script_path, body)
+        if rc != 0:
+            print(f"[worker {w}] ERROR writing {script_path}: {out}", file=sys.stderr)
+            return 2
+        launch = (f"chmod +x {shlex.quote(script_path)} && "
+                  f"setsid nohup bash -l {shlex.quote(script_path)} "
+                  f"> {shlex.quote(a.worker_log)} 2>&1 < /dev/null & echo $!")
+        rc, out = run_remote(w, launch, timeout=30)
         pid = out.strip().splitlines()[-1] if out.strip() else "?"
         pids[w] = pid
-        print(f"[worker {w}] rank={i} started pid={pid} log={a.worker_log}")
+        print(f"[worker {w}] rank={i} started pid={pid} script={script_path} log={a.worker_log}")
 
     if a.output_dir:
         state = os.path.join(os.path.dirname(a.output_dir) or ".", STATE_FILE)
