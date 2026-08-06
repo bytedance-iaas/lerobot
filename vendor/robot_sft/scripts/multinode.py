@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+"""Cross-node (multi-machine) helper for robot_sft: check / status / clean / launch.
+
+Every cross-node failure we have actually hit came from hand-rolled ssh one-liners:
+a redirect that landed on the wrong host, a worker missing the model cache or HF token,
+a pre-created output_dir, a master disk that filled during checkpoint save (which surfaces
+as an NCCL *timeout on the worker*), and orphaned `setsid` ranks still holding GPU memory
+on the next retry. This encodes each of those once, so the agent stops improvising.
+
+Subcommands
+  check   all preflight gates for a cross-node run (read-only)
+  status  one-line phase per node, from both logs (read-only)
+  clean   kill leftover ranks on every node, verify GPU freed, optionally drop output_dir
+  launch  start the workers (ssh) + print the master command, recording PIDs for `clean`
+
+Addresses are whatever the user gave (headless DNS preferred over pod IPs). Remote commands
+run through `bash -lc` so ~/.bashrc credentials (HF_TOKEN/HF_ENDPOINT) are actually loaded —
+a plain non-interactive ssh does NOT source them.
+
+    python multinode.py check --worker <addr> --master <addr> \
+        --dataset-root /opt/data/ds --output-dir /opt/data/run1 \
+        --require-model lerobot/pi05_base --require-model google/paligemma-3b-pt-224 \
+        --steps 10544 --save-freq 1100 --ckpt-gb 9
+    python multinode.py status --worker <addr> --output-dir /opt/data/run1
+    python multinode.py clean  --worker <addr> --output-dir /opt/data/run1 [--remove-output-dir]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import subprocess
+import sys
+
+# LogLevel=ERROR matters: without it ssh prints "Warning: Permanently added … to the list of
+# known hosts" (pod host keys change every restart, so it fires constantly) and that line lands
+# in the output we parse — it silently corrupted the version compare and the GPU count.
+SSH_OPTS = ["-o", "ConnectTimeout=8", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+            "-o", "LogLevel=ERROR"]
+TRAIN_PATTERNS = ["accelerate", "lerobot-train", "lerobot_train"]
+STATE_FILE = ".multinode_pids.json"   # written into output_dir's parent by `launch`
+
+
+# --------------------------------------------------------------------------- shell helpers
+def _result(p) -> tuple[int, str]:
+    """Parse STDOUT only — stderr (ssh notices, tool chatter) must never reach a comparison.
+    On failure fall back to stderr so the reason is still visible."""
+    out = (p.stdout or "").strip()
+    return p.returncode, out if (p.returncode == 0 or out) else (p.stderr or "").strip()
+
+
+def run_local(cmd: str, timeout: int = 60) -> tuple[int, str]:
+    return _result(subprocess.run(["bash", "-lc", cmd], capture_output=True, text=True,
+                                  timeout=timeout))
+
+
+def run_remote(addr: str, cmd: str, timeout: int = 60) -> tuple[int, str]:
+    """Run cmd on `addr` under a LOGIN shell so ~/.bashrc creds load. Note the quoting:
+    the redirect/pipe must be INSIDE the remote command, or it happens locally."""
+    full = ["ssh", *SSH_OPTS, f"root@{addr}", f"bash -lc {shlex.quote(cmd)}"]
+    try:
+        p = subprocess.run(full, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return 255, f"ssh timeout after {timeout}s"
+    return _result(p)
+
+
+class Report:
+    def __init__(self) -> None:
+        self.failed = 0
+
+    def check(self, name: str, ok: bool, detail: str = "", ok_detail: str = "") -> bool:
+        """`detail` explains a FAILURE — it must never print on a pass (a "[PASS] … not cached"
+        line is worse than no line). Use ok_detail for the success annotation."""
+        if not ok:
+            self.failed += 1
+        note = ok_detail if ok else detail
+        print(f"[{'PASS' if ok else 'FAIL'}] {name}" + (f" — {note}" if note else ""))
+        return ok
+
+    def done(self, what: str) -> int:
+        if self.failed:
+            print(f"\n{what}: {self.failed} check(s) FAILED — fix these before launching.")
+            return 1
+        print(f"\n{what}: all checks passed.")
+        return 0
+
+
+def hf_cache_dirname(repo_id: str) -> str:
+    return "models--" + repo_id.replace("/", "--")
+
+
+# --------------------------------------------------------------------------- check
+def cmd_check(a) -> int:
+    r = Report()
+    hf_home = a.hf_home or os.environ.get("HF_HOME") or "/opt/data/.cache/huggingface"
+    hub = f"{hf_home}/hub"
+
+    for w in a.worker:
+        print(f"\n=== worker {w} ===")
+        # 1. reachable, and it is a DIFFERENT host than the master
+        rc, out = run_remote(w, "hostname")
+        if not r.check(f"{w}: ssh reachable", rc == 0, out if rc else out):
+            continue  # every later check needs ssh
+
+        # 2. reverse path — the rendezvous is bidirectional; a worker that cannot resolve
+        #    the master hangs forever instead of erroring.
+        rc, out = run_remote(w, f"getent hosts {shlex.quote(a.master)} || true")
+        r.check(f"{w}: can resolve master ({a.master})", bool(out.strip()),
+                out or "no A record — accelerate rendezvous will hang, not error")
+
+        # 3. env parity: a torch/lerobot mismatch corrupts training subtly rather than loudly
+        vcmd = ("cd /lerobot && python -c \"import torch,importlib.metadata as m;"
+                "print(torch.__version__, m.version('lerobot'))\"")
+        rc_l, ver_l = run_local(vcmd)
+        rc_w, ver_w = run_remote(w, vcmd)
+        r.check(f"{w}: torch/lerobot match master", rc_l == 0 and rc_w == 0 and ver_l == ver_w,
+                f"master={ver_l!r} worker={ver_w!r}")
+
+        # 4. dataset at the SAME path (each rank reads locally; DDP ships batches, not data)
+        if a.dataset_root:
+            rc, out = run_remote(w, f"ls {shlex.quote(a.dataset_root)}/meta/info.json")
+            r.check(f"{w}: dataset at {a.dataset_root}", rc == 0,
+                    "missing — the worker dies seconds after launch")
+
+        # 5. model cache + credentials. EVERY rank builds the policy itself, so the backbone
+        #    must be cached (or downloadable) on every node; gated repos also need HF_TOKEN.
+        for repo in a.require_model:
+            rc, out = run_remote(w, f"ls -d {shlex.quote(hub)}/{hf_cache_dirname(repo)}")
+            r.check(f"{w}: model cache {repo}", rc == 0,
+                    "not cached — a gated repo will 403 mid-launch")
+        if a.require_model:
+            rc, out = run_remote(w, 'test -n "$HF_TOKEN" && echo yes || echo no')
+            r.check(f"{w}: HF_TOKEN visible to a login shell", out.strip().endswith("yes"),
+                    "absent — gated repos 403. Note: non-login ssh does NOT read ~/.bashrc")
+
+        # 6. GPU count feeds --num_processes
+        rc, out = run_remote(w, "nvidia-smi --query-gpu=name --format=csv,noheader | wc -l")
+        n = out.strip().splitlines()[-1] if out.strip() else "0"
+        r.check(f"{w}: GPU count = {n}", n.isdigit() and int(n) > 0, out)
+
+        # 7. GPU actually free — orphaned ranks from a previous attempt hold memory and
+        #    make the retry OOM. `clean` fixes this.
+        rc, out = run_remote(w, "nvidia-smi --query-gpu=memory.used --format=csv,noheader")
+        used = [int(x.split()[0]) for x in out.splitlines() if x.strip() and x.split()[0].isdigit()]
+        r.check(f"{w}: GPUs idle", all(u < 1024 for u in used) if used else False,
+                f"in use: {out.strip()} — run `multinode.py clean` first" if used else out)
+
+        # 8. output_dir must NOT exist: lerobot-train aborts on an existing dir without --resume
+        if a.output_dir:
+            rc, out = run_remote(w, f"test -e {shlex.quote(a.output_dir)} && echo exists || echo clean")
+            r.check(f"{w}: output_dir clean", out.strip().endswith("clean"),
+                    "exists — delete it on EVERY node or every retry fails identically")
+
+    print("\n=== master ===")
+    # 9. checkpoint disk budget — ONLY the master writes checkpoints, and running out mid-save
+    #    surfaces as an NCCL timeout on the WORKER, sending you to debug the wrong node.
+    if a.output_dir and a.steps and a.save_freq:
+        need = (a.steps // max(1, a.save_freq) + 1) * a.ckpt_gb
+        rc, out = run_local(f"df -BG --output=avail {shlex.quote(os.path.dirname(a.output_dir))} "
+                            "| tail -1 | tr -dc '0-9'")
+        avail = int(out) if out.strip().isdigit() else -1
+        r.check(f"master: checkpoint disk budget (~{need}G needed, {avail}G free)",
+                avail >= need,
+                "master fills up mid-save -> looks like a worker NCCL timeout, not a disk error")
+
+    # 10. rendezvous port free on the master
+    rc, out = run_local(f"ss -ltn 2>/dev/null | grep -w {a.port} || true")
+    r.check(f"master: port {a.port} free", not out.strip(),
+            out.strip() or "in use — give this run a distinct --main_process_port")
+
+    if a.output_dir:
+        r.check("master: output_dir clean", not os.path.exists(a.output_dir),
+                "exists — delete it before launching")
+
+    return r.done("check")
+
+
+# --------------------------------------------------------------------------- status
+PHASES = [
+    ("first checkpoint written", ("Checkpoint saved", "checkpoints/")),
+    ("training steps running", ("it/s]", "loss:")),
+    ("training started", ("Start offline training", "Effective batch size")),
+    ("building policy/dataset (the long quiet phase)", ("Creating policy", "Creating dataset",
+                                                        "Loading", "resolving")),
+    ("rendezvous / process group init", ("Distributed environment", "rendezvous", "nproc")),
+]
+
+
+def classify(text: str) -> str:
+    for label, needles in PHASES:
+        if any(n in text for n in needles):
+            return label
+    return "no recognizable phase yet"
+
+
+def tail_of(path: str, addr: str | None, n: int = 40) -> str:
+    cmd = f"tail -{n} {shlex.quote(path)} 2>/dev/null || true"
+    _, out = (run_remote(addr, cmd) if addr else run_local(cmd))
+    return out
+
+
+def cmd_status(a) -> int:
+    for label, addr, log in [("master", None, a.master_log)] + \
+                            [(f"worker {w}", w, a.worker_log) for w in a.worker]:
+        text = tail_of(log, addr)
+        if not text.strip():
+            print(f"[{label}] log EMPTY at {log} — if this is a worker, the launch redirect "
+                  f"probably ran on the master (quote it: ssh host 'cmd > log 2>&1')")
+            continue
+        last = [ln for ln in text.splitlines() if ln.strip()][-1][:160]
+        print(f"[{label}] {classify(text)}\n          last: {last}")
+    print("\n(poll this every ~20-30s and relay it; multi-node startup is minutes of silence)")
+    return 0
+
+
+# --------------------------------------------------------------------------- clean
+def cmd_clean(a) -> int:
+    r = Report()
+    pat = "|".join(TRAIN_PATTERNS)
+    kill = (f"pkill -9 -f '{pat}' 2>/dev/null; sleep 3; "
+            "nvidia-smi --query-gpu=memory.used --format=csv,noheader")
+    targets: list[tuple[str, str | None]] = [("master", None)] + [(w, w) for w in a.worker]
+
+    for label, addr in targets:
+        _, out = (run_remote(addr, kill) if addr else run_local(kill))
+        used = [int(x.split()[0]) for x in out.splitlines() if x.strip() and x.split()[0].isdigit()]
+        # `setsid`-detached ranks outlive the launcher; without this the next attempt OOMs.
+        r.check(f"{label}: GPUs released", all(u < 1024 for u in used) if used else True,
+                f"still used: {out.strip()} — find stragglers with `pgrep -af python`")
+
+        if a.remove_output_dir and a.output_dir:
+            rm = f"rm -rf {shlex.quote(a.output_dir)} && echo removed"
+            _, o2 = (run_remote(addr, rm) if addr else run_local(rm))
+            r.check(f"{label}: output_dir removed", "removed" in o2, o2)
+
+    return r.done("clean")
+
+
+# --------------------------------------------------------------------------- launch
+def cmd_launch(a) -> int:
+    """Start the workers over ssh (logs written ON each worker) and print the master command.
+
+    The master is NOT started here: it must run under the watchdog so the run is supervised.
+    """
+    if "--machine_rank" not in a.command:
+        print("ERROR: --command must be the full accelerate command containing --machine_rank",
+              file=sys.stderr)
+        return 2
+    pids: dict[str, str] = {}
+    for i, w in enumerate(a.worker, start=1):
+        cmd = a.command.replace("--machine_rank=0", f"--machine_rank={i}")
+        if cmd == a.command:
+            print(f"ERROR: could not set rank for {w}: no literal --machine_rank=0 in --command",
+                  file=sys.stderr)
+            return 2
+        # Redirect INSIDE the remote shell, else the log is created on the master and the
+        # worker-side file stays empty (a failure mode that costs a whole run to notice).
+        remote = f"cd /lerobot && setsid nohup {cmd} > {shlex.quote(a.worker_log)} 2>&1 & echo $!"
+        rc, out = run_remote(w, remote, timeout=30)
+        pid = out.strip().splitlines()[-1] if out.strip() else "?"
+        pids[w] = pid
+        print(f"[worker {w}] rank={i} started pid={pid} log={a.worker_log}")
+
+    if a.output_dir:
+        state = os.path.join(os.path.dirname(a.output_dir) or ".", STATE_FILE)
+        try:
+            with open(state, "w") as f:
+                json.dump({"workers": pids, "worker_log": a.worker_log}, f, indent=2)
+            print(f"\nrecorded worker PIDs -> {state}")
+        except OSError as e:
+            print(f"(could not record PIDs: {e})")
+
+    print("\nNow start the MASTER under the watchdog (rank 0), e.g.:\n"
+          f"  {a.command}\n"
+          "Then poll:  python multinode.py status --worker <addr> ...")
+    return 0
+
+
+# --------------------------------------------------------------------------- cli
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def common(p):
+        p.add_argument("--worker", action="append", default=[],
+                       help="worker address exactly as the user gave it (repeatable)")
+        p.add_argument("--output-dir", default=None)
+
+    c = sub.add_parser("check", help="all cross-node preflight gates (read-only)")
+    common(c)
+    c.add_argument("--master", required=True, help="master address AS THE WORKERS REACH IT")
+    c.add_argument("--dataset-root", default=None)
+    c.add_argument("--require-model", action="append", default=[],
+                   help="HF repo id whose cache must exist on every node (repeatable)")
+    c.add_argument("--hf-home", default=None)
+    c.add_argument("--steps", type=int, default=None)
+    c.add_argument("--save-freq", type=int, default=None)
+    c.add_argument("--ckpt-gb", type=float, default=9.0)
+    c.add_argument("--port", type=int, default=29500)
+
+    s = sub.add_parser("status", help="one-line phase per node (read-only)")
+    common(s)
+    s.add_argument("--master-log", required=True)
+    s.add_argument("--worker-log", required=True)
+
+    cl = sub.add_parser("clean", help="kill leftover ranks everywhere, verify GPUs freed")
+    common(cl)
+    cl.add_argument("--remove-output-dir", action="store_true",
+                    help="also delete output_dir on every node (required before a retry)")
+
+    la = sub.add_parser("launch", help="start workers over ssh; master runs under the watchdog")
+    common(la)
+    la.add_argument("--command", required=True,
+                    help="the full rank-0 accelerate command (must contain --machine_rank=0)")
+    la.add_argument("--worker-log", default="/opt/data/robot_sft/worker.log")
+
+    a = ap.parse_args()
+    return {"check": cmd_check, "status": cmd_status,
+            "clean": cmd_clean, "launch": cmd_launch}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

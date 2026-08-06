@@ -460,32 +460,41 @@ and only then plan the run. Run every check from the **master**; when the nodes 
 image you can do all of it yourself over ssh — otherwise hand the worker-side ones to the user.
 Report each check's result; **do not proceed while any of them fails.**
 
+**Use `scripts/multinode.py` — do NOT hand-roll ssh one-liners.** Every cross-node failure we have
+actually hit came from improvised ssh (a redirect that landed on the wrong host, a missing model
+cache, a pre-created output_dir, orphaned ranks holding GPUs). The script encodes each gate once:
 ```bash
-W=<worker-addr>          # exactly as the user gave it (DNS name preferred over pod IP)
-M=<master-addr>          # the master as the WORKERS must reach it
-OUT=<output_dir>; DS=<dataset_root>
-
-# 1. address resolves + is reachable, master -> worker
-getent hosts "$W" && ssh -o ConnectTimeout=8 root@"$W" hostname
-# 2. reverse path: the worker must reach the master (rendezvous is bidirectional)
-ssh root@"$W" "getent hosts $M"
-# 3. same image/env on both sides (versions MUST match — a mismatch corrupts training subtly)
-python -c 'import torch,importlib.metadata as m;print(torch.__version__, m.version("lerobot"))'
-ssh root@"$W" "cd /lerobot && python -c 'import torch,importlib.metadata as m;print(torch.__version__, m.version(\"lerobot\"))'"
-# 4. dataset present on the worker at the SAME path
-ssh root@"$W" "ls $DS/meta/info.json"
-# 5. worker GPU count (must match what you pass as gpus_per_node)
-ssh root@"$W" "nvidia-smi --query-gpu=name --format=csv,noheader | wc -l"
-# 6. the rendezvous port is free on the master and reachable from the worker
-ss -ltn | grep -w 29500 || echo "29500 free on master (good)"
-# 7. the output_dir's PARENT is writable on the worker — and output_dir itself does NOT exist.
-#    NEVER pre-create output_dir: lerobot-train refuses to start on an existing output_dir
-#    without --resume, so a "helpful" mkdir turns into an immediate FAILED run on every node.
-ssh root@"$W" "test -w \$(dirname $OUT) && ! test -e $OUT && echo 'parent writable, output_dir clean'"
+python scripts/multinode.py check \
+  --master <master-addr> --worker <worker-addr> [--worker <addr2> …] \
+  --dataset-root <dataset_root> --output-dir <output_dir> \
+  --require-model <policy repo id> [--require-model <backbone repo id> …] \
+  --steps <steps> --save-freq <save_freq> --ckpt-gb <size of one checkpoint>
 ```
-Checks 1–2 catch the addressing mistakes (bare pod name, stale pod IP, one-way reachability);
-3 catches env drift; 4 is the #1 cause of a worker dying seconds after launch; 5 feeds
-`num_processes`; 6–7 catch port/path problems before they turn into a silent hang.
+It verifies, per node: ssh reachable · **worker can resolve the master** (rendezvous is
+bidirectional — one-way reachability hangs forever instead of erroring) · torch+lerobot versions
+match · dataset at the same path · **model cache + `HF_TOKEN`** · GPU count · **GPUs actually idle**
+· output_dir absent; and on the master: **checkpoint disk budget**, rendezvous port free.
+`--require-model` takes the policy AND its backbone (e.g. `lerobot/pi05_base` and
+`google/paligemma-3b-pt-224`). Exit code is non-zero while anything fails — **do not proceed**;
+report each failure. The other subcommands: `status` (see the polling rule below), `clean` (before
+any retry), `launch` (start workers with correct redirects + recorded PIDs).
+
+Why these specific gates — each one is a failure we hit and misdiagnosed:
+- **Every rank builds the policy itself**, so the pretrained backbone must be cached on EVERY node
+  and gated repos need `HF_TOKEN` there. A worker without them 403s seconds after launch. ⚠️ A
+  non-login ssh does **not** read `~/.bashrc`, so run remote commands through `bash -lc` or the
+  token is invisible even when it is configured.
+- **The master's disk filling during a checkpoint save surfaces as an NCCL *timeout on the worker***
+  — it sends you to debug the wrong node. Only the master writes checkpoints, so budget
+  `(steps/save_freq) × ckpt_size` there BEFORE launching.
+- **Generally, in a multi-node run any rank's local problem appears as "some other rank timed out."**
+  When you see a collective timeout, check every node's own log for the real error first.
+- **Orphaned ranks survive a failed run** (`setsid`-detached workers outlive the master) and keep
+  holding GPU memory, so the next attempt OOMs or rendezvous misbehaves. Always
+  `multinode.py clean` between attempts and confirm GPU memory actually returned to ~0.
+- Cleanup naturally involves force-kills and recursive deletes, which the console's **security scan
+  may block**. Don't fight it — surface the exact command and let the user approve it.
+
 **Only after all of M0 passes** do you plan the run — and the multi-node *smoke test* (below) is
 still a separate, later gate: M0 proves the nodes can talk, the smoke test proves accelerate/NCCL
 actually rendezvous and train.
@@ -538,9 +547,11 @@ smokes the single-node command; it cannot catch the top cross-node failures (ren
 connecting, NCCL hangs, dataset missing on a worker, env drift between nodes). Before the real
 launch, run the **full multi-node command on ALL nodes** with `--steps=2 --save_freq=1` and a
 throwaway `--output_dir`, and confirm every rank reaches step 2 and the master writes a checkpoint.
-⚠️ **Do not pre-create the smoke `output_dir`, and before ANY retry delete it on EVERY node**
-(`rm -rf` on master + `ssh root@$W 'rm -rf …'`) — lerobot-train aborts on an existing output_dir
-without `--resume`, so a leftover dir from a failed attempt makes every retry fail identically.
+⚠️ **Do not pre-create the smoke `output_dir`, and before ANY retry reset EVERY node** with
+`python scripts/multinode.py clean --worker <addr> --output-dir <dir> --remove-output-dir` —
+it kills leftover ranks, verifies the GPUs actually came back, and removes the dir everywhere.
+lerobot-train aborts on an existing output_dir without `--resume`, and an orphaned rank still
+holding GPU memory makes the retry OOM — so skipping this makes every retry fail identically.
 Debug aids: `NCCL_DEBUG=INFO`; if rendezvous connects but NCCL hangs on a multi-NIC node, set
 `NCCL_SOCKET_IFNAME=<iface>`. Note NCCL also uses **ephemeral ports beyond 29500** — open
 node↔node traffic, not just one port; and if two trainings share a master box, give each a
@@ -558,11 +569,13 @@ minutes in rendezvous + model load (a VLA like pi05 is slow to load) emitting no
 - **Poll every ~20–30 s and relay a one-line status from EACH node**, naming the phase so "alive but
   slow" is distinguishable from "hung":
   ```bash
-  tail -3 "$OUT/master.log"; ssh root@"$W" "tail -3 $OUT/worker.log"
+  python scripts/multinode.py status --worker <addr> \
+      --master-log <master.log> --worker-log <worker.log>
   ```
-  Recognizable milestones, in order: accelerate rendezvous → policy/dataset construction (the long
-  quiet one) → `Effective batch size:` / `Start offline training …` → the first tqdm `N/M [` line →
-  first checkpoint. Say which phase each node is in and how long it has been there.
+  It prints the phase per node (rendezvous → policy/dataset construction, the long quiet one →
+  `Start offline training` → first tqdm `N/M [` → first checkpoint) plus that node's last line, and
+  flags an empty worker log as the classic mis-redirect. Relay it, and say how long each node has
+  been in its phase.
 - **If a node emits nothing for minutes, say so explicitly** ("master: still loading the policy, 3m
   in, no output yet — normal for pi05; worker: rendezvous connected") instead of going quiet. Escalate
   to the M0 checks / `NCCL_DEBUG=INFO` only after the wait clearly exceeds a model-load time.
@@ -673,6 +686,10 @@ the run). **Never on a worker** (no checkpoints, and it would contend with that 
 - `scripts/monitor_server.py` — TensorBoard-like FastAPI dashboard (dependency-free
   `<canvas>`): plots the training-loss + eval curves, shows the watchdog's `assessment`
   verdict, and galleries any images found under `eval/artifacts/`.
+- `scripts/multinode.py` — cross-node helper: `check` (all M0 gates), `status` (per-node
+  phase while the launch is silent), `clean` (kill orphaned ranks everywhere + verify the
+  GPUs came back), `launch` (start workers with correct remote redirects + recorded PIDs).
+  Use it instead of hand-rolled ssh — see 跨机训练.
 - `lerobot.datasets.StreamingTOSRobotDataset` (in the lerobot package, not this skill) —
   stream a LeRobot v3.0 dataset from object storage (Volcengine **TOS** via `tosfs`, or S3)
   without downloading it. See "Streaming a dataset from TOS" below.
