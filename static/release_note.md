@@ -190,18 +190,69 @@ python src/lerobot/async_inference/robot_client.py \
 - **从 bf16 checkpoint 起训**：直接加载 `pi05_base` 等 bf16 权重即可，TE 的 fp8 缩放元数据（`_extra_state`）自动新初始化并在训练中标定——权重照常加载，无需预转换。
 - **依赖**：需要 TransformerEngine（已内置于 lerobot 镜像）+ Hopper/Ada 的 fp8 tensor core；旧卡会在运行时报错，所以 `plan_training.py` 只在检测到 H20/Hopper 时才允许 `--float8`。
 
+### 4. 新策略 · NVIDIA DreamZero（世界模型 VLA）
+
+把 **NVIDIA GEAR 的 DreamZero** 移植成了 LeRobot 树内策略（注册名 `dreamzero`）。它不是常规 VLA，而是基于 **Wan 视频扩散**的 **World Action Model**：一个因果 DiT 在同一条 token 序列里**联合去噪「视频 latent + 动作寄存器 + 状态寄存器」**，推理时用 KV-cache 逐 block 自回归地吐出 action chunk——即"一边预测未来画面、一边输出动作"。
+
+- **原生推理，不走 vllm**：移植的是上游自己的 PyTorch KV-cache 因果推理路径（`lazy_joint_video_action`），包进 LeRobot 的 `select_action` / `predict_action_chunk`；远程部署直接复用 LeRobot 自带的 gRPC `PolicyServer`。
+- **两档模型**：`wan21_14b`（DreamZero-DROID/AgiBot，VAE 16ch）与 `wan22_5b`（Wan2.2-TI2V-5B，VAE38 48ch / 160×320）。
+- **checkpoint 转换器**：把 NVIDIA 发布的 `GEAR-Dreams/DreamZero-*`（GEAR `VLA` 布局）转成 LeRobot checkpoint（`config.json` + `model.safetensors` + `statistics.json`），转完即可 `from_pretrained` 加载。
+- **离线开环评估**:留出 episode 逐帧回放，输出 action MSE（与 fp8 无关，纯 bf16 也可用）。
+- **SFT（LoRA）**:LoRA + 冻结 VAE/文本/图像编码器已在动作头内接好，训练侧的动作打包（q99 归一化 + 相对动作）已实现。
+- **当前状态(如实说明)**:归一化/视角拼接/相对动作解码等数值逻辑已有 CPU 单测锁定;**GPU 端到端与官方 checkpoint 的数值对齐仍待在 H20 上验证**——`processor` 的 umt5 tokenizer 路径与官方权重的精确配置需要实机确认后才算完成。
+
+```bash
+# 1) 转换官方 checkpoint
+python -m lerobot.policies.dreamzero.scripts.convert_dreamzero_checkpoint \
+    --src <GEAR-Dreams/DreamZero-DROID 本地目录> --dst <lerobot 格式输出目录> \
+    --embodiment-tag oxe_droid --model-variant wan22_5b
+
+# 2) 留出集离线开环评估
+python -m lerobot.policies.dreamzero.scripts.offline_eval \
+    --checkpoint <上一步输出> --repo-id <留出数据集> --episode 0 --device cuda
+```
+
 ---
 
 ## 二、控制台自带的能力
 
-### 4. 内置 AI Agent · 豆包驱动
+### 5. 内置 AI Agent · 豆包驱动
 
 右侧就是一个 AI Agent 对话框，接入 **豆包 / 火山方舟（Volcengine Ark）** 大模型。用自然语言即可让它探索数据集、规划并启动 SFT 训练、评估 checkpoint，或直接在下方控制台里执行命令。首次使用只需填入火山方舟 API Key（**仅用于 chat，不影响终端与其他功能**）。底层由 hermes agent 驱动。
 
-### 5. 配套的 robot_sft 技能
+### 6. 配套的 robot_sft 技能
 
 Agent 预装了 **`robot_sft`** 技能：把一次机器人模仿学习 / VLA 策略的 SFT 训练，拆成一串小的、可独立验证、文件存档的阶段——数据集探查 → train/eval 切分 → 计划 + 预检（含冒烟测试）→ 训练（自愈看门狗 + 定期离线评估 + 监控面板）。崩溃或上下文重置也不丢进度：重读会话状态即可继续。上面「直接访问 TOS 数据集」的能力也由它串起来。
 
-### 6. 自动发现并打开控制台里的服务
+### 7. 跨机（多机多卡）训练 · ssh + accelerate
+
+单机卡数不够时，可以把训练**横跨多台机器**。底层是 LeRobot 自带的 HF **accelerate**（多机 DDP/FSDP，梯度走 NCCL），控制台补上了让它在容器环境里真正跑得起来的那部分：
+
+- **Pod 之间开箱免密 ssh**：镜像内置一对共享密钥 + sshd，**所有由本镜像启动的 pod 天然互信**（同一镜像 ⇒ 私钥与 `authorized_keys` 配对），无需任何运行时配置，pod 重建后依然有效。`rsync` 也已预装，用于同步 checkpoint。
+- **按集群 DNS 寻址**：pod IP 每次重启都会变，因此一律用 headless DNS `<pod名>.<service名>`（如 `lerobot-console-0.lerobot-console`）作为 `--main_process_ip`，命令不随重启失效。
+- **`multinode.py` 工具**（随 `robot_sft` 一起预装），把踩过的坑固化成四个子命令：
+  - `check`——启动前的通信体检：双向可达、两端 torch/lerobot 版本一致、**数据集与模型缓存 + `HF_TOKEN` 在每个节点都就位**、GPU 数与空闲、**master 的 checkpoint 磁盘预算**、端口占用、`output_dir` 干净；
+  - `status`——启动阶段常有几分钟无输出（rendezvous + 大模型加载），它按节点报告当前阶段，把"活着但慢"与"卡死"区分开；
+  - `clean`——重试前清理各节点残留进程并确认显存真正释放（脱离终端的 rank 会活过失败的 run，占着显存让下一次 OOM）；
+  - `launch`——以**脚本文件**方式下发各 rank 的命令（内联到 ssh 参数里会被多层 shell 吃掉引号，形如 `--dataset.episodes='[0, 1]'` 的参数会损坏并报成 YAML 错误）。
+- **启动方式**：所有节点跑**同一条命令**，只有 `--machine_rank` 不同（0 = master）；`--num_processes` 是所有节点的 GPU 总数，`batch_size` 仍是每进程的值。
+- **需要你准备的**：**数据集必须已在每个节点的相同路径上**（DDP 只切分 batch，不搬运数据），并告诉 Agent 各节点地址与每节点 GPU 数。Worker 由你手动启动（这是刻意的：看门狗只能监管本机 master 进程，远程拉起的训练会留下无人监管的孤儿进程）。
+- **checkpoint 与评估只在 master**（accelerate 只在主进程保存/记录）。因此**续训需要先把 checkpoint 同步到每个 worker 的相同路径**（`rsync`/`scp`），再各节点一起 `--resume=true` 重启——多机场景下看门狗**不会**自动重启，它会把 run 标为 `blocked` 并给出手动步骤。
+
+```bash
+# 每个节点同一条命令，只改 --machine_rank（0=master，1,2…=worker）
+cd /lerobot && uv run accelerate launch --multi_gpu \
+  --num_machines=2 --num_processes=<所有节点 GPU 总数> --machine_rank=<R> \
+  --main_process_ip=<master 的 DNS 名> --main_process_port=29500 \
+  $(which lerobot-train) <与单机完全相同的训练参数>
+```
+
+### 8. 自动发现并打开控制台里的服务
 
 在下方 Linux 终端里启动的 web 服务（如 webrtc 远程遥操作面板、训练监控面板），控制台会**自动发现**；点右上角「＋ 打开」即可把它作为一个标签页在这里打开，也可手动输入端口 / 网址。Agent 输出的 HTML 同样会在这里打开——**终端、Agent、内嵌浏览器三者在同一个页面里协同**。
+
+### 9. HTTPS 访问 · 走 API 网关（APIG）
+
+控制台现在由火山 **API 网关（APIG）** 对外提供服务，**自带 HTTPS**：APIG 会为每个服务分配一个 `*.volceapi.com` 域名并自带证书，无需自购域名、也不用自签证书（页面上原先的「未加密 HTTP」提示因此已移除）。域名在 [APIG 控制台](https://console.volcengine.com/veapig)的服务列表里查看——同一个网关下可能列出多个域名，**以能正常返回的那个为准**。登录仍走控制台自身的账号口令。
+
+> APIG 只处理 HTTP/WebSocket（终端、Agent、监控面板都在其中）。LiveKit 的 UDP/TCP 媒体流不经过它，仍走独立的 CLB（见前文 §2）。
