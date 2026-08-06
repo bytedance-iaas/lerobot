@@ -478,8 +478,10 @@ ssh root@"$W" "ls $DS/meta/info.json"
 ssh root@"$W" "nvidia-smi --query-gpu=name --format=csv,noheader | wc -l"
 # 6. the rendezvous port is free on the master and reachable from the worker
 ss -ltn | grep -w 29500 || echo "29500 free on master (good)"
-# 7. shared output_dir path exists on the worker (each rank writes/reads its own local copy)
-ssh root@"$W" "mkdir -p $OUT && echo output_dir ok"
+# 7. the output_dir's PARENT is writable on the worker — and output_dir itself does NOT exist.
+#    NEVER pre-create output_dir: lerobot-train refuses to start on an existing output_dir
+#    without --resume, so a "helpful" mkdir turns into an immediate FAILED run on every node.
+ssh root@"$W" "test -w \$(dirname $OUT) && ! test -e $OUT && echo 'parent writable, output_dir clean'"
 ```
 Checks 1–2 catch the addressing mistakes (bare pod name, stale pod IP, one-way reachability);
 3 catches env drift; 4 is the #1 cause of a worker dying seconds after launch; 5 feeds
@@ -536,10 +538,34 @@ smokes the single-node command; it cannot catch the top cross-node failures (ren
 connecting, NCCL hangs, dataset missing on a worker, env drift between nodes). Before the real
 launch, run the **full multi-node command on ALL nodes** with `--steps=2 --save_freq=1` and a
 throwaway `--output_dir`, and confirm every rank reaches step 2 and the master writes a checkpoint.
+⚠️ **Do not pre-create the smoke `output_dir`, and before ANY retry delete it on EVERY node**
+(`rm -rf` on master + `ssh root@$W 'rm -rf …'`) — lerobot-train aborts on an existing output_dir
+without `--resume`, so a leftover dir from a failed attempt makes every retry fail identically.
 Debug aids: `NCCL_DEBUG=INFO`; if rendezvous connects but NCCL hangs on a multi-NIC node, set
 `NCCL_SOCKET_IFNAME=<iface>`. Note NCCL also uses **ephemeral ports beyond 29500** — open
 node↔node traffic, not just one port; and if two trainings share a master box, give each a
 distinct `--main_process_port`.
+
+**⚠️ Multi-node startup is MINUTES OF SILENCE — you MUST stream progress from BOTH nodes.** This is
+the single-node "slow commands must stream progress" rule, made stricter: a cross-node launch spends
+minutes in rendezvous + model load (a VLA like pi05 is slow to load) emitting nothing, and the
+**worker's output lives on the worker**, so the user sees an idle screen and concludes it died.
+- **NEVER block on the launch** — no blocking `wait`, no bare `sleep N` with output only at the end.
+  Launch in the background writing to a log, then poll.
+- **The worker's log must be written ON THE WORKER**: `ssh root@$W 'cmd > /path/worker.log 2>&1'`
+  (redirect INSIDE the quotes). Unquoted, `ssh root@$W cmd > worker.log` redirects on the MASTER and
+  the worker-side file stays empty — a real trap that costs a whole run to notice.
+- **Poll every ~20–30 s and relay a one-line status from EACH node**, naming the phase so "alive but
+  slow" is distinguishable from "hung":
+  ```bash
+  tail -3 "$OUT/master.log"; ssh root@"$W" "tail -3 $OUT/worker.log"
+  ```
+  Recognizable milestones, in order: accelerate rendezvous → policy/dataset construction (the long
+  quiet one) → `Effective batch size:` / `Start offline training …` → the first tqdm `N/M [` line →
+  first checkpoint. Say which phase each node is in and how long it has been there.
+- **If a node emits nothing for minutes, say so explicitly** ("master: still loading the policy, 3m
+  in, no output yet — normal for pi05; worker: rendezvous connected") instead of going quiet. Escalate
+  to the M0 checks / `NCCL_DEBUG=INFO` only after the wait clearly exceeds a model-load time.
 
 **Run: master under the watchdog, workers by hand.** Master runs under the **watchdog** as usual
 (`session.py add-run`, `watchdog.py`, `monitor_server.py`); it uses `multi_node.master_launch_command`.
