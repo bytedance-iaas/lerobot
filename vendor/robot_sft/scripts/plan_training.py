@@ -389,6 +389,21 @@ def main() -> None:
         plan["multi_gpu_note"] = ("for multi-GPU use `uv run accelerate launch --num_processes="
                                   f"{args.gpus} $(which lerobot-train) ...` with the same flags; "
                                   "batch_size is per process")
+    # Multi-NODE (cross-machine) template — only relevant when the user explicitly asks for cross-node
+    # training. Same lerobot-train flags on every node; wrap with the accelerate multi-node prefix and
+    # vary only --machine_rank (0=master, 1..=workers). See SKILL.md "跨机训练". Dataset must be on
+    # EVERY node at the same path; checkpoints + eval are master-only; resume needs a manual scp of the
+    # checkpoint to each worker first.
+    plan["multi_node_note"] = (
+        "CROSS-NODE (multi-machine): run the SAME lerobot-train flags on every node, wrapped as\n"
+        "  cd {repo} && uv run accelerate launch --multi_gpu --num_machines=<N> "
+        "--num_processes=<TOTAL_GPUS_ALL_NODES> --machine_rank=<R> --main_process_ip=<MASTER_IP> "
+        "--main_process_port=29500 $(which lerobot-train) <same flags>\n"
+        "  machine_rank: 0=master, 1,2,..=workers. num_processes=sum of GPUs across all nodes; "
+        "batch is per-process. Dataset MUST already be on EVERY node at the same path. Only the master "
+        "writes checkpoints + runs eval; to resume, first scp <output_dir>/checkpoints/<STEP> to the "
+        "same path on every worker, then relaunch all nodes with --resume=true."
+    ).format(repo=args.repo)
 
     # Eval needs a SPARE GPU: the eval_watcher runs offline_eval concurrently on an IDLE GPU
     # (--gpu, kept off the training GPUs). If the box has no GPU beyond the ones training uses,

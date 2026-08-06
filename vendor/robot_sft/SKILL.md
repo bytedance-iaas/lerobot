@@ -403,6 +403,64 @@ manually: `cd /lerobot && python <skill>/scripts/offline_eval.py --model-path
 this is a real generalization signal, not memorization. Open-loop still ≠ closed-loop: it
 picks checkpoints, it does not prove real-robot success.
 
+## 跨机训练 (multi-node / cross-machine distributed)
+Only when the user **explicitly asks** for cross-node / multi-machine / 跨机 training (2+ GPU
+boxes). lerobot-train runs under HF **accelerate**; multi-node is DDP/FSDP across machines. robot_sft
+drives the **master** node normally (plan → preflight → watchdog + monitors + eval); the **worker**
+nodes are started **manually by the user** — robot_sft cannot reach them. See
+https://huggingface.co/docs/lerobot/en/torch_accelerators (and `multi_gpu_training.mdx`).
+
+**Preconditions — enforce these and tell the user BEFORE launching:**
+1. **Dataset must already be on EVERY node at the SAME path.** Each rank's dataloader reads frames
+   locally (DDP only shards the batch, it does not ship data). **We require the user to prepare the
+   dataset on the other node(s) themselves** — ask them to confirm it's present at the same
+   `--dataset.root` / repo path on every node before you emit any command.
+2. **Ask the user for:** (a) each **other node's IP**, (b) the **master node's IP reachable from the
+   workers**, (c) **each node's GPU count** (assume equal GPUs/node — the simple case; unequal needs a
+   per-node accelerate config file, flag that). Same lerobot **image/env** on all nodes; the
+   **`--main_process_port` (default 29500) must be open** master↔workers.
+
+**Launch — run the SAME command on every node, differing ONLY by `--machine_rank`.** Take the exact
+`lerobot-train` flags `plan_training.py` emitted (steps/batch/dataset/policy/**output_dir**/…) and wrap
+them with the accelerate multi-node prefix:
+```bash
+cd /lerobot && uv run accelerate launch \
+  --multi_gpu \
+  --num_machines=<N> \
+  --num_processes=<TOTAL GPUs across ALL nodes> \
+  --machine_rank=<R> \              # 0 = master, 1,2,… = each worker
+  --main_process_ip=<MASTER_IP> \
+  --main_process_port=29500 \
+  $(which lerobot-train) \
+  <the SAME lerobot-train flags for every node>
+```
+- **Emit a ready-to-paste command for EACH node** — master (`--machine_rank=0`) and one per worker
+  (`--machine_rank=1`, `2`, …), filling in `<MASTER_IP>`, `<N>`, `<TOTAL GPUs>`. The flags after
+  `$(which lerobot-train)` are **identical on every node** (same dataset path, same `output_dir`).
+- `--num_processes` = **sum of GPUs across all nodes**; `--num_machines` = node count. `batch_size`
+  stays **per-process**; effective batch = `batch_size × num_processes` (rescale steps/LR accordingly).
+- Master runs under the **watchdog** as usual (`session.py add-run`, `watchdog.py`, `monitor_server.py`).
+  Workers do NOT — the user starts them by hand and they rendezvous with the master's IP:port.
+
+**Checkpoints & resume (master-only + manual scp):**
+- **Only the master (rank 0) writes checkpoints** to `output_dir/checkpoints/` — accelerate saves and
+  logs only on the main process. Workers write nothing.
+- On **resume**, every rank loads the checkpoint from its **own local** `output_dir` at launch. Since
+  only master has it, **before relaunching a multi-node resume, manually `scp` the checkpoint step dir
+  from master to the SAME path on every worker**, then start all nodes with `--resume=true`:
+  ```bash
+  # on master, for the step you're resuming from (or checkpoints/last):
+  scp -r <output_dir>/checkpoints/<STEP> user@<WORKER_IP>:<output_dir>/checkpoints/
+  ```
+  (copy the whole step dir — both `pretrained_model/` and `training_state/`.) Without this the workers
+  can't initialize and the rendezvous fails.
+- **The watchdog's auto-resume is master-side only** — it can't scp to or restart the workers. So treat
+  a multi-node resume as a **manual** step: scp → restart every node. (Tell the user this up front.)
+
+**Eval runs ONLY on the master node** — checkpoints exist only there. Start `eval_watcher.py` /
+`offline_eval.py` on the master (spare GPU on master → concurrent; else `post_training` on master after
+the run). **Never on a worker** (no checkpoints, and it would contend with that worker's training).
+
 ## The self-healing watchdog contract
 
 `watchdog.py` implements — and you must preserve — this contract (full algorithm in
