@@ -416,20 +416,31 @@ https://huggingface.co/docs/lerobot/en/torch_accelerators (and `multi_gpu_traini
    locally (DDP only shards the batch, it does not ship data). **We require the user to prepare the
    dataset on the other node(s) themselves** — ask them to confirm it's present at the same
    `--dataset.root` / repo path on every node before you emit any command.
-2. **Ask the user for:** (a) each **other node's IP**, (b) the **master node's IP reachable from the
-   workers**, (c) **each node's GPU count** (assume equal GPUs/node — the simple case; unequal needs a
-   per-node accelerate config file, flag that). Same lerobot **image/env** on all nodes; the
-   **`--main_process_port` (default 29500) must be open** master↔workers.
+2. **Ask the user for — never guess any of it:** (a) **how to address each worker node** (an IP /
+   hostname, or, if it is a pod, its **pod name + its headless service name**), (b) the **master's
+   address as reachable from the workers**, (c) **each node's GPU count** (assume equal GPUs/node —
+   the simple case; unequal needs a per-node accelerate config file, flag that). Same lerobot
+   **image/env** on all nodes; the **`--main_process_port` (default 29500) must be open**
+   master↔workers.
+   ⚠️ **There is no default worker.** The worker is whatever machine/pod the user names — it is NOT
+   assumed to be any particular pod (e.g. not "the test pod"). Ask, echo back what you understood,
+   and use exactly that address everywhere (commands, scp, `multi_node` block).
 
-**Node addressing + ssh (console pods: already wired).** When the nodes are **console pods** in the
-same cluster, they can reach each other out of the box — verified: DNS resolves, TCP connects, and
-`ssh`/`scp` are **passwordless** (the image bakes a shared keypair + `authorized_keys` + sshd, and
-`StrictHostKeyChecking=no`; all pods run the SAME image so they trust each other automatically).
-- **Address pods by headless DNS, NOT pod IP** — pod IPs change on every restart/rollout:
-  `<pod-name>.<headless-service-name>` (e.g. master `lerobot-console-0.lerobot-console`,
-  worker `lerobot-console-test-0.lerobot-console-test`; append `.default.svc.cluster.local` when
-  writing it into a persisted plan). ⚠️ A **bare pod name does NOT resolve** — the service segment
-  is mandatory. Use this DNS name for `--main_process_ip` so the command survives pod restarts.
+**Node addressing + ssh.** Whatever the user names as a node, address it exactly as they gave it.
+When a node **is a pod running this same console image**, cluster networking is already wired —
+verified: DNS resolves, TCP connects, and `ssh`/`scp` are **passwordless** (the image bakes a shared
+keypair + `authorized_keys` + sshd with `StrictHostKeyChecking=no`; pods from the SAME image trust
+each other automatically). A pod running a *different* image has no shared key — treat it like a
+plain node.
+- **Address pods by headless DNS, NOT pod IP** — pod IPs change on every restart/rollout. The form is
+  `<pod-name>.<headless-service-name>` (+`.default.svc.cluster.local` when persisting it), where BOTH
+  parts come from the user. ⚠️ A **bare pod name does NOT resolve** — the service segment is
+  mandatory. Use this DNS name for `--main_process_ip` so the command survives pod restarts.
+  (In this cluster the console pods happen to be `lerobot-console-0.lerobot-console` and
+  `lerobot-console-test-0.lerobot-console-test` — an illustration of the FORM only, never an
+  assumption about which node the user is using.)
+- **Verify the address before building any command:** `getent hosts <dns-name>` (or
+  `ssh root@<dns-name> hostname`). If it doesn't resolve, ask the user again — do not guess a name.
 - Use ssh to **verify the worker's dataset yourself** instead of asking the user to go do it:
   `ssh root@<worker-dns> 'ls <dataset_root>/meta/info.json'`.
 - **Still start the workers MANUALLY** (give the user the per-node command; see below). Do NOT
@@ -445,19 +456,20 @@ spare-GPU/eval_mode logic stays master-local). When `--gpus` exceeds the box's G
 emits a `multi_node_hint` reminding you of exactly this. Effective batch = `batch × num_processes`
 (per-process batch unchanged) — consider rescaling LR.
 
-**Persist the topology (MANDATORY once the user provides IPs).** Write a `multi_node` block into
-`<session>/training_plan.json` — the conversation is not durable, and the watchdog keys off this
-block:
+**Persist the topology (MANDATORY once the user gives you the addresses).** Write a `multi_node`
+block into `<session>/training_plan.json` — the conversation is not durable, and the watchdog keys
+off this block. Store the addresses **exactly as the user gave them** (DNS name or IP):
 ```json
 "multi_node": {
-  "master_ip": "…", "worker_ips": ["…"], "gpus_per_node": 8,
+  "master_addr": "…", "worker_addrs": ["…"], "gpus_per_node": 8,
   "num_machines": 2, "num_processes": 16,
   "master_launch_command": "cd /lerobot && uv run accelerate launch --multi_gpu … --machine_rank=0 … $(which lerobot-train) <flags>",
   "master_resume_command": "cd /lerobot && uv run accelerate launch --multi_gpu … --machine_rank=0 … $(which lerobot-train) --resume=true --config_path=<out>/checkpoints/last/pretrained_model/train_config.json"
 }
 ```
-⚠️ In VKE the master is a **pod IP that changes on pod restart** — after any console-pod restart,
-re-derive `master_ip` and regenerate every node's commands before resuming.
+⚠️ If any address is a **pod IP**, it changes on pod restart — after a restart, re-confirm
+`master_addr`/`worker_addrs` and regenerate every node's commands before resuming. (Headless DNS
+names don't have this problem, which is why they're preferred.)
 
 **Launch — run the SAME command on every node, differing ONLY by `--machine_rank`.** Take the exact
 `lerobot-train` flags `plan_training.py` emitted (steps/batch/dataset/policy/**output_dir**/…) and wrap

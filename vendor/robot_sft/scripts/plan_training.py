@@ -435,7 +435,7 @@ def main() -> None:
             "CROSS-NODE total (steps/global-batch math uses it). Pass --cuda with the "
             "MASTER-LOCAL training GPU indices so eval_mode/spare-GPU logic stays master-local. "
             "Eval + checkpoints are MASTER-ONLY. Record the topology in training_plan.json "
-            "multi_node {master_ip, worker_ips, gpus_per_node, num_machines, num_processes, "
+            "multi_node {master_addr, worker_addrs, gpus_per_node, num_machines, num_processes, "
             "master_launch_command, master_resume_command} per SKILL.md 跨机训练.")
         if not args.cuda:
             _train_gpus = _total_gpus  # conservative: assume all master-local GPUs train
