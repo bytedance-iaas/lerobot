@@ -404,13 +404,41 @@ def main() -> None:
         "writes checkpoints + runs eval; to resume, first scp <output_dir>/checkpoints/<STEP> to the "
         "same path on every worker, then relaunch all nodes with --resume=true."
     ).format(repo=args.repo)
+    # Resume is ALSO multi-node: the bare resume_command above is single-node and MUST NOT be used
+    # for a cross-node run (wrong world size). Every node reruns the same accelerate prefix with the
+    # resume flags; the master variant belongs in training_plan.json multi_node.master_resume_command
+    # so the watchdog uses it (watchdog refuses a multi-node resume without it).
+    plan["multi_node_resume_note"] = (
+        "CROSS-NODE RESUME: first scp {out}/checkpoints/<latest STEP> from the master to the SAME "
+        "path on every worker. Then on EVERY node (same accelerate prefix, only --machine_rank "
+        "differs):\n"
+        "  cd {repo} && uv run accelerate launch --multi_gpu --num_machines=<N> "
+        "--num_processes=<TOTAL_GPUS_ALL_NODES> --machine_rank=<R> --main_process_ip=<MASTER_IP> "
+        "--main_process_port=29500 $(which lerobot-train) --resume=true "
+        "--config_path={out}/checkpoints/last/pretrained_model/train_config.json\n"
+        "  Put the rank-0 variant into training_plan.json multi_node.master_resume_command "
+        "(the watchdog runs that, never the single-node resume_command)."
+    ).format(repo=args.repo, out=out_dir)
 
     # Eval needs a SPARE GPU: the eval_watcher runs offline_eval concurrently on an IDLE GPU
     # (--gpu, kept off the training GPUs). If the box has no GPU beyond the ones training uses,
     # in-training eval CANNOT run — tell the user to eval the LAST FEW checkpoints AFTER training.
     _total_gpus = _total_gpu_count()
     _train_gpus = len([c for c in args.cuda.split(",") if c.strip()]) if args.cuda else args.gpus
-    _spare = (_total_gpus - _train_gpus) if _total_gpus is not None else None
+    # CROSS-NODE detection: --gpus beyond this box's GPU count means the caller passed the
+    # TOTAL across nodes (correct for the steps/global-batch math above). The spare-GPU/eval
+    # logic below is MASTER-LOCAL though — it needs --cuda to carry the master-local training
+    # GPU indices, otherwise _train_gpus (= the cross-node total) would misclassify eval_mode.
+    if _total_gpus is not None and args.gpus > _total_gpus:
+        plan["multi_node_hint"] = (
+            f"--gpus={args.gpus} exceeds this box's {_total_gpus} GPU(s) -> treated as the "
+            "CROSS-NODE total (steps/global-batch math uses it). Pass --cuda with the "
+            "MASTER-LOCAL training GPU indices so eval_mode/spare-GPU logic stays master-local. "
+            "Eval + checkpoints are MASTER-ONLY. Record the topology in training_plan.json "
+            "multi_node {master_ip, worker_ips, gpus_per_node, num_machines, num_processes, "
+            "master_launch_command, master_resume_command} per SKILL.md 跨机训练.")
+        if not args.cuda:
+            _train_gpus = _total_gpus  # conservative: assume all master-local GPUs train
     if _spare is not None and _spare < 1:
         plan["eval_mode"] = "post_training"
         _eps = ("--episodes " + " ".join(str(e) for e in eval_eps)) if eval_eps else \

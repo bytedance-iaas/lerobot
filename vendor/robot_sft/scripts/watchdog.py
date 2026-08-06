@@ -250,6 +250,19 @@ def main() -> None:
     resume_cmd = plan.get("resume_command") or (
         f"cd {plan.get('repo', '/lerobot')} && uv run lerobot-train --resume=true "
         f"--config_path={output_dir}/checkpoints/last/pretrained_model/train_config.json")
+    # ---- CROSS-NODE (multi-node) mode ---------------------------------------------------
+    # When training_plan.json carries a `multi_node` block (written by the agent per SKILL.md
+    # 跨机训练), this watchdog drives ONLY the master rank. Two hard consequences:
+    #   - launch/resume must use the accelerate multi-node commands from that block — the plain
+    #     single-node resume_command would silently restart the run with the WRONG world size
+    #     (workers orphaned, effective batch changed, and it would LOOK like it worked);
+    #   - auto-restart is DISABLED: a resume first needs the latest checkpoint scp'd to every
+    #     worker and a coordinated manual restart of all nodes; the watchdog can do neither.
+    multi_node = plan.get("multi_node") or None
+    if multi_node:
+        cmd = multi_node.get("master_launch_command") or cmd
+        if multi_node.get("master_resume_command"):
+            resume_cmd = multi_node["master_resume_command"]
     run_dir = os.path.join(session, "runs", args.run)
     run_json = os.path.join(run_dir, "run.json")
     log_path = os.path.join(run_dir, "train.log")
@@ -263,7 +276,18 @@ def main() -> None:
     restarts = run.get("restarts", 0)
     # If a resumable checkpoint already exists (watchdog itself restarted), resume — the
     # fresh-launch command would die on "output directory already exists".
-    first_cmd = resume_cmd if latest_resumable_checkpoint(output_dir) else cmd
+    resuming = latest_resumable_checkpoint(output_dir) is not None
+    if multi_node and resuming and not multi_node.get("master_resume_command"):
+        update(status="blocked",
+               reason="multi-node resume needs multi_node.master_resume_command in "
+                      "training_plan.json (accelerate multi-node prefix). A single-node resume "
+                      "would restart with the wrong world size. Before restarting: scp the latest "
+                      "checkpoint step dir to the same path on every worker, restart the workers, "
+                      "then rerun the watchdog.")
+        print("[watchdog] BLOCKED: multi-node resume requires master_resume_command "
+              "+ manual worker scp/restart (see training_plan.json multi_node)")
+        return
+    first_cmd = resume_cmd if resuming else cmd
     proc = launch(first_cmd, log_path)
     update(status="running", pid=proc.pid, restarts=restarts, log=log_path,
            output_dir=output_dir, started_at=time.ctime())
@@ -298,7 +322,12 @@ def main() -> None:
         # stall detection
         if step is not None and step != last_progress_step:
             last_progress_step, last_progress_time = step, now()
-        stalled = (now() - last_progress_time) > args.stall_timeout and proc.poll() is None
+        # Multi-node: before the FIRST step the master legitimately sits in the accelerate
+        # rendezvous waiting for workers the user starts by hand — don't call that a stall.
+        # After the first step, normal stall detection applies.
+        rendezvous_wait = multi_node is not None and last_progress_step is None
+        stalled = ((now() - last_progress_time) > args.stall_timeout and proc.poll() is None
+                   and not rendezvous_wait)
 
         diverged = isinstance(loss, float) and loss > args.divergence
 
@@ -349,6 +378,23 @@ def main() -> None:
             return
         if cls["category"] == "oom":
             update(oom_hint=cls["fix"])  # surface; resume still helps if a checkpoint exists
+
+        # Multi-node: NEVER auto-relaunch. A resume needs the latest checkpoint scp'd to every
+        # worker and a coordinated restart of ALL nodes with the accelerate prefix — this
+        # watchdog can only reach the master, so relaunching here would either hang at the
+        # rendezvous or (with the single-node command) silently restart with the wrong world
+        # size. Surface the manual procedure instead.
+        if multi_node:
+            ckpt = latest_resumable_checkpoint(output_dir)
+            update(status="blocked", reason=trouble or f"exit code {rc}",
+                   checkpoint=os.path.basename(ckpt) if ckpt else None,
+                   note="multi-node run: auto-restart disabled. To resume: scp "
+                        f"{output_dir}/checkpoints/<latest STEP> to the same path on every "
+                        "worker, restart every node with its accelerate multi-node resume "
+                        "command (multi_node block in training_plan.json), then rerun the "
+                        "watchdog on the master.")
+            print("[watchdog] BLOCKED (multi-node): manual scp + coordinated restart required")
+            return
 
         if restarts >= args.max_restarts:
             update(status="failed", reason=trouble or f"exit code {rc}",

@@ -420,6 +420,27 @@ https://huggingface.co/docs/lerobot/en/torch_accelerators (and `multi_gpu_traini
    per-node accelerate config file, flag that). Same lerobot **image/env** on all nodes; the
    **`--main_process_port` (default 29500) must be open** master↔workers.
 
+**Plan with cross-node totals (steps math) but master-local eval:** run `plan_training.py` with
+**`--gpus <TOTAL GPUs across ALL nodes>`** (so `global_batch = batch × total_processes` and the
+steps/save_freq math is right) **and `--cuda <master-local training GPU indices>`** (so the
+spare-GPU/eval_mode logic stays master-local). When `--gpus` exceeds the box's GPU count the plan
+emits a `multi_node_hint` reminding you of exactly this. Effective batch = `batch × num_processes`
+(per-process batch unchanged) — consider rescaling LR.
+
+**Persist the topology (MANDATORY once the user provides IPs).** Write a `multi_node` block into
+`<session>/training_plan.json` — the conversation is not durable, and the watchdog keys off this
+block:
+```json
+"multi_node": {
+  "master_ip": "…", "worker_ips": ["…"], "gpus_per_node": 8,
+  "num_machines": 2, "num_processes": 16,
+  "master_launch_command": "cd /lerobot && uv run accelerate launch --multi_gpu … --machine_rank=0 … $(which lerobot-train) <flags>",
+  "master_resume_command": "cd /lerobot && uv run accelerate launch --multi_gpu … --machine_rank=0 … $(which lerobot-train) --resume=true --config_path=<out>/checkpoints/last/pretrained_model/train_config.json"
+}
+```
+⚠️ In VKE the master is a **pod IP that changes on pod restart** — after any console-pod restart,
+re-derive `master_ip` and regenerate every node's commands before resuming.
+
 **Launch — run the SAME command on every node, differing ONLY by `--machine_rank`.** Take the exact
 `lerobot-train` flags `plan_training.py` emitted (steps/batch/dataset/policy/**output_dir**/…) and wrap
 them with the accelerate multi-node prefix:
@@ -437,25 +458,43 @@ cd /lerobot && uv run accelerate launch \
 - **Emit a ready-to-paste command for EACH node** — master (`--machine_rank=0`) and one per worker
   (`--machine_rank=1`, `2`, …), filling in `<MASTER_IP>`, `<N>`, `<TOTAL GPUs>`. The flags after
   `$(which lerobot-train)` are **identical on every node** (same dataset path, same `output_dir`).
-- `--num_processes` = **sum of GPUs across all nodes**; `--num_machines` = node count. `batch_size`
-  stays **per-process**; effective batch = `batch_size × num_processes` (rescale steps/LR accordingly).
-- Master runs under the **watchdog** as usual (`session.py add-run`, `watchdog.py`, `monitor_server.py`).
-  Workers do NOT — the user starts them by hand and they rendezvous with the master's IP:port.
+- Worker-side dataset self-check (give this to the user per worker BEFORE launch):
+  `ls <dataset_root>/meta/info.json` — must exist at the **same path** as on the master.
 
-**Checkpoints & resume (master-only + manual scp):**
+**Multi-node smoke test (HARD GATE — the multi-node analogue of preflight).** `preflight.py` only
+smokes the single-node command; it cannot catch the top cross-node failures (rendezvous not
+connecting, NCCL hangs, dataset missing on a worker, env drift between nodes). Before the real
+launch, run the **full multi-node command on ALL nodes** with `--steps=2 --save_freq=1` and a
+throwaway `--output_dir`, and confirm every rank reaches step 2 and the master writes a checkpoint.
+Debug aids: `NCCL_DEBUG=INFO`; if rendezvous connects but NCCL hangs on a multi-NIC node, set
+`NCCL_SOCKET_IFNAME=<iface>`. Note NCCL also uses **ephemeral ports beyond 29500** — open
+node↔node traffic, not just one port; and if two trainings share a master box, give each a
+distinct `--main_process_port`.
+
+**Run: master under the watchdog, workers by hand.** Master runs under the **watchdog** as usual
+(`session.py add-run`, `watchdog.py`, `monitor_server.py`); it uses `multi_node.master_launch_command`.
+Workers are started manually by the user and rendezvous with the master's IP:port. Before the first
+step the master legitimately waits in the rendezvous for the workers — the watchdog knows
+(`multi_node` present) and won't count that wait as a stall; still, start the workers promptly.
+
+**Checkpoints & resume (master-only + manual scp; watchdog will NOT auto-restart):**
 - **Only the master (rank 0) writes checkpoints** to `output_dir/checkpoints/` — accelerate saves and
   logs only on the main process. Workers write nothing.
-- On **resume**, every rank loads the checkpoint from its **own local** `output_dir` at launch. Since
-  only master has it, **before relaunching a multi-node resume, manually `scp` the checkpoint step dir
-  from master to the SAME path on every worker**, then start all nodes with `--resume=true`:
+- **The watchdog never auto-relaunches a multi-node run.** On crash/stall it sets the run
+  `blocked` with the manual procedure (it can't scp to or restart workers, and the single-node
+  resume_command would silently restart with the WRONG world size). A multi-node resume is always
+  manual:
   ```bash
-  # on master, for the step you're resuming from (or checkpoints/last):
+  # 1. on master, copy the step dir being resumed (both pretrained_model/ and training_state/):
   scp -r <output_dir>/checkpoints/<STEP> user@<WORKER_IP>:<output_dir>/checkpoints/
+  # 2. relaunch EVERY node with the SAME accelerate prefix + resume flags (only --machine_rank differs):
+  ...accelerate launch … $(which lerobot-train) --resume=true \
+     --config_path=<output_dir>/checkpoints/last/pretrained_model/train_config.json
+  # 3. rerun the watchdog on the master (it uses multi_node.master_resume_command)
   ```
-  (copy the whole step dir — both `pretrained_model/` and `training_state/`.) Without this the workers
-  can't initialize and the rendezvous fails.
-- **The watchdog's auto-resume is master-side only** — it can't scp to or restart the workers. So treat
-  a multi-node resume as a **manual** step: scp → restart every node. (Tell the user this up front.)
+  Every rank loads the checkpoint from its **own local** `output_dir`, so without the scp the workers
+  can't initialize. The plan's bare `resume_command` is single-node — **never use it for a
+  multi-node run**; the watchdog refuses to resume without `multi_node.master_resume_command`.
 
 **Eval runs ONLY on the master node** — checkpoints exist only there. Start `eval_watcher.py` /
 `offline_eval.py` on the master (spare GPU on master → concurrent; else `post_training` on master after
