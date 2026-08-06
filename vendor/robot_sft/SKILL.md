@@ -487,6 +487,8 @@ step the master legitimately waits in the rendezvous for the workers — the wat
   ```bash
   # 1. on master, copy the step dir being resumed (both pretrained_model/ and training_state/):
   scp -r <output_dir>/checkpoints/<STEP> user@<WORKER_IP>:<output_dir>/checkpoints/
+  # Console pods: this works VERBATIM between console pods (root@<pod-ip-or-headless-dns>) — the
+  # image bakes a shared ssh keypair + sshd, so any two console pods are passwordless already.
   # 2. relaunch EVERY node with the SAME accelerate prefix + resume flags (only --machine_rank differs):
   ...accelerate launch … $(which lerobot-train) --resume=true \
      --config_path=<output_dir>/checkpoints/last/pretrained_model/train_config.json

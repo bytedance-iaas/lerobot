@@ -33,6 +33,16 @@ if [ -r /sys/fs/cgroup/cpu.max ]; then
   fi
 fi
 
+# --- sshd: pod-to-pod ssh for multi-node training (checkpoint scp master->workers) --------
+# The image bakes one shared keypair + authorized_keys (see Dockerfile), so any two console
+# pods ssh each other passwordlessly. Host keys are per-boot (pods have no stable identity;
+# the baked ssh config sets StrictHostKeyChecking=no). Never block the console on ssh (|| true).
+if [ -x /usr/sbin/sshd ]; then
+  ssh-keygen -A >/dev/null 2>&1 || true
+  mkdir -p /run/sshd
+  /usr/sbin/sshd 2>/dev/null && echo "==> sshd up (:22, key-only, cluster-internal)" || true
+fi
+
 # Fresh PVC (no config yet) → seed config + skill from the baked image snapshot.
 if [ ! -s "$HERMES_HOME/config.yaml" ] && [ -d "$SEED" ]; then
   echo "==> seeding HERMES_HOME from baked snapshot (offline)"

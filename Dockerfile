@@ -43,6 +43,23 @@ RUN for f in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do \
     && apt-get install -y --no-install-recommends ripgrep ca-certificates wget jq aria2 \
     && rm -rf /var/lib/apt/lists/*
 
+# --- pod-to-pod ssh (multi-node training: checkpoint scp master->workers) ----- #
+# All console pods run this SAME image, so ONE build-time keypair whose pubkey is in the
+# image's own authorized_keys makes every pod<->pod ssh passwordless automatically — no
+# runtime key exchange, survives pod restarts. Trade-off (accepted for this private
+# registry + cluster-internal sshd; 22 is never exposed by APIG/CLB, which forward 8080
+# only): anyone with the image has the key. Upgrade path: mount a k8s Secret keypair.
+# StrictHostKeyChecking off because pod host keys regenerate on every restart.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openssh-server openssh-client \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /run/sshd /root/.ssh \
+    && ssh-keygen -t ed25519 -N "" -f /root/.ssh/id_ed25519 \
+    && cat /root/.ssh/id_ed25519.pub >> /root/.ssh/authorized_keys \
+    && printf 'Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n' > /root/.ssh/config \
+    && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys /root/.ssh/id_ed25519 \
+    && sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+
 # --- oniond: Volcengine TOS model/dataset downloader (onion-ai-data) ---------- #
 # The skill prefers oniond for external models/datasets (fast, TOS-local, no AK/SK), then
 # falls back to HF (hf-mirror) — see vendor/robot_sft/scripts/fetch.py. Install like
