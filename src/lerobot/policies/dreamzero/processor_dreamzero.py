@@ -37,10 +37,11 @@ transform/dreamzero_cotrain.py``):
   - **text**: umt5 tokenizer, ``max_length=512``, the oxe_droid multi-view language template, and
     the fixed CFG negative prompt.
 
-The per-embodiment stitch + language template are implemented for oxe_droid (the released
-DreamZero-DROID checkpoint); other embodiments raise ``NotImplementedError`` until ported.
+oxe_droid keeps its bespoke three-view stitch and fixed prompt (the released DreamZero-DROID
+checkpoint); every other embodiment goes through upstream's generic 2x2 canvas, whose spare
+quadrants are blacked out, with a prompt generated to describe that layout.
 The exact per-key dims + statistics come from the checkpoint (``statistics.json`` /
-``meta/modality.json``), supplied through ``dataset_stats`` by the checkpoint converter.
+``experiment_cfg/metadata.json``), or from ``scripts/compute_statistics.py`` for a new dataset.
 """
 
 import logging
@@ -85,6 +86,14 @@ _DROID_LANG_MID = (
 )
 # Fixed default when the observation carries no instruction (transform/dreamzero_cotrain.yaml).
 _DEFAULT_INSTRUCTION = "Perform the default behavior."
+
+# Wording for the generic (non-DROID) canvas, following upstream's agibot/yam/xdof prompts: the
+# same "A multi-view video shows that a robot <instr> The video is split into four views: ...
+# The robot <instr>" frame, with the quadrant descriptions swapped for the ones this embodiment
+# actually fills. The prompt is the only thing that tells the model which quadrant is which
+# camera, so it has to track `_stitch_generic`'s slot order.
+_GENERIC_LANG_PREFIX = "A multi-view video shows that a robot "
+_GENERIC_LANG_SPLIT = " The video is split into four views: "
 
 
 # ----------------------------------------------------------------------------------------------
@@ -167,32 +176,132 @@ def _to_bthwc_uint8(video: torch.Tensor) -> torch.Tensor:
     return v.contiguous()
 
 
-def _crop_resize_view(view: torch.Tensor, crop_scale: float, out_h: int, out_w: int) -> torch.Tensor:
-    """Center-crop by ``crop_scale`` then bilinear-resize to (out_h, out_w). (B,T,H,W,C) uint8."""
+def _crop_size(h: int, w: int, crop_scale: float) -> tuple[int, int]:
+    """Upstream's crop size: ``(int(h*scale), int(w*scale))`` (VideoCrop.get_transform)."""
+    return int(h * crop_scale), int(w * crop_scale)
+
+
+def _sample_crop_offset(h: int, w: int, crop_scale: float, generator=None) -> tuple[int, int]:
+    """A random (top, left) for training, matching torchvision ``RandomCrop``.
+
+    Upstream concatenates every view and frame into one batch and transforms it once, so a single
+    offset is shared across views and time — cropping views independently would misalign the
+    stitched canvas against what the model was trained on.
+    """
+    ch, cw = _crop_size(h, w, crop_scale)
+    top = int(torch.randint(0, h - ch + 1, (1,), generator=generator).item())
+    left = int(torch.randint(0, w - cw + 1, (1,), generator=generator).item())
+    return top, left
+
+
+def _crop_resize_view(
+    view: torch.Tensor,
+    crop_scale: float,
+    out_h: int,
+    out_w: int,
+    crop_offset: tuple[int, int] | None = None,
+) -> torch.Tensor:
+    """Crop by ``crop_scale`` then bilinear-resize to (out_h, out_w). (B,T,H,W,C) uint8.
+
+    ``crop_offset`` selects the crop's top-left corner; None means centre (upstream's eval mode).
+    """
     b, t, h, w, c = view.shape
-    ch, cw = int(h * crop_scale), int(w * crop_scale)
-    top, left = (h - ch) // 2, (w - cw) // 2
+    ch, cw = _crop_size(h, w, crop_scale)
+    top, left = crop_offset if crop_offset is not None else ((h - ch) // 2, (w - cw) // 2)
     view = view[:, :, top : top + ch, left : left + cw, :]
     # interpolate wants (N, C, H, W) float.
     x = view.reshape(b * t, ch, cw, c).permute(0, 3, 1, 2).float()
-    x = torch.nn.functional.interpolate(x, size=(out_h, out_w), mode="bilinear", align_corners=False, antialias=True)
+    x = torch.nn.functional.interpolate(
+        x, size=(out_h, out_w), mode="bilinear", align_corners=False, antialias=True
+    )
     x = x.round().clamp(0, 255).to(torch.uint8)
     return x.permute(0, 2, 3, 1).reshape(b, t, out_h, out_w, c).contiguous()
+
+
+def _color_jitter_views(views: list[torch.Tensor], params: dict) -> list[torch.Tensor]:
+    """Apply one shared ColorJitter to every view, as upstream's single batched transform does.
+
+    Runs after the resize and before the stitch (upstream order: crop -> resize -> jitter ->
+    concat). torchvision samples one factor per call, so the views are jittered identically.
+    ``ColorJitter.get_params`` draws from torch's global RNG, so ``--seed`` governs it.
+    """
+    from torchvision.transforms import ColorJitter, functional as tvf
+
+    jitter = ColorJitter(**params)
+    # get_params returns the sampled factors, so the same ones can be replayed on every view.
+    idx, brightness, contrast, saturation, hue = ColorJitter.get_params(
+        jitter.brightness, jitter.contrast, jitter.saturation, jitter.hue
+    )
+
+    def apply(view: torch.Tensor) -> torch.Tensor:
+        b, t, h, w, c = view.shape
+        x = view.reshape(b * t, h, w, c).permute(0, 3, 1, 2)  # (N, C, H, W) uint8
+        for i in idx:
+            if i == 0 and brightness is not None:
+                x = tvf.adjust_brightness(x, brightness)
+            elif i == 1 and contrast is not None:
+                x = tvf.adjust_contrast(x, contrast)
+            elif i == 2 and saturation is not None:
+                x = tvf.adjust_saturation(x, saturation)
+            elif i == 3 and hue is not None:
+                x = tvf.adjust_hue(x, hue)
+        return x.permute(0, 2, 3, 1).reshape(b, t, h, w, c).contiguous()
+
+    return [apply(v) for v in views]
 
 
 def _stitch_oxe_droid(views: list[torch.Tensor], out_h: int, out_w: int) -> torch.Tensor:
     """Stitch [exterior_1, exterior_2, wrist] into DreamZero's 2H x 2W DROID canvas.
 
-    Layout (dreamzero_cotrain.py `_prepare_video`, OXE_DROID branch): top row = wrist repeated
-    across the full width; bottom-left = exterior_1; bottom-right = exterior_2. Returns
-    (B, T, 2*out_h, 2*out_w, 3) uint8.
+    Layout: top row = the wrist view stretched across the full width; bottom-left = exterior_1;
+    bottom-right = exterior_2. Returns (B, T, 2*out_h, 2*out_w, 3) uint8.
+
+    The wrist view is widened with ``repeat_interleave`` — a nearest-neighbour 2x horizontal
+    upscale (``[a,b,c] -> [a,a,b,b,c,c]``), matching upstream's ``np.repeat(wrist, 2, axis=-1)``.
+    ``Tensor.repeat`` would TILE it instead (``[a,b,c] -> [a,b,c,a,b,c]``), putting two copies of
+    the wrist camera side by side — a plausible-looking canvas that is not what the model was
+    trained on.
     """
     ext1, ext2, wrist = views[0], views[1], views[2]
     b, t = ext1.shape[0], ext1.shape[1]
     canvas = torch.zeros((b, t, 2 * out_h, 2 * out_w, 3), dtype=torch.uint8, device=ext1.device)
-    canvas[:, :, :out_h, :, :] = wrist.repeat(1, 1, 1, 2, 1)  # top: wrist spans 2W
+    canvas[:, :, :out_h, :, :] = torch.repeat_interleave(wrist, 2, dim=3)  # top: wrist spans 2W
     canvas[:, :, out_h:, :out_w, :] = ext1  # bottom-left
     canvas[:, :, out_h:, out_w:, :] = ext2  # bottom-right
+    return canvas
+
+
+# Quadrants of the generic canvas, in the order views are assigned to them. Upstream fills
+# top-left, then bottom-left, then top-right, and leaves bottom-right black — so a robot with two
+# cameras occupies the left column and the right column stays black. `_GENERIC_QUADRANT_NAMES`
+# names them for the language template, which has to describe the layout the model is looking at.
+_GENERIC_QUADRANT_NAMES = ("top-left", "bottom-left", "top-right", "bottom-right")
+
+
+def _stitch_generic(views: list[torch.Tensor], out_h: int, out_w: int) -> torch.Tensor:
+    """Stitch up to four views into the 2H x 2W canvas, black-filling the unused quadrants.
+
+    This is upstream's non-DROID layout (`DreamZeroCotrainTransform._prepare_video`, the branch
+    after the `OXE_DROID` special case), which every other embodiment it ships — agibot, yam,
+    xdof — goes through. Views land top-left, bottom-left, top-right; anything left over stays
+    black, exactly as upstream's prompts describe ("the bottom-right view is a black screen").
+
+    Filling the spare quadrants with black rather than, say, tiling two views across the full
+    canvas is deliberate: the canvas size is pinned by `frame_seqlen` and cannot shrink, and black
+    is the padding the model was trained to see there.
+    """
+    if not 1 <= len(views) <= 4:
+        raise ValueError(f"The DreamZero canvas holds 1-4 views, got {len(views)}.")
+    b, t = views[0].shape[0], views[0].shape[1]
+    canvas = torch.zeros((b, t, 2 * out_h, 2 * out_w, 3), dtype=torch.uint8, device=views[0].device)
+    slots = [
+        (slice(None, out_h), slice(None, out_w)),  # top-left
+        (slice(out_h, None), slice(None, out_w)),  # bottom-left
+        (slice(None, out_h), slice(out_w, None)),  # top-right
+        (slice(out_h, None), slice(out_w, None)),  # bottom-right
+    ]
+    for view, (rows, cols) in zip(views, slots, strict=False):
+        canvas[:, :, rows, cols, :] = view
     return canvas
 
 
@@ -210,6 +319,10 @@ class DreamZeroPackInputsStep(ProcessorStep):
         self._action_layout = _QuantileLayout(self.stats, "action", config.action_modality_keys)
         # Raw (unnormalized) last observed state per modality key — reference for relative decode.
         self._last_raw_state: dict[str, torch.Tensor] = {}
+        # Per-macro-block raw anchor states, set on a training window (see _block_anchor_rows).
+        self._block_anchor_state: dict[str, torch.Tensor] = {}
+        # Augmentation RNG; left as the global generator so `--seed` governs it.
+        self._generator = None
         self._tokenizer = None  # lazy umt5
 
     # -- helpers ----------------------------------------------------------------------------
@@ -234,114 +347,198 @@ class DreamZeroPackInputsStep(ProcessorStep):
         return enc["input_ids"].to(device), enc["attention_mask"].to(device)
 
     def _ordered_image_keys(self, obs: dict) -> list[str]:
-        if self.config.image_view_order:
-            keys = []
-            for k in self.config.image_view_order:
+        if self.config.video_modality_keys:
+            keys, missing = [], []
+            for k in self.config.video_modality_keys:
                 cand = k if k in obs else f"{OBS_IMAGES}.{k}"
-                if cand in obs:
-                    keys.append(cand)
+                (keys if cand in obs else missing).append(cand if cand in obs else k)
+            if missing:
+                # Silently dropping a configured view would stitch a canvas that no longer matches
+                # the prompt built from `video_modality_keys` — same shape, wrong content — so a
+                # typo'd or renamed camera key must fail here instead.
+                available = sorted(
+                    k for k in obs if isinstance(k, str) and k.startswith((f"{OBS_IMAGES}.", OBS_IMAGE))
+                )
+                raise KeyError(
+                    f"config.video_modality_keys names camera view(s) {missing} that are not in the "
+                    f"observation. Available image keys: {available}. Fix video_modality_keys or the "
+                    "rename_map."
+                )
             return keys
-        keys = sorted(k for k in obs if isinstance(k, str) and k.startswith(f"{OBS_IMAGES}."))
+        # `_is_pad` window flags share the observation.images prefix in a training batch and must
+        # not be mistaken for camera views.
+        keys = sorted(
+            k
+            for k in obs
+            if isinstance(k, str) and k.startswith(f"{OBS_IMAGES}.") and not k.endswith("_is_pad")
+        )
         if not keys and OBS_IMAGE in obs:
             keys = [OBS_IMAGE]
         return keys
 
-    def _build_language(self, task: Any, bsz: int) -> list[str]:
+    def _build_language(self, task: Any, bsz: int, n_views: int | None = None) -> list[str]:
         if isinstance(task, (list, tuple)):
             raw = [str(t) if t else _DEFAULT_INSTRUCTION for t in task]
         else:
             raw = [str(task) if task else _DEFAULT_INSTRUCTION] * bsz
-        if self.config.embodiment_tag != "oxe_droid":
-            raise NotImplementedError(
-                f"DreamZero language template is only ported for oxe_droid; got {self.config.embodiment_tag!r}."
+        if self.config.embodiment_tag == "oxe_droid":
+            return [_DROID_LANG_PREFIX + i.lower() + _DROID_LANG_MID + i.lower() for i in raw]
+        middle = _GENERIC_LANG_SPLIT + self._describe_canvas(n_views) + " The robot "
+        return [_GENERIC_LANG_PREFIX + i.lower() + middle + i.lower() for i in raw]
+
+    def _describe_canvas(self, n_views: int | None = None) -> str:
+        """Sentence naming what sits in each quadrant of the generic canvas.
+
+        The camera names come from `view_descriptions` when set, else from `video_modality_keys` with
+        the LeRobot key prefix stripped — so `observation.images.wrist` reads as "the wrist
+        camera". Quadrants with no view are described as black screens, matching both
+        `_stitch_generic` and upstream's own prompts for embodiments with fewer than four cameras.
+        """
+        names = list(self.config.view_descriptions or ()) or [
+            k.rsplit(".", 1)[-1].replace("_", " ") for k in (self.config.video_modality_keys or ())
+        ]
+        if not names:
+            raise ValueError(
+                f"Embodiment {self.config.embodiment_tag!r} needs `video_modality_keys` (or "
+                "`view_descriptions`) so the prompt can say which camera is in which quadrant; "
+                "the model has no other way to know the layout."
             )
-        out = []
-        for instr in raw:
-            low = instr.lower()
-            out.append(_DROID_LANG_PREFIX + low + _DROID_LANG_MID + low)
-        return out
+        if n_views is not None and len(names) != n_views:
+            # A name count that disagrees with the stitched view count would either misname
+            # quadrants or call occupied ones black screens — a prompt/canvas mismatch the model
+            # cannot detect. (`__call__` passes the actual view count; the config-level length
+            # check cannot see it when the views come from sorted observation keys.)
+            raise ValueError(
+                f"The prompt has {len(names)} camera name(s) {names} but the canvas holds "
+                f"{n_views} view(s); set `video_modality_keys`/`view_descriptions` to match the "
+                "observation's cameras."
+            )
+        # Upstream capitalises only the first clause of the list ("...four views: The top-left
+        # view shows..., the top-right view shows...").
+        described = [
+            f"{'The' if i == 0 else 'the'} {quadrant} view shows the camera view from the {name}"
+            for i, (quadrant, name) in enumerate(zip(_GENERIC_QUADRANT_NAMES, names, strict=False))
+        ]
+        blank = list(_GENERIC_QUADRANT_NAMES[len(names) :])
+        if len(blank) == 1:
+            described.append(f"and the {blank[0]} view is a black screen (inactive view)")
+        elif blank:
+            described.append(
+                "and the " + " and ".join(f"{q}" for q in blank) + " views are black screens (inactive views)"
+            )
+        return ", ".join(described) + "."
 
     # -- main -------------------------------------------------------------------------------
     def __call__(self, transition: EnvTransition) -> EnvTransition:
-        if self.config.embodiment_tag != "oxe_droid":
-            raise NotImplementedError(
-                "DreamZero preprocessing is only ported for the oxe_droid/DROID embodiment "
-                f"(view stitching + language template); got {self.config.embodiment_tag!r}."
-            )
         obs = transition.get(TransitionKey.OBSERVATION, {}) or {}
         comp = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}) or {}
         device = next((v.device for v in obs.values() if isinstance(v, torch.Tensor)), torch.device("cpu"))
 
-        # ---- VIDEO: per-view crop+resize then oxe_droid stitch → images (B,T,2h,2w,3) uint8 ----
+        # A training sample carries the whole window: `num_frames` observation rows and
+        # `action_horizon * max_chunk_size` actions. Inference carries a single observation.
+        # Detected up front because it also selects random-vs-centre crop for the video below.
+        raw_state = obs.get(OBS_STATE)
+        training = raw_state is not None and raw_state.dim() == 3 and raw_state.shape[1] > 1
+        if training:
+            self._assert_window_not_padded(transition, comp)
+
+        # ---- VIDEO: per-view crop+resize then stitch → images (B,T,2h,2w,3) uint8 ----
+        droid = self.config.embodiment_tag == "oxe_droid"
+        # DROID's layout is the only one that assigns a specific meaning to each view, so it needs
+        # exactly three; every other embodiment goes through the generic grid, which takes 1-4.
+        min_views, max_views = (3, 3) if droid else (1, 4)
         img_keys = self._ordered_image_keys(obs)
-        if len(img_keys) < 3:
-            raise ValueError(
-                f"DreamZero (oxe_droid) needs 3 camera views [exterior_1, exterior_2, wrist]; "
-                f"found {len(img_keys)} image key(s): {img_keys}. Set config.image_view_order."
+        if not min_views <= len(img_keys) <= max_views:
+            expected = (
+                "3 camera views [exterior_1, exterior_2, wrist]"
+                if droid
+                else f"1-4 camera views (embodiment {self.config.embodiment_tag!r})"
             )
+            raise ValueError(
+                f"DreamZero needs {expected}; found {len(img_keys)} image key(s): {img_keys}. "
+                "Set config.video_modality_keys."
+            )
+        raw_views = [_to_bthwc_uint8(obs[k]) for k in img_keys[:max_views]]
+        # Upstream asserts every camera shares a resolution, then crops them as one batch.
+        src_h, src_w = raw_views[0].shape[2], raw_views[0].shape[3]
+        if any(v.shape[2:4] != (src_h, src_w) for v in raw_views):
+            raise ValueError(
+                "DreamZero crops all camera views with one shared offset, so they must share a "
+                f"resolution; got {[tuple(v.shape[2:4]) for v in raw_views]}."
+            )
+        crop_offset = (
+            _sample_crop_offset(src_h, src_w, self.config.view_crop_scale, self._generator)
+            if training
+            else None  # centre crop at inference, mirroring upstream's eval mode
+        )
         views = [
             _crop_resize_view(
-                _to_bthwc_uint8(obs[k]),
+                v,
                 self.config.view_crop_scale,
                 self.config.per_view_height,
                 self.config.per_view_width,
+                crop_offset,
             )
-            for k in img_keys[:3]
+            for v in raw_views
         ]
-        obs["images"] = _stitch_oxe_droid(views, self.config.per_view_height, self.config.per_view_width)
+        if training and self.config.video_color_jitter:
+            views = _color_jitter_views(views, dict(self.config.color_jitter_params))
+        stitch = _stitch_oxe_droid if droid else _stitch_generic
+        obs["images"] = stitch(views, self.config.per_view_height, self.config.per_view_width)
         for k in [key for key in obs if isinstance(key, str) and key.startswith(OBS_IMAGES)]:
             obs.pop(k, None)
         obs.pop(OBS_IMAGE, None)
 
-        # ---- STATE: q99 normalize (absolute), concat, pad to max_state_dim, + state_mask ----
-        if OBS_STATE in obs:
-            state = obs[OBS_STATE]
-            if state.dim() != 2:
-                raise ValueError(f"state must be (B, D), got {tuple(state.shape)}")
-            bsz = state.shape[0]
-            self._cache_raw_state(state)
-            norm = state.clone().float()
+        # ---- STATE: q99 normalize (absolute), pad to max_state_dim, + state_mask ----
+        if raw_state is not None:
+            # (B, D) at inference; (B, num_frames, D) in training -> keep one row per macro block.
+            anchors = raw_state if training else raw_state.unsqueeze(1)
+            if training:
+                anchors = anchors[:, self._block_anchor_rows]  # (B, max_chunk_size, D)
+            bsz = anchors.shape[0]
+            self._cache_raw_state(anchors[:, 0])
+            self._block_anchor_state = self._split_by_key(anchors)
+
+            norm = anchors.clone().float()
             for _key, (s, e) in self._state_layout.slices.items():
-                if e <= state.shape[1]:
-                    q01 = self._state_layout.q01[s:e]
-                    q99 = self._state_layout.q99[s:e]
-                    norm[:, s:e] = _q99_forward(state[:, s:e].float(), q01, q99)
-            real_dim = norm.shape[1]
+                if e <= anchors.shape[-1]:
+                    norm[..., s:e] = _q99_forward(
+                        anchors[..., s:e].float(), self._state_layout.q01[s:e], self._state_layout.q99[s:e]
+                    )
+            real_dim = norm.shape[-1]
             pad = self.config.max_state_dim - real_dim
             if pad < 0:
                 raise ValueError(f"state dim {real_dim} exceeds max_state_dim {self.config.max_state_dim}")
-            state_padded = torch.nn.functional.pad(norm, (0, pad)).unsqueeze(1)  # (B, 1, max_state_dim)
-            state_mask = torch.zeros(bsz, 1, self.config.max_state_dim, dtype=torch.bool, device=norm.device)
-            state_mask[:, :, :real_dim] = True
-            obs["state"] = state_padded
+            state_mask = torch.zeros(
+                bsz, norm.shape[1], self.config.max_state_dim, dtype=torch.bool, device=norm.device
+            )
+            state_mask[..., :real_dim] = True
+            obs["state"] = torch.nn.functional.pad(norm, (0, pad))
             obs["state_mask"] = state_mask
             obs.pop(OBS_STATE, None)
         else:
             bsz = obs["images"].shape[0]
 
-        # ---- ACTION (training only): relative-encode joints + q99 normalize + pad + masks ----
-        # Present only when the transition carries a ground-truth action chunk (lerobot-train).
-        # The forward mirror of DreamZeroActionDecodeStep: joint_position is made relative to the
-        # last observed state then q99-normalized with RELATIVE stats; gripper stays absolute.
-        # Outputs land in the observation dict so they reach DreamZeroPolicy.forward's action_input
-        # (action / action_mask / has_real_action) — the exact batch flattening is validated on the
-        # first real training run (dreamzero_port_plan.md M3).
+        # ---- ACTION (training only): per-block relative encode + q99 + pad + masks ----
+        # Mirrors upstream's `_convert_to_relative_action`: each macro block of `action_horizon`
+        # rows subtracts the RAW state at that block's own first row, and only then is q99
+        # normalized (with the relative stats for `relative_action_keys`). Anchoring the whole
+        # window on one state instead would make later blocks' displacements several times larger
+        # than the quantiles they are normalized against.
         action = transition.get(TransitionKey.ACTION)
-        if action is not None and self._action_layout.dim > 0:
+        if action is not None and self._action_layout.dim == 0:
+            # Silently skipping the action branch here is how a stats-schema mismatch used to
+            # surface: the model then failed much later on a missing `has_real_action`.
+            raise ValueError(
+                "A ground-truth action is present but DreamZero has no action statistics, so it "
+                f"cannot be normalized. Expected q01/q99 for {list(self.config.action_modality_keys)} "
+                "under an 'action' key — check that the checkpoint's statistics were loaded."
+            )
+        if action is not None:
             real_dim = self._action_layout.dim
             was_2d = action.dim() == 2
             a = (action.unsqueeze(1) if was_2d else action)[..., :real_dim].clone().float()  # (B,T,D)
-            rel_keys = set(self.config.relative_action_keys or ())
-            if rel_keys and self._last_raw_state:
-                reference = torch.zeros(a.shape[0], real_dim, dtype=a.dtype, device=a.device)
-                mask = [False] * real_dim
-                for key, (s, e) in self._action_layout.slices.items():
-                    if key in rel_keys and key in self._last_raw_state:
-                        ref = self._last_raw_state[key].to(a.device, a.dtype)
-                        reference[:, s:e] = ref[:, : e - s]
-                        for i in range(s, e):
-                            mask[i] = True
-                a = to_relative_actions(a, reference, mask)
+            a = self._encode_relative_actions(a, training=training)
             a = _q99_forward(a, self._action_layout.q01, self._action_layout.q99)
             a_padded = torch.nn.functional.pad(a, (0, self.config.max_action_dim - real_dim))
             action_mask = torch.zeros(*a_padded.shape, dtype=torch.bool, device=a_padded.device)
@@ -352,7 +549,7 @@ class DreamZeroPackInputsStep(ProcessorStep):
             transition[TransitionKey.ACTION] = a_padded.squeeze(1) if was_2d else a_padded
 
         # ---- TEXT: umt5 tokenize (template + fixed negative prompt) ----
-        texts = self._build_language(comp.get("task"), bsz)
+        texts = self._build_language(comp.get("task"), bsz, n_views=len(img_keys))
         text_ids, text_mask = self._tokenize(texts, device)
         neg_ids, neg_mask = self._tokenize([self.config_negative_prompt] * bsz, device)
         obs["text"] = text_ids
@@ -367,6 +564,77 @@ class DreamZeroPackInputsStep(ProcessorStep):
 
         transition[TransitionKey.OBSERVATION] = obs
         return transition
+
+    @property
+    def _block_anchor_rows(self) -> list[int]:
+        """Observation rows that start each macro block.
+
+        Observation rows sit at raw offsets ``0, stride, 2*stride, ...``; block ``c`` starts at raw
+        offset ``c * action_horizon``, i.e. row ``c * action_horizon // stride``. For DROID that is
+        rows [0, 8, 16, 24] of the 33-row window.
+        """
+        step = self.config.action_horizon // self.config.video_frame_stride
+        return [c * step for c in range(self.config.max_chunk_size)]
+
+    def _split_by_key(self, rows: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Slice a raw (unnormalized) state tensor into its per-modality-key components."""
+        out = {}
+        for key, (s, e) in self._state_layout.slices.items():
+            if e <= rows.shape[-1]:
+                out[key] = rows[..., s:e].detach().float()
+        return out
+
+    def _assert_window_not_padded(self, transition: EnvTransition, comp: dict) -> None:
+        """Refuse a padded training window.
+
+        `drop_n_last_frames` should make short windows unreachable, so a set `*_is_pad` flag means
+        the window contract and the sampler disagree — and padded rows would train the model on
+        repeated frames without any mask saying so.
+        """
+        source = {**(comp or {}), **(transition.get(TransitionKey.OBSERVATION) or {})}
+        padded = [
+            key
+            for key, value in source.items()
+            if isinstance(key, str) and key.endswith("_is_pad") and torch.as_tensor(value).any()
+        ]
+        if padded:
+            raise ValueError(
+                f"DreamZero training windows must be complete, but these are padded: {padded}. "
+                f"Check that the dataset was built with drop_n_last_frames="
+                f"{self.config.drop_n_last_frames}."
+            )
+
+    def _encode_relative_actions(self, actions: torch.Tensor, *, training: bool) -> torch.Tensor:
+        """Subtract each block's own anchor state from the relative action dims. (B, T, real_dim)."""
+        rel_keys = set(self.config.relative_action_keys or ())
+        anchors = self._block_anchor_state if training else None
+        if not rel_keys or not (anchors or self._last_raw_state):
+            return actions
+
+        horizon = self.config.action_horizon
+        n_blocks = self.config.max_chunk_size if training else 1
+        real_dim = actions.shape[-1]
+        for block in range(n_blocks):
+            lo = block * horizon
+            hi = min(lo + horizon, actions.shape[1])
+            if lo >= actions.shape[1]:
+                break
+            reference = torch.zeros(actions.shape[0], real_dim, dtype=actions.dtype, device=actions.device)
+            mask = [False] * real_dim
+            for key, (s, e) in self._action_layout.slices.items():
+                if key not in rel_keys:
+                    continue
+                if training and key in (anchors or {}):
+                    ref = anchors[key][:, block]
+                elif not training and key in self._last_raw_state:
+                    ref = self._last_raw_state[key]
+                else:
+                    continue
+                reference[:, s:e] = ref.to(actions.device, actions.dtype)[:, : e - s]
+                for i in range(s, e):
+                    mask[i] = True
+            actions[:, lo:hi] = to_relative_actions(actions[:, lo:hi], reference, mask)
+        return actions
 
     def _cache_raw_state(self, state: torch.Tensor) -> None:
         """Cache the raw (unnormalized) per-key state — the reference for relative→absolute decode."""
@@ -398,9 +666,20 @@ class DreamZeroPackInputsStep(ProcessorStep):
 class DreamZeroActionDecodeStep(ProcessorStep):
     """Unnormalize the predicted chunk (q99 inverse) and convert relative joints back to absolute.
 
-    ``joint_position`` uses the RELATIVE stats and is made absolute by adding the last observed
-    joint state (cached by the paired :class:`DreamZeroPackInputsStep`); ``gripper_position`` uses
-    ABSOLUTE stats and is left unchanged. Mirrors ``GrootSimPolicy.unapply``.
+    ``joint_position`` uses the RELATIVE stats and is made absolute by adding the observed joint
+    state; ``gripper_position`` uses ABSOLUTE stats and is left unchanged. Mirrors
+    ``GrootSimPolicy.unapply``.
+
+    **Which** observed state matters: the model's chunk is relative to the frame the chunk was
+    predicted from, so every action in it must be decoded against that one anchor. The paired
+    :class:`DreamZeroPackInputsStep` caches the current state on every call, which is right for the
+    frame that triggered the prediction and wrong for the frames that follow while the chunk is
+    still being consumed. So this step latches the anchor for the life of a chunk instead of
+    reading the pack step's latest value each time.
+
+    Chunk length comes from ``config.n_action_steps`` because that is exactly what
+    ``DreamZeroPolicy.select_action`` queues per prediction (``deque(maxlen=n_action_steps)``,
+    refilled when empty). ``reset()`` drops the latch so a new episode re-anchors immediately.
     """
 
     def __init__(self, config: DreamZeroConfig, stats: dict | None = None):
@@ -409,6 +688,21 @@ class DreamZeroActionDecodeStep(ProcessorStep):
         self._action_layout = _QuantileLayout(self.stats, "action", config.action_modality_keys)
         # Set by make_dreamzero_pre_post_processors so decode can read the pack step's cached state.
         self.pack_step: DreamZeroPackInputsStep | None = None
+        self._anchor: dict[str, torch.Tensor] = {}
+        self._actions_left_in_chunk = 0
+
+    def reset(self) -> None:
+        """Forget the latched anchor so the next decode re-anchors on the current observation."""
+        self._anchor = {}
+        self._actions_left_in_chunk = 0
+
+    def _anchor_for(self, n_actions: int) -> dict[str, torch.Tensor]:
+        """Return the anchor for this decode, latching a fresh one when a chunk starts."""
+        if self._actions_left_in_chunk <= 0:
+            self._anchor = dict(self.pack_step._last_raw_state) if self.pack_step is not None else {}
+            self._actions_left_in_chunk = max(int(self.config.n_action_steps), 1)
+        self._actions_left_in_chunk -= n_actions
+        return self._anchor
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         action = transition.get(TransitionKey.ACTION)
@@ -425,14 +719,15 @@ class DreamZeroActionDecodeStep(ProcessorStep):
         # q99 inverse over the concatenated action vector (joint stats are RELATIVE, gripper ABSOLUTE).
         action = _q99_inverse(action, self._action_layout.q01, self._action_layout.q99)
 
-        # relative → absolute: add the last observed state for relative_action_keys only.
+        # relative → absolute: add the chunk's anchor state for relative_action_keys only.
         rel_keys = set(self.config.relative_action_keys or ())
-        if rel_keys and self.pack_step is not None and self.pack_step._last_raw_state:
+        anchor = self._anchor_for(action.shape[1])
+        if rel_keys and anchor:
             reference = torch.zeros(action.shape[0], real_dim, dtype=action.dtype, device=action.device)
             mask = [False] * real_dim
             for key, (s, e) in self._action_layout.slices.items():
-                if key in rel_keys and key in self.pack_step._last_raw_state:
-                    ref = self.pack_step._last_raw_state[key].to(action.device, action.dtype)
+                if key in rel_keys and key in anchor:
+                    ref = anchor[key].to(action.device, action.dtype)
                     reference[:, s:e] = ref[:, : e - s]
                     for i in range(s, e):
                         mask[i] = True
@@ -450,10 +745,86 @@ class DreamZeroActionDecodeStep(ProcessorStep):
         return features
 
 
+# Standard override keys that `lerobot-train` always passes but a DreamZero pipeline has no step
+# for: q99 normalization and the relative<->absolute action conversion both happen inside
+# DreamZeroPackInputsStep / DreamZeroActionDecodeStep, driven by the checkpoint's own statistics
+# rather than by dataset stats. Same situation as GR00T (_GROOT_ABSENT_STANDARD_OVERRIDE_KEYS).
+_ABSENT_STANDARD_OVERRIDE_KEYS = frozenset(
+    {
+        "absolute_actions_processor",
+        "normalizer_processor",
+        "relative_actions_processor",
+        "unnormalizer_processor",
+    }
+)
+
+
+def _drop_absent_standard_overrides(overrides: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Strip standard override keys a DreamZero pipeline has no step for.
+
+    Everything else still raises on a miss — silently ignoring an override the caller meant to
+    take effect is the failure mode this whole path is guarding against.
+    """
+    if not overrides:
+        return overrides
+    filtered = {}
+    for key, value in overrides.items():
+        if key in _ABSENT_STANDARD_OVERRIDE_KEYS:
+            logger.debug(
+                "Ignoring override key %r: DreamZero normalizes inside its own processor steps "
+                "using the checkpoint's statistics, so it has no matching step.",
+                key,
+            )
+            continue
+        filtered[key] = value
+    return filtered
+
+
+def _apply_step_overrides(pipeline, overrides: dict[str, Any] | None) -> None:
+    """Apply ``from_pretrained``-style step overrides to a freshly built pipeline.
+
+    DreamZero builds its processors from scratch rather than deserializing a saved pipeline (its
+    normalization statistics live in the checkpoint, not in a ``policy_preprocessor.json``), so
+    caller overrides such as ``rename_observations_processor`` and ``device_processor`` have to be
+    applied to the constructed steps. Mirrors GR00T's equivalent, including raising on keys that
+    match nothing — an override that silently does nothing is worse than one that fails.
+    """
+    if not overrides:
+        return
+
+    def step_keys(step) -> set[str]:
+        keys = {type(step).__name__}
+        registry_name = getattr(type(step), "_registry_name", None)
+        if registry_name:
+            keys.add(registry_name)
+        return keys
+
+    for override_key, step_overrides in overrides.items():
+        matched = [step for step in pipeline.steps if override_key in step_keys(step)]
+        if not matched:
+            available = [getattr(type(s), "_registry_name", None) or type(s).__name__ for s in pipeline.steps]
+            raise KeyError(
+                f"Override key {override_key!r} matches no step of the DreamZero processor "
+                f"pipeline. Available step keys: {available}."
+            )
+        for step in matched:
+            for field_name, value in dict(step_overrides).items():
+                if not hasattr(step, field_name):
+                    raise TypeError(f"Override field {field_name!r} is not a field of step {override_key!r}.")
+                setattr(step, field_name, value)
+            post_init = getattr(step, "__post_init__", None)
+            if callable(post_init):
+                # Re-derive anything computed from the overridden config (DeviceProcessorStep
+                # resolves its torch.device there, for instance).
+                post_init()
+
+
 def make_dreamzero_pre_post_processors(
     config: DreamZeroConfig,
     dataset_stats: dict | None = None,
     dataset_meta=None,
+    preprocessor_overrides: dict[str, Any] | None = None,
+    postprocessor_overrides: dict[str, Any] | None = None,
     **kwargs,
 ):
     """Build the DreamZero (preprocessor, postprocessor) pipeline pair.
@@ -477,17 +848,63 @@ def make_dreamzero_pre_post_processors(
         DeviceProcessorStep(device="cpu"),
     ]
 
-    return (
-        PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](
-            steps=input_steps,
-            name=POLICY_PREPROCESSOR_DEFAULT_NAME,
-        ),
-        PolicyProcessorPipeline[PolicyAction, PolicyAction](
-            steps=output_steps,
-            name=POLICY_POSTPROCESSOR_DEFAULT_NAME,
-            to_transition=policy_action_to_transition,
-            to_output=transition_to_policy_action,
-        ),
+    preprocessor = PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](
+        steps=input_steps,
+        name=POLICY_PREPROCESSOR_DEFAULT_NAME,
+    )
+    postprocessor = PolicyProcessorPipeline[PolicyAction, PolicyAction](
+        steps=output_steps,
+        name=POLICY_POSTPROCESSOR_DEFAULT_NAME,
+        to_transition=policy_action_to_transition,
+        to_output=transition_to_policy_action,
+    )
+    _apply_step_overrides(preprocessor, _drop_absent_standard_overrides(preprocessor_overrides))
+    _apply_step_overrides(postprocessor, _drop_absent_standard_overrides(postprocessor_overrides))
+    return preprocessor, postprocessor
+
+
+def _has_dreamzero_stats(stats: dict | None, config: DreamZeroConfig) -> bool:
+    """True when `stats` is in DreamZero's per-modality-key schema for this config's layout."""
+    if not stats:
+        return False
+    for modality, keys in (("state", config.state_modality_keys), ("action", config.action_modality_keys)):
+        group = stats.get(modality)
+        if not isinstance(group, dict) or not all(_extract_has_q(group.get(k)) for k in keys):
+            return False
+    return True
+
+
+def _extract_has_q(entry) -> bool:
+    return isinstance(entry, dict) and "q01" in entry and "q99" in entry
+
+
+def _resolve_video_modality_keys(config: DreamZeroConfig, pretrained_path) -> None:
+    """Fill an empty `video_modality_keys` from the checkpoint's own recorded concat order.
+
+    The order decides which camera occupies which canvas quadrant, and the checkpoint records the
+    one its weights were trained with (`experiment_cfg/conf.yaml`'s `video_concat_order`). Only
+    the `--policy.path` route reads that automatically, because a training run builds its config
+    from the CLI — so without this a fine-tune falls back to sorted camera keys, which matches
+    DROID only by alphabetical accident.
+
+    Mirrors how GR00T resolves its `video_modality_keys` from the checkpoint at processor-build
+    time. Left alone when the caller set the field explicitly.
+    """
+    from . import gear_checkpoint
+
+    if config.video_modality_keys or not gear_checkpoint.is_gear_checkpoint(pretrained_path):
+        return
+    order = gear_checkpoint.read_concat_layout(pretrained_path, config.embodiment_tag).get(
+        "video_modality_keys"
+    )
+    if not order:
+        return
+    config.video_modality_keys = tuple(order)
+    logger.info(
+        "video_modality_keys not set; using the order %s recorded in %s. Cameras named differently "
+        "in the dataset need --rename_map, or set --policy.video_modality_keys explicitly.",
+        list(order),
+        pretrained_path,
     )
 
 
@@ -497,26 +914,41 @@ def make_dreamzero_pre_post_processors_from_pretrained(
     dataset_stats: dict | None = None,
     **kwargs,
 ):
-    """Build the DreamZero processors, reading ``statistics.json`` from the checkpoint.
+    """Build the DreamZero processors, reading the q01/q99 statistics from the checkpoint.
 
-    The converter writes ``statistics.json`` as ``{embodiment_tag: {state, action}}`` (GEAR q01/q99).
-    When ``dataset_stats`` isn't supplied, load the block for ``config.embodiment_tag`` so the q99
-    normalization + relative decode use the checkpoint's own statistics (mirrors GR00T's
-    ``make_groot_pre_post_processors_from_pretrained``).
+    A released NVIDIA checkpoint carries them in ``experiment_cfg/metadata.json``; a LeRobot one
+    saved by this policy carries them in ``statistics.json`` as ``{embodiment_tag: {state, action}}``.
+    Either way the q99 normalization and the relative→absolute decode use the checkpoint's own
+    statistics, sliced to ``config.state_modality_keys`` / ``config.action_modality_keys`` (mirrors
+    GR00T's ``make_groot_pre_post_processors_from_pretrained``).
     """
-    import json
-    from pathlib import Path
+    from . import gear_checkpoint
 
-    stats = dataset_stats
+    _resolve_video_modality_keys(config, pretrained_path)
+
+    stats = dataset_stats if _has_dreamzero_stats(dataset_stats, config) else None
+    if dataset_stats is not None and stats is None:
+        # `lerobot-train` always passes `dataset.meta.stats`, which is LeRobot's FLAT schema
+        # ({"observation.state": {...}, "action": {...}}). DreamZero needs per-modality-key
+        # quantiles ({state: {joint_position: {q01, q99}}}), and — more importantly — a fine-tune
+        # must normalize with the statistics the checkpoint was trained on, not the ones recomputed
+        # from whatever subset is being trained on now. Ignore them and say so.
+        logger.info(
+            "Ignoring the supplied dataset_stats (not in DreamZero's per-modality-key schema); "
+            "using the checkpoint's own statistics from %s.",
+            pretrained_path,
+        )
     if stats is None:
-        stats_file = Path(pretrained_path) / "statistics.json"
-        if stats_file.exists():
-            all_stats = json.loads(stats_file.read_text())
-            block = all_stats.get(config.embodiment_tag)
-            stats = block if isinstance(block, dict) else all_stats
-        else:
+        stats = gear_checkpoint.load_checkpoint_statistics(
+            pretrained_path,
+            config.embodiment_tag,
+            config.state_modality_keys,
+            config.action_modality_keys,
+            override_path=config.statistics_path,
+        )
+        if stats is None:
             logger.warning(
-                "No statistics.json in %s — DreamZero q99 normalization/decode will have no stats.",
+                "No statistics found in %s — DreamZero q99 normalization/decode will have no stats.",
                 pretrained_path,
             )
     return make_dreamzero_pre_post_processors(config, dataset_stats=stats, **kwargs)

@@ -32,9 +32,11 @@ from lerobot.policies.dreamzero.processor_dreamzero import (  # noqa: E402
     DreamZeroActionDecodeStep,
     DreamZeroPackInputsStep,
     _crop_resize_view,
+    _crop_size,
     _q99_forward,
     _q99_inverse,
     _QuantileLayout,
+    _sample_crop_offset,
     _stitch_oxe_droid,
     _to_bthwc_uint8,
 )
@@ -66,6 +68,26 @@ def test_stitch_oxe_droid_layout():
     assert (canvas[:, :, :h, :, :] == 33).all()  # top row: wrist, repeated across full width
     assert (canvas[:, :, h:, :w, :] == 11).all()  # bottom-left: exterior_1
     assert (canvas[:, :, h:, w:, :] == 22).all()  # bottom-right: exterior_2
+
+
+def test_stitch_oxe_droid_stretches_the_wrist_view():
+    """The wrist view is upscaled 2x across the top row, not tiled twice.
+
+    The layout test above fills each view with a constant, which cannot tell
+    ``repeat_interleave`` (``[a,b,c] -> [a,a,b,b,c,c]``, what upstream's
+    ``np.repeat(wrist, 2, axis=-1)`` does) apart from ``Tensor.repeat``
+    (``[a,b,c] -> [a,b,c,a,b,c]``, two wrist cameras side by side). A horizontal gradient does.
+    """
+    h, w = 2, 3
+    ext = torch.zeros((1, 1, h, w, 3), dtype=torch.uint8)
+    ramp = torch.arange(1, w + 1, dtype=torch.uint8)
+    wrist = ramp.view(1, 1, 1, w, 1).expand(1, 1, h, w, 3).contiguous()
+
+    canvas = _stitch_oxe_droid([ext, ext, wrist], h, w)
+
+    top_row = canvas[0, 0, 0, :, 0]
+    assert top_row.tolist() == [1, 1, 2, 2, 3, 3]  # stretched
+    assert top_row.tolist() != [1, 2, 3, 1, 2, 3]  # not tiled
 
 
 def test_crop_resize_shape_and_dtype():
@@ -134,3 +156,254 @@ def test_action_pack_decode_roundtrip():
     out = decode({TransitionKey.ACTION: padded.clone()})[TransitionKey.ACTION]
 
     assert torch.allclose(out, raw, atol=1e-4)
+
+
+def _decode_pair(n_action_steps=4):
+    """A pack/decode pair wired the way make_dreamzero_pre_post_processors wires them."""
+    cfg = DreamZeroConfig(n_action_steps=n_action_steps)
+    stats = {
+        "action": {
+            "joint_position": {"q01": [-2.0] * 7, "q99": [2.0] * 7},
+            "gripper_position": {"q01": [0.0], "q99": [1.0]},
+        },
+        "state": {
+            "joint_position": {"q01": [-2.0] * 7, "q99": [2.0] * 7},
+            "gripper_position": {"q01": [0.0], "q99": [1.0]},
+        },
+    }
+    pack = DreamZeroPackInputsStep(cfg, stats)
+    decode = DreamZeroActionDecodeStep(cfg, stats)
+    decode.pack_step = pack
+    return cfg, pack, decode
+
+
+def _decode_one(decode, cfg):
+    """Decode a single zero action; the joint dims come back as the anchor state."""
+    action = torch.zeros(1, cfg.max_action_dim)
+    action[..., :8] = -1.0  # q99 inverse of -1 is q01, which is 0 for these stats after +anchor
+    return decode({TransitionKey.ACTION: action.clone()})[TransitionKey.ACTION]
+
+
+def test_decode_holds_one_anchor_for_the_whole_chunk():
+    """Every action of a chunk decodes against the frame the chunk was predicted from.
+
+    `select_action` pops one action per control tick, and the preprocessor runs again on each new
+    frame — so reading the pack step's latest state would re-anchor mid-chunk and re-add motion
+    that already happened.
+    """
+    cfg, pack, decode = _decode_pair(n_action_steps=4)
+
+    pack._cache_raw_state(torch.full((1, 8), 0.5))  # frame t0 -> the chunk's anchor
+    first = _decode_one(decode, cfg)
+    for step in range(1, 4):  # frames t1..t3: state moves, chunk is still being consumed
+        pack._cache_raw_state(torch.full((1, 8), 0.5 + 0.1 * step))
+        later = _decode_one(decode, cfg)
+        assert torch.allclose(later, first), f"action {step} re-anchored on the current frame"
+
+    # The 5th action belongs to the next chunk, so it must pick up the newest state.
+    pack._cache_raw_state(torch.full((1, 8), 9.0))
+    assert not torch.allclose(_decode_one(decode, cfg), first)
+
+
+def test_decode_reset_drops_the_latched_anchor():
+    """A new episode must re-anchor immediately rather than finish the previous chunk's count."""
+    cfg, pack, decode = _decode_pair(n_action_steps=4)
+
+    pack._cache_raw_state(torch.full((1, 8), 0.5))
+    first = _decode_one(decode, cfg)
+
+    decode.reset()
+    pack._cache_raw_state(torch.full((1, 8), 9.0))
+    assert not torch.allclose(_decode_one(decode, cfg), first)
+
+
+def test_decode_whole_chunk_re_anchors_each_call():
+    """predict_action_chunk + one postprocessor pass anchors per call, not per n_action_steps."""
+    cfg, pack, decode = _decode_pair(n_action_steps=4)
+    horizon = 6  # a full chunk is longer than n_action_steps
+
+    pack._cache_raw_state(torch.full((1, 8), 0.5))
+    chunk = torch.zeros(1, horizon, cfg.max_action_dim)
+    chunk[..., :8] = -1.0
+    first = decode({TransitionKey.ACTION: chunk.clone()})[TransitionKey.ACTION]
+
+    pack._cache_raw_state(torch.full((1, 8), 9.0))
+    second = decode({TransitionKey.ACTION: chunk.clone()})[TransitionKey.ACTION]
+    assert not torch.allclose(second, first)
+
+
+# ----------------------------------------------------------------------------------------------
+# training window packing
+# ----------------------------------------------------------------------------------------------
+def _training_pack(n_state_dim=8):
+    cfg = DreamZeroConfig()
+    stats = {
+        "state": {
+            "joint_position": {"q01": [-4.0] * 7, "q99": [4.0] * 7},
+            "gripper_position": {"q01": [0.0], "q99": [1.0]},
+        },
+        "action": {
+            "joint_position": {"q01": [-2.0] * 7, "q99": [2.0] * 7},  # RELATIVE stats
+            "gripper_position": {"q01": [0.0], "q99": [1.0]},
+        },
+    }
+    return cfg, DreamZeroPackInputsStep(cfg, stats)
+
+
+def test_block_anchor_rows_follow_the_window_geometry():
+    """Block c starts at raw offset c*action_horizon, i.e. observation row c*horizon/stride."""
+    cfg, pack = _training_pack()
+    assert cfg.video_frame_stride == 3
+    assert pack._block_anchor_rows == [0, 8, 16, 24]
+    # Those rows sit at raw offsets 0/24/48/72 of the 33-row observation window.
+    obs_offsets = cfg.observation_delta_indices
+    assert [obs_offsets[r] for r in pack._block_anchor_rows] == [0, 24, 48, 72]
+
+
+def test_training_actions_are_relative_to_their_own_block_anchor():
+    """Each macro block subtracts the state at its own first row, not one window-wide anchor.
+
+    Anchoring the whole window on block 0 would make block 3's displacement ~4x larger than the
+    quantiles it is normalized against, saturating the q99 clamp.
+    """
+    cfg, pack = _training_pack()
+    n_rows, horizon, blocks = cfg.num_frames, cfg.action_horizon, cfg.max_chunk_size
+
+    # A state that ramps by exactly 1.0 per macro block on every joint dim.
+    state = torch.zeros(1, n_rows, 8)
+    for row in range(n_rows):
+        state[0, row, :7] = cfg.observation_delta_indices[row] / horizon
+    # Actions equal to their own block's anchor -> every relative action must come out 0.
+    action = torch.zeros(1, horizon * blocks, 8)
+    for c in range(blocks):
+        action[0, c * horizon : (c + 1) * horizon, :7] = float(c)
+
+    pack._cache_raw_state(state[:, 0])
+    pack._block_anchor_state = pack._split_by_key(state[:, pack._block_anchor_rows])
+    rel = pack._encode_relative_actions(action[..., :8].clone(), training=True)
+
+    assert torch.allclose(rel[..., :7], torch.zeros_like(rel[..., :7]), atol=1e-6)
+    # The gripper is not a relative key, so it passes through untouched.
+    assert torch.allclose(rel[..., 7], action[..., 7])
+
+
+def test_single_window_anchor_would_saturate_later_blocks():
+    """Guards the reason for per-block anchoring: one anchor blows past the q99 range."""
+    cfg, pack = _training_pack()
+    horizon, blocks = cfg.action_horizon, cfg.max_chunk_size
+    action = torch.zeros(1, horizon * blocks, 8)
+    for c in range(blocks):
+        action[0, c * horizon : (c + 1) * horizon, :7] = float(c)  # up to +3.0 by block 3
+
+    # Inference-style single anchor at 0.0 leaves block 3 at +3.0, outside the +/-2.0 q99 span.
+    pack._last_raw_state = {"joint_position": torch.zeros(1, 7), "gripper_position": torch.zeros(1, 1)}
+    single = _q99_forward(
+        pack._encode_relative_actions(action[..., :8].clone(), training=False),
+        pack._action_layout.q01,
+        pack._action_layout.q99,
+    )
+    assert single[0, -1, 0] == 1.0  # clamped: information destroyed
+
+
+def test_training_window_rejects_padding():
+    """drop_n_last_frames should make short windows unreachable; a pad flag means it did not."""
+    cfg, pack = _training_pack()
+    with pytest.raises(ValueError, match="must be complete"):
+        pack._assert_window_not_padded(
+            {TransitionKey.OBSERVATION: {"action_is_pad": torch.tensor([True])}}, {}
+        )
+    pack._assert_window_not_padded({TransitionKey.OBSERVATION: {"action_is_pad": torch.tensor([False])}}, {})
+
+
+def test_crop_offset_is_shared_across_views():
+    """One crop offset for every camera — independent crops would misalign the stitched canvas.
+
+    Upstream concatenates all views and frames into a single batch and transforms it once
+    (`groot/vla/data/transform/video.py` apply), so the offset cannot vary per view.
+    """
+    h, w, scale = 180, 320, 0.95
+    ch, cw = _crop_size(h, w, scale)
+    assert (ch, cw) == (171, 304)  # int(h*scale), int(w*scale) — upstream's formula
+
+    # A view whose pixel value encodes its row, so the crop offset is readable from the output.
+    ramp = torch.arange(h, dtype=torch.uint8).view(1, 1, h, 1, 1).expand(1, 1, h, w, 3).contiguous()
+    offset = (7, 11)
+    a = _crop_resize_view(ramp, scale, ch, cw, offset)
+    b = _crop_resize_view(ramp, scale, ch, cw, offset)
+    assert torch.equal(a, b), "same offset must give the same crop"
+    # A different offset must actually move the window (otherwise the arg is being ignored).
+    assert not torch.equal(a, _crop_resize_view(ramp, scale, ch, cw, (0, 0)))
+
+
+def test_crop_offset_defaults_to_centre():
+    """Inference centre-crops, matching upstream's eval mode."""
+    h, w, scale = 180, 320, 0.95
+    ch, cw = _crop_size(h, w, scale)
+    ramp = torch.arange(h, dtype=torch.uint8).view(1, 1, h, 1, 1).expand(1, 1, h, w, 3).contiguous()
+    centre = ((h - ch) // 2, (w - cw) // 2)
+    assert torch.equal(
+        _crop_resize_view(ramp, scale, ch, cw, None), _crop_resize_view(ramp, scale, ch, cw, centre)
+    )
+
+
+def test_sampled_crop_offset_stays_in_bounds():
+    h, w, scale = 180, 320, 0.95
+    ch, cw = _crop_size(h, w, scale)
+    for _ in range(200):
+        top, left = _sample_crop_offset(h, w, scale)
+        assert 0 <= top <= h - ch and 0 <= left <= w - cw
+
+
+def test_sorted_image_key_fallback_skips_pad_flags():
+    """A training batch carries `observation.images.*_is_pad` flags next to the camera keys.
+
+    Without `video_modality_keys` the views come from the sorted `observation.images.*` keys, and a
+    pad flag mistaken for a camera would change both the view count and the stitch content.
+    """
+    pack = DreamZeroPackInputsStep(DreamZeroConfig())
+    obs = {
+        "observation.images.exterior_1_left": torch.zeros(1, 3, 4, 4),
+        "observation.images.exterior_1_left_is_pad": torch.zeros(1, dtype=torch.bool),
+        "observation.images.wrist_left": torch.zeros(1, 3, 4, 4),
+        "observation.images.wrist_left_is_pad": torch.zeros(1, dtype=torch.bool),
+    }
+
+    assert pack._ordered_image_keys(obs) == [
+        "observation.images.exterior_1_left",
+        "observation.images.wrist_left",
+    ]
+
+
+def test_train_time_standard_overrides_are_dropped_not_raised():
+    """`lerobot-train` always passes normalizer overrides; DreamZero has no such step.
+
+    Normalization and the relative<->absolute conversion live inside the pack/decode steps, driven
+    by the checkpoint's statistics rather than dataset stats. Dropping these four keys is
+    deliberate — but everything else must still raise, so a real override cannot be lost silently.
+    """
+    from lerobot.policies.dreamzero.processor_dreamzero import _drop_absent_standard_overrides
+
+    overrides = {
+        "normalizer_processor": {"stats": {}},
+        "unnormalizer_processor": {"stats": {}},
+        "relative_actions_processor": {"enabled": True},
+        "absolute_actions_processor": {"enabled": True},
+        "device_processor": {"device": "cpu"},
+        "rename_observations_processor": {"rename_map": {}},
+    }
+    kept = _drop_absent_standard_overrides(overrides)
+    assert set(kept) == {"device_processor", "rename_observations_processor"}
+    assert _drop_absent_standard_overrides(None) is None
+
+
+def test_unknown_override_key_still_raises():
+    """A typo'd or genuinely missing step must fail rather than be quietly ignored."""
+    from lerobot.policies.dreamzero.processor_dreamzero import (
+        _apply_step_overrides,
+        make_dreamzero_pre_post_processors,
+    )
+
+    cfg = DreamZeroConfig()
+    pre, _ = make_dreamzero_pre_post_processors(cfg)
+    with pytest.raises(KeyError, match="matches no step"):
+        _apply_step_overrides(pre, {"no_such_processor": {"x": 1}})

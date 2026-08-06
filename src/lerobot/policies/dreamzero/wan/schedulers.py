@@ -18,8 +18,24 @@
 #   groot/vla/model/dreamzero/modules/flow_match_scheduler.py
 #   groot/vla/model/dreamzero/modules/flow_unipc_multistep_scheduler.py
 
+import os
+
 import torch
 
+
+def _maybe_compile(fn):
+    """Apply upstream's ``torch.compile`` to a UniPC update step, opt-in.
+
+    Upstream decorates these with ``fullgraph=True, dynamic=False``. Both take ``order`` and
+    ``step_index`` as plain Python ints, so Dynamo specializes on every value and a normal
+    16-step schedule blows past the recompile limit (``FailOnRecompileLimitHit``). Upstream gets
+    away with it only because its released inference path runs a step-skipping schedule with few
+    distinct indices. Default to eager so correctness work is not hostage to that, and gate the
+    compiled path behind ``DREAMZERO_COMPILE_SCHEDULER=1`` for throughput runs.
+    """
+    if os.getenv("DREAMZERO_COMPILE_SCHEDULER", "0").lower() not in ("1", "true", "yes"):
+        return fn
+    return torch.compile(mode="reduce-overhead", fullgraph=True, dynamic=False)(fn)
 
 
 class FlowMatchScheduler():
@@ -406,7 +422,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
 
             return epsilon
 
-    @torch.compile(mode="reduce-overhead", fullgraph=True, dynamic=False)
+    @_maybe_compile
     def multistep_uni_p_bh_update(
         self,
         model_output: torch.Tensor,
@@ -518,7 +534,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         x_t = x_t.to(x.dtype)
         return x_t
 
-    @torch.compile(mode="reduce-overhead", fullgraph=True, dynamic=False)
+    @_maybe_compile
     def multistep_uni_c_bh_update(
         self,
         this_model_output: torch.Tensor,
