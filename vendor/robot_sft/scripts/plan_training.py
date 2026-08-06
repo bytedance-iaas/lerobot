@@ -472,15 +472,25 @@ def main() -> None:
         import check_features
         fc = check_features.check(args.dataset_repo_id, args.dataset_root, args.policy_path, args.policy_type)
         if fc["status"] == "mismatch" and fc.get("rename_map"):
-            rename_flag = f"--rename_map='{json.dumps(fc['rename_map'])}'"
-            cmd = cmd + " \\\n  " + rename_flag
-            plan["launch_command"] = cmd
-            plan["camera_rename_map"] = fc["rename_map"]
-            plan["camera_padded"] = fc.get("padded_cameras")
-            print(f"\n⚠ camera mismatch (dataset {fc['provided']} vs checkpoint {fc['expected']}) "
-                  f"auto-fixed: added {rename_flag}"
-                  + (f"; {fc['padded_cameras']} auto-pad black." if fc.get("padded_cameras") else "."),
-                  file=_sys.stderr)
+            # An explicit --rename-map was already appended above. Appending the auto-detected one
+            # too would emit the flag TWICE in one command (which of the two wins is up to the arg
+            # parser — never leave that ambiguous). The user's explicit value is an override: keep
+            # it, and only report what the auto-check would have used.
+            if args.rename_map:
+                plan["camera_rename_map_detected"] = fc["rename_map"]
+                print(f"\n⚠ camera mismatch (dataset {fc['provided']} vs checkpoint {fc['expected']}); "
+                      f"KEEPING your explicit --rename-map and skipping the auto one "
+                      f"(detected: {json.dumps(fc['rename_map'])})", file=_sys.stderr)
+            else:
+                rename_flag = f"--rename_map='{json.dumps(fc['rename_map'])}'"
+                cmd = cmd + " \\\n  " + rename_flag
+                plan["launch_command"] = cmd
+                plan["camera_rename_map"] = fc["rename_map"]
+                plan["camera_padded"] = fc.get("padded_cameras")
+                print(f"\n⚠ camera mismatch (dataset {fc['provided']} vs checkpoint {fc['expected']}) "
+                      f"auto-fixed: added {rename_flag}"
+                      + (f"; {fc['padded_cameras']} auto-pad black." if fc.get("padded_cameras") else "."),
+                      file=_sys.stderr)
 
     if args.out:
         with open(args.out, "w") as f:
