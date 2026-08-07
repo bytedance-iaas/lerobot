@@ -72,12 +72,23 @@ HERMES_BIN = os.environ.get("HERMES_BIN") or shutil.which("hermes") or "hermes"
 # hermes venv's bin/, so its resolved sibling `python` is that interpreter.
 HERMES_PY = os.environ.get("HERMES_PY") or str(Path(HERMES_BIN).resolve().with_name("python"))
 HERMES_SESSION_API = os.environ.get("HERMES_SESSION_API") or "/opt/hermes/session_api.py"
-# Single-user HTTP Basic auth, credentials from the environment. When both are
-# set, EVERY route (page, static, WS, proxy) requires them; otherwise the console
-# is open (logged as a warning). This is a single account by design.
-AUTH_USER = os.environ.get("CONSOLE_USER") or os.environ.get("AUTH_USER") or ""
-AUTH_PASS = os.environ.get("CONSOLE_PASSWORD") or os.environ.get("AUTH_PASSWORD") or ""
-AUTH_ENABLED = bool(AUTH_USER and AUTH_PASS)
+# Single-user HTTP Basic auth (one account by design), credentials injected via the
+# environment: CONSOLE_USER / CONSOLE_PASSWORD (legacy aliases AUTH_USER / AUTH_PASSWORD).
+# EVERY route — page, static, WS, proxy — requires them.
+#
+# Auth is ALWAYS ON. When the env vars are missing we fall back to a well-known default and
+# warn loudly, instead of the old behaviour of disabling auth entirely: this console exposes a
+# root shell and now has a public HTTPS entry (APIG), so failing OPEN meant a single unmounted
+# Secret would silently publish it to the internet with only a log line. Failing closed on a
+# default password is recoverable; failing open is not.
+DEFAULT_AUTH_USER = "lerobot"
+DEFAULT_AUTH_PASS = "lerobot"
+_env_user = os.environ.get("CONSOLE_USER") or os.environ.get("AUTH_USER") or ""
+_env_pass = os.environ.get("CONSOLE_PASSWORD") or os.environ.get("AUTH_PASSWORD") or ""
+AUTH_USER = _env_user or DEFAULT_AUTH_USER
+AUTH_PASS = _env_pass or DEFAULT_AUTH_PASS
+AUTH_USING_DEFAULT = not (_env_user and _env_pass)
+AUTH_ENABLED = True
 # The console serves plain HTTP :8080. TLS/HTTPS is terminated upstream — by APIG (the
 # API Gateway, which gives an HTTPS auto-domain + cert) or a CLB — so there is no
 # in-process cert handling here.
@@ -1206,10 +1217,13 @@ def main() -> None:
     # Always plain HTTP :8080 — TLS is terminated upstream by APIG / CLB.
     log.info("LeRobot Agent Console http://0.0.0.0:%s  shell=%s  LEROBOT_HOME=%s  hermes=%s",
              PORT, SHELL, WORKDIR, HERMES_BIN)
-    if AUTH_ENABLED:
-        log.info("auth: single-user HTTP Basic ENABLED (user=%s)", AUTH_USER)
+    if AUTH_USING_DEFAULT:
+        log.warning(
+            "auth: using the DEFAULT credentials (user=%s) — CONSOLE_USER / CONSOLE_PASSWORD were "
+            "not injected. The console is protected but with a PUBLICLY KNOWN password; set the "
+            "env vars (k8s Secret lerobot-console-auth) and restart.", AUTH_USER)
     else:
-        log.warning("auth: DISABLED — set CONSOLE_USER + CONSOLE_PASSWORD to protect the console")
+        log.info("auth: single-user HTTP Basic ENABLED (user=%s)", AUTH_USER)
     web.run_app(build_app(), host="0.0.0.0", port=PORT, access_log=None)
 
 
