@@ -476,6 +476,8 @@ def eval_policy(
     max_rewards = []
     all_successes = []
     all_seeds = []
+    all_residuals: list[list[float]] = []  # per-episode world-model prediction-residual traces
+    all_replans: list[int] = []
     threads = []  # for video saving threads
     n_episodes_rendered = 0  # for saving the correct number of videos
 
@@ -564,6 +566,13 @@ def eval_policy(
         max_rewards.extend(batch_max_rewards.tolist())
         batch_successes = einops.reduce((rollout_data["success"] * mask), "b n -> b", "any")
         all_successes.extend(batch_successes.tolist())
+        # World-model policies that track their prediction residual (LingBot-VA's
+        # ``track_prediction_residual``) accumulate one value per chunk over the rollout; the
+        # policy is reset per rollout, so this is exactly this episode's trace.
+        residual_trace = getattr(policy, "residual_history", None)
+        if residual_trace:
+            all_residuals.append(list(residual_trace))
+            all_replans.append(getattr(policy, "replan_count", 0))
         if seeds:
             all_seeds.extend(seeds)
         else:
@@ -676,6 +685,13 @@ def eval_policy(
             "eval_ep_s": (time.time() - start) / n_episodes,
         },
     }
+
+    if all_residuals:
+        for ep, trace, replans in zip(
+            info["per_episode"], all_residuals[:n_episodes], all_replans[:n_episodes], strict=False
+        ):
+            ep["residual_trace"] = trace
+            ep["replan_count"] = replans
 
     if return_episode_data:
         info["episodes"] = episode_data
@@ -829,6 +845,9 @@ class TaskMetrics(TypedDict):
     successes: list[bool]
     video_paths: list[str]
     predicted_video_paths: list[str]
+    # Per-episode world-model prediction-residual traces (empty unless the policy tracks them).
+    residual_traces: list[list[float]]
+    replan_counts: list[int]
 
 
 ACC_KEYS = ("sum_rewards", "max_rewards", "successes", "video_paths", "predicted_video_paths")
@@ -881,6 +900,8 @@ def eval_one(
         successes=[ep["success"] for ep in per_episode],
         video_paths=task_result.get("video_paths", []),
         predicted_video_paths=task_result.get("predicted_video_paths", []),
+        residual_traces=[ep["residual_trace"] for ep in per_episode if "residual_trace" in ep],
+        replan_counts=[ep["replan_count"] for ep in per_episode if "replan_count" in ep],
     )
 
 
