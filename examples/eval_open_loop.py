@@ -167,10 +167,19 @@ def _slope(a: torch.Tensor, b: torch.Tensor) -> float:
 
 
 @torch.no_grad()
-def eval_episode(policy, dataset, preprocessor, postprocessor, episode, n, stride) -> dict:
+def eval_episode(policy, dataset, preprocessor, postprocessor, episode, n, stride, step=1) -> dict:
+    """Score one episode open-loop.
+
+    `step` is how many dataset frames one *model action step* spans. It is 1 whenever the dataset
+    runs at the rate the policy was trained for, and >1 when the policy strides a faster dataset
+    down (DreamZero's `source_fps`). Ignoring it silently compares the model's i-th action against
+    frame `start + i` when the action actually lands on `start + i*step` — a mismatch that grows
+    across the chunk and, on a dataset where the arm mostly moves one way, shows up as a negative
+    delta correlation rather than as an obvious error.
+    """
     sq_errors, hold_errors, pred_deltas, true_deltas = [], [], [], []
 
-    for start in range(0, n, stride):
+    for start in range(0, n, stride * step):
         anchor = dataset[start]
         policy.reset()
         chunk = policy.predict_action_chunk(preprocessor(_build_observation(anchor)))
@@ -179,9 +188,10 @@ def eval_episode(policy, dataset, preprocessor, postprocessor, episode, n, strid
             chunk = chunk[0]
 
         anchor_state = anchor.get(OBS_STATE)
-        for offset in range(min(stride, n - start, chunk.shape[0])):
+        reach = min(stride, chunk.shape[0], -(-(n - start) // step))
+        for offset in range(reach):
             action = chunk[offset]
-            gt = dataset[start + offset][ACTION].to(action.device, action.dtype)
+            gt = dataset[start + offset * step][ACTION].to(action.device, action.dtype)
             if gt.ndim == action.ndim + 1:  # a recorded chunk vs a single step
                 gt = gt[0]
             k = min(action.shape[-1], gt.shape[-1])
@@ -252,14 +262,24 @@ def main(cfg: OpenLoopEvalConfig):
     )
 
     stride = cfg.stride or getattr(policy.config, "n_action_steps", None) or 1
+    # Dataset frames per model action step; 1 unless the policy strides a faster dataset down.
+    step = int(getattr(policy.config, "frame_rate_multiplier", 1) or 1)
     per_episode = []
     for episode in episodes:
         dataset = open_dataset(episode)
         n = len(dataset)
         if cfg.max_frames_per_episode is not None:
             n = min(n, cfg.max_frames_per_episode)
-        logging.info("Open-loop eval: episode %d, %d frames, stride %d", episode, n, stride)
-        per_episode.append(eval_episode(policy, dataset, preprocessor, postprocessor, episode, n, stride))
+        logging.info(
+            "Open-loop eval: episode %d, %d frames, stride %d, %d dataset frame(s) per action step",
+            episode,
+            n,
+            stride,
+            step,
+        )
+        per_episode.append(
+            eval_episode(policy, dataset, preprocessor, postprocessor, episode, n, stride, step)
+        )
 
     aggregate = {}
     for key in ("action_mse", "hold_state_mse", "delta_corr", "delta_slope"):
