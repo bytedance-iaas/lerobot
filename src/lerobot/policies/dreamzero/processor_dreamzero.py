@@ -63,7 +63,6 @@ from lerobot.processor import (
 from lerobot.processor.relative_action_processor import to_absolute_actions
 from lerobot.types import EnvTransition, TransitionKey
 from lerobot.utils.constants import (
-    ACTION,
     OBS_IMAGE,
     OBS_IMAGES,
     OBS_STATE,
@@ -119,11 +118,6 @@ def _stat_vec(stats: dict, modality: str, key: str, name: str) -> np.ndarray | N
     if not isinstance(entry, dict) or name not in entry:
         return None
     return np.asarray(entry[name], dtype=np.float32).reshape(-1)
-
-
-def _key_dim(stats: dict, modality: str, key: str) -> int:
-    q01 = _stat_vec(stats, modality, key, "q01")
-    return int(q01.shape[0]) if q01 is not None else 0
 
 
 class _QuantileLayout:
@@ -306,7 +300,7 @@ class DreamZeroPackInputsStep(ProcessorStep):
             bsz = state.shape[0]
             self._cache_raw_state(state)
             norm = state.clone().float()
-            for key, (s, e) in self._state_layout.slices.items():
+            for _key, (s, e) in self._state_layout.slices.items():
                 if e <= state.shape[1]:
                     q01 = self._state_layout.q01[s:e]
                     q99 = self._state_layout.q99[s:e]
@@ -462,3 +456,34 @@ def make_dreamzero_pre_post_processors(
             to_output=transition_to_policy_action,
         ),
     )
+
+
+def make_dreamzero_pre_post_processors_from_pretrained(
+    config: DreamZeroConfig,
+    pretrained_path,
+    dataset_stats: dict | None = None,
+    **kwargs,
+):
+    """Build the DreamZero processors, reading ``statistics.json`` from the checkpoint.
+
+    The converter writes ``statistics.json`` as ``{embodiment_tag: {state, action}}`` (GEAR q01/q99).
+    When ``dataset_stats`` isn't supplied, load the block for ``config.embodiment_tag`` so the q99
+    normalization + relative decode use the checkpoint's own statistics (mirrors GR00T's
+    ``make_groot_pre_post_processors_from_pretrained``).
+    """
+    import json
+    from pathlib import Path
+
+    stats = dataset_stats
+    if stats is None:
+        stats_file = Path(pretrained_path) / "statistics.json"
+        if stats_file.exists():
+            all_stats = json.loads(stats_file.read_text())
+            block = all_stats.get(config.embodiment_tag)
+            stats = block if isinstance(block, dict) else all_stats
+        else:
+            logger.warning(
+                "No statistics.json in %s — DreamZero q99 normalization/decode will have no stats.",
+                pretrained_path,
+            )
+    return make_dreamzero_pre_post_processors(config, dataset_stats=stats, **kwargs)

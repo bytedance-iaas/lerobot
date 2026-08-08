@@ -22,7 +22,6 @@ the upstream DreamZero semantics (dreamzero_port_plan.md M2). The umt5 tokenizer
 GPU model are validated separately (they need the released checkpoint + a GPU).
 """
 
-import numpy as np
 import pytest
 import torch
 
