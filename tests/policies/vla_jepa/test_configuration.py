@@ -55,3 +55,31 @@ def test_validate_features_sets_action_dim_from_feature() -> None:
     config = make_config(action_dim=6, state_dim=10)
     assert config.action_dim == 6
     assert config.state_dim == 10
+
+
+# ---------------------------------------------------------------------------
+# World-model prediction-error feedback flags
+# ---------------------------------------------------------------------------
+
+
+def test_wm_feedback_defaults_to_disabled() -> None:
+    config = make_config()
+    assert config.enable_wm_feedback is False
+    assert config.wm_error_threshold is None
+    assert config.wm_replan_on_surprise is True
+
+
+def test_wm_feedback_requires_world_model() -> None:
+    with pytest.raises(ValueError, match="enable_wm_feedback requires enable_world_model"):
+        make_config(enable_wm_feedback=True, enable_world_model=False)
+
+
+def test_wm_error_threshold_requires_feedback_enabled() -> None:
+    with pytest.raises(ValueError, match="wm_error_threshold requires enable_wm_feedback"):
+        make_config(enable_wm_feedback=False, wm_error_threshold=0.5)
+
+
+def test_wm_feedback_enabled_config_is_valid() -> None:
+    config = make_config(enable_wm_feedback=True, wm_error_threshold=0.5)
+    assert config.enable_wm_feedback is True
+    assert config.wm_error_threshold == 0.5

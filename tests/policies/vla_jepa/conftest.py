@@ -49,6 +49,11 @@ def make_config(
     state_dim: int = STATE_DIM,
     action_horizon: int = ACTION_HORIZON,
     num_video_frames: int = NUM_VIDEO_FRAMES,
+    *,
+    enable_world_model: bool = True,
+    enable_wm_feedback: bool = False,
+    wm_error_threshold: float | None = None,
+    wm_replan_on_surprise: bool = True,
 ) -> VLAJEPAConfig:
     config = VLAJEPAConfig(
         input_features={
@@ -74,9 +79,25 @@ def make_config(
         predictor_num_heads=2,
         predictor_mlp_ratio=2.0,
         jepa_tubelet_size=1,
+        enable_world_model=enable_world_model,
+        enable_wm_feedback=enable_wm_feedback,
+        wm_error_threshold=wm_error_threshold,
+        wm_replan_on_surprise=wm_replan_on_surprise,
     )
     config.validate_features()
     return config
+
+
+def make_monitor(policy, config: VLAJEPAConfig):
+    """Build a WorldModelMonitor from an already-constructed policy's frozen submodules."""
+    from lerobot.policies.vla_jepa.monitor import WorldModelMonitor
+
+    return WorldModelMonitor(
+        video_encoder=policy.model.video_encoder,
+        video_processor=policy.model.video_processor,
+        video_predictor=policy.model.video_predictor,
+        config=config,
+    )
 
 
 def make_train_batch(

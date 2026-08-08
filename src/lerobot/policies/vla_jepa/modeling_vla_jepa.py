@@ -38,6 +38,7 @@ else:
 
 from .action_head import VLAJEPAActionHead
 from .configuration_vla_jepa import VLAJEPAConfig
+from .monitor import WorldModelMonitor
 from .qwen_interface import Qwen3VLInterface
 from .world_model import ActionConditionedVideoPredictor
 
@@ -309,8 +310,14 @@ class VLAJEPAModel(nn.Module):
         images: list[list[Tensor]],
         instructions: list[str],
         state: Tensor | None = None,
-    ) -> Tensor:
-        """Predict an action chunk. `images` is per-sample, per-view float [0,1] [C, H, W] tensors."""
+    ) -> tuple[Tensor, Tensor | None]:
+        """Predict an action chunk. `images` is per-sample, per-view float [0,1] [C, H, W] tensors.
+
+        Returns ``(actions, action_tokens)``. ``action_tokens`` is the Qwen action-token hidden
+        state sequence, returned only when ``config.enable_wm_feedback`` is set; the world-model
+        monitor consumes it as predictor conditioning. It is ``None`` otherwise, so the extra
+        gather is skipped entirely when feedback is off.
+        """
         if self.config.resize_images_to is not None:
             height, width = self.config.resize_images_to
             images = [
@@ -318,10 +325,13 @@ class VLAJEPAModel(nn.Module):
                 for views in images
             ]
 
-        embodied_action_tokens, _ = self._encode_qwen(images, instructions, need_action_tokens=False)
-        return self.action_model.predict_action(
+        embodied_action_tokens, action_tokens = self._encode_qwen(
+            images, instructions, need_action_tokens=self.config.enable_wm_feedback
+        )
+        actions = self.action_model.predict_action(
             embodied_action_tokens.float(), state.float() if state is not None else None
         )
+        return actions, action_tokens
 
 
 # ============================================================================
@@ -355,10 +365,26 @@ class VLAJEPAPolicy(PreTrainedPolicy):
                 config.action_dim = ds_features[ACTION]["shape"][0]
 
         self.model = VLAJEPAModel(config)
+        self._last_action_tokens: Tensor | None = None
+        self.last_wm_error: float | None = None
+        self.monitor: WorldModelMonitor | None = (
+            WorldModelMonitor(
+                video_encoder=self.model.video_encoder,
+                video_processor=self.model.video_processor,
+                video_predictor=self.model.video_predictor,
+                config=config,
+            )
+            if config.enable_wm_feedback
+            else None
+        )
         self.reset()
 
     def reset(self) -> None:
         self._queues = {ACTION: deque(maxlen=self.config.n_action_steps)}
+        self._last_action_tokens = None
+        self.last_wm_error = None
+        if self.monitor is not None:
+            self.monitor.reset()
 
     # ---- Format Conversion: LeRobot → Native ----
 
@@ -445,18 +471,50 @@ class VLAJEPAPolicy(PreTrainedPolicy):
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
 
         inputs = self._prepare_model_inputs(batch, training=False)
-        actions = self.model.predict_action(inputs["images"], inputs["instructions"], inputs.get("state"))
+        actions, action_tokens = self.model.predict_action(
+            inputs["images"], inputs["instructions"], inputs.get("state")
+        )
+        self._last_action_tokens = action_tokens
         return actions.to(device=self.config.device, dtype=torch.float32)
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
-        """LeRobot select_action with action queue caching."""
+        """LeRobot select_action with action queue caching and optional world-model gating."""
         self.eval()
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
+
         if len(self._queues[ACTION]) == 0:
             actions = self.predict_action_chunk(batch)
             self._queues[ACTION].extend(actions.transpose(0, 1)[: self.config.n_action_steps])
+
+        if self.monitor is not None and self._last_action_tokens is not None:
+            output = self.monitor.observe(self._observation_frames(batch), self._last_action_tokens)
+            if output is not None:
+                self.last_wm_error = output.error.mean().item()
+                if self._should_replan(self.last_wm_error):
+                    self._queues[ACTION].clear()
+                    actions = self.predict_action_chunk(batch)
+                    self._queues[ACTION].extend(actions.transpose(0, 1)[: self.config.n_action_steps])
+
         return self._queues[ACTION].popleft()
+
+    def _should_replan(self, error: float) -> bool:
+        """Whether a measured prediction error should force an early replan."""
+        return (
+            self.config.wm_replan_on_surprise
+            and self.config.wm_error_threshold is not None
+            and error > self.config.wm_error_threshold
+        )
+
+    def _observation_frames(self, batch: dict[str, Tensor]) -> Tensor:
+        """Stack the current frame from every camera view into ``[B, V, C, H, W]`` in [0, 1]."""
+        views = []
+        for key in self.config.image_features:
+            tensor = batch[key]
+            if tensor.ndim == 5:  # [B, T, C, H, W] -> current observation
+                tensor = tensor[:, 0]
+            views.append(self.model.qwen.to_pixel_values(tensor))
+        return torch.stack(views, dim=1)
 
     @classmethod
     def from_pretrained(
