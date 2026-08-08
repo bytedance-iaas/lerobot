@@ -172,6 +172,15 @@ class LingBotVAPolicy(PreTrainedPolicy):
         self._negative_prompt_embeds = None
         self.last_predicted_frames = None
         self.last_predicted_latents = None
+        # Prediction-residual feedback (see ``track_prediction_residual``). ``_pred_latents`` holds
+        # the video latents predicted for the chunk currently being executed, so the next chunk
+        # boundary can compare them against the frames that were actually observed.
+        self.last_residual: float | None = None
+        self.last_residual_per_frame: list[float] = []
+        self.residual_history: list[float] = []
+        self._pred_latents: Tensor | None = None
+        self._pred_offset = 0  # predicted-frame index the first observed keyframe corresponds to
+        self.replan_count = 0
         self._use_cfg = (cfg.guidance_scale > 1) or (cfg.action_guidance_scale > 1)
         # Two independent flow-matching schedulers (video latent + action streams).
         self._scheduler = FlowMatchScheduler(shift=cfg.snr_shift, sigma_min=0.0, extra_one_step=True)
@@ -424,6 +433,11 @@ class LingBotVAPolicy(PreTrainedPolicy):
             # keyframe. Buffer it on the sub-step boundary the upstream client samples on.
             if (self._prev_j + 1) % self._keyframe_stride == 0:
                 self._obs_buffer.append(self._extract_raw_obs(batch))
+            if self._should_replan():
+                # The world model drifted from reality on the previous chunk: drop the rest of the
+                # planned actions so the observed frames re-enter the KV cache sooner.
+                self._action_queue.clear()
+                self.replan_count += 1
             if len(self._action_queue) == 0:
                 # All actions for the current chunk have been executed; feed the observed
                 # keyframes + executed actions back and predict the next chunk.
@@ -434,6 +448,60 @@ class LingBotVAPolicy(PreTrainedPolicy):
         self._prev_j = self._exec_step % self.config.action_per_frame
         self._exec_step += 1
         return self._action_queue.popleft()
+
+    # Prediction-residual feedback
+    @property
+    def _residual_enabled(self) -> bool:
+        cfg = self.config
+        return cfg.track_prediction_residual or cfg.residual_replan_threshold is not None
+
+    def _record_residual(self, z_real: Tensor) -> None:
+        """Compare the observed keyframe latents against what the model predicted for them.
+
+        Both tensors live in the same channel-normalized latent space and are ``[B, z, F, h, w]``,
+        so the residual is a plain elementwise difference -- no VAE decode needed.
+
+        The observed frames are the ones the executed actions produced, so they line up with the
+        predicted frames starting at ``_pred_offset``: 1 on the first chunk (predicted frame 0 is
+        the conditioning frame, whose action is never executed) and 0 afterwards. A chunk cut short
+        by early re-planning yields fewer observed frames, which are still the *first* ones of that
+        chunk -- hence an explicit offset rather than a tail slice.
+        """
+        z_pred = self._pred_latents
+        if z_pred is None:
+            return
+        off = self._pred_offset
+        f = min(z_real.shape[2], z_pred.shape[2] - off)
+        if f <= 0:
+            return
+        real = z_real[:, :, :f].float()
+        pred = z_pred[:, :, off : off + f].to(real)
+        # Per latent frame: ||z_real - z_pred|| / ||z_real||, so the scale is comparable across
+        # frames and episodes.
+        diff = (real - pred).transpose(0, 2).reshape(f, -1).norm(dim=1)
+        base = real.transpose(0, 2).reshape(f, -1).norm(dim=1).clamp_min(1e-6)
+        per_frame = (diff / base).tolist()
+        self.last_residual_per_frame = per_frame
+        self.last_residual = sum(per_frame) / len(per_frame)
+        self.residual_history.append(self.last_residual)
+
+    def _should_replan(self) -> bool:
+        """Whether to cut the current chunk short because the last residual was too large.
+
+        Re-planning is only allowed on a latent-frame boundary: the KV feedback pairs one latent
+        frame with one action frame, so cutting mid-frame would desynchronize the observed-frame
+        and executed-action counts.
+        """
+        cfg = self.config
+        thr = cfg.residual_replan_threshold
+        if thr is None or self.last_residual is None or not self._action_queue:
+            return False
+        if self._exec_step == 0 or self._exec_step % cfg.action_per_frame != 0:
+            return False
+        min_frames = min(max(cfg.residual_min_exec_frames, 1), cfg.frame_chunk_size - 1)
+        if self._exec_step // cfg.action_per_frame < min_frames:
+            return False
+        return self.last_residual > thr
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
@@ -458,6 +526,14 @@ class LingBotVAPolicy(PreTrainedPolicy):
 
         # actions: [B, action_dim, F, action_per_frame, 1] (model-normalized). Keep for KV feedback.
         self._executed_actions = actions
+
+        if self._residual_enabled:
+            # Keep the video latents this chunk imagined so the next chunk boundary can compare
+            # them against the frames that were actually observed while executing it. On the first
+            # chunk predicted frame 0 is the conditioning frame and its action is dropped, so the
+            # observations start at predicted frame 1.
+            self._pred_latents = latents.detach()
+            self._pred_offset = 1 if is_first else 0
 
         if self.config.save_predicted_video:
             # Match upstream LingBot-VA visualization: collect chunk latents and decode the
@@ -721,12 +797,19 @@ class LingBotVAPolicy(PreTrainedPolicy):
         self.transformer.clear_pred_cache("pos")
         # Encode the buffered keyframe clip in one streaming call (carries the causal VAE cache).
         latent_model_input = self._encode_frames(obs_buffer)
+        if self._residual_enabled:
+            self._record_residual(latent_model_input)
         # On the first feedback, prepend the init latent so the latent/action frame counts align
         # (upstream prepends ``init_latent`` to the observed keyframes when frame_st_id == 0).
         if self._frame_st_id == 0 and getattr(self, "_init_latent", None) is not None:
             latent_model_input = torch.cat([self._init_latent, latent_model_input], dim=2)
         action_model_input = self._preprocess_action_state(executed_actions)
         action_model_input = action_model_input.to(latent_model_input)
+        # A chunk cut short by residual re-planning produced fewer observed latent frames than the
+        # full action chunk; only the actions that were actually executed may enter the KV cache.
+        n_frames = latent_model_input.shape[2]
+        if action_model_input.shape[2] > n_frames:
+            action_model_input = action_model_input[:, :, :n_frames]
         input_dict = self._prepare_latent_input(
             latent_model_input, action_model_input, frame_st_id=self._frame_st_id
         )

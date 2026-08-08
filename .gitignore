@@ -176,3 +176,6 @@ outputs/
 *.urdf
 *.xml
 *.part
+
+# Claude Code local settings (personal, not for the team)
+.claude/settings.local.json

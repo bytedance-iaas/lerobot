@@ -95,6 +95,23 @@ class LingBotVAConfig(PreTrainedConfig):
     # Opt-in: VAE-decode predicted video latents to ``self.last_predicted_frames`` for saving MP4s.
     save_predicted_video: bool = False
 
+    # Prediction-residual feedback. At every chunk boundary the real observed keyframes are
+    # VAE-encoded and written into the KV cache, so the residual against the latents the model
+    # *predicted* for those same frames measures how far the world model has drifted from reality.
+    # Measurement only (no behaviour change): records ``policy.last_residual`` (per-frame mean of
+    # ``||z_real - z_pred|| / ||z_real||``, computed in latent space -- no VAE decode) and appends
+    # it to ``policy.residual_history``.
+    track_prediction_residual: bool = False
+    # Control: when the residual measured at the start of a chunk exceeds this, the chunk is cut
+    # short so real observations re-enter the KV cache sooner (MPC-style early re-planning).
+    # ``None`` disables it and keeps the default fixed-cadence behaviour bit-for-bit.
+    residual_replan_threshold: float | None = None
+    # Re-planning may only happen on a latent-frame boundary (a multiple of ``action_per_frame``
+    # executed actions), otherwise the observed-frame / executed-action counts fed back into the
+    # KV cache no longer line up. This is the smallest chunk we are willing to execute, in latent
+    # frames; it is clamped to [1, frame_chunk_size - 1].
+    residual_min_exec_frames: int = 2
+
     # Normalization: IDENTITY here; images are scaled + VAE-encoded and actions are
     # quantile-(un)normalized inside the policy / dedicated processor steps.
     normalization_mapping: dict[str, NormalizationMode] = field(
