@@ -41,6 +41,9 @@ from .configuration_dreamzero import TRAINING_MODES, DreamZeroConfig
 
 logger = logging.getLogger(__name__)
 
+# FSDP renames every module it wraps; nested wrappers survive `accelerator.unwrap_model`.
+_FSDP_PREFIX = "_fsdp_wrapped_module."
+
 
 class DreamZeroPolicy(PreTrainedPolicy):
     """DreamZero World Action Model policy."""
@@ -260,11 +263,33 @@ class DreamZeroPolicy(PreTrainedPolicy):
                 "`--policy.save_lora_only=false` to write complete weights."
             )
         self.config._save_pretrained(save_directory)
-        trainable = {name for name, p in self.named_parameters() if p.requires_grad}
+        # `accelerator.unwrap_model` strips only the OUTERMOST FSDP wrapper, so with a per-block
+        # auto-wrap policy the nested ones survive and `named_parameters()` still spells an adapter
+        # `blocks.0._fsdp_wrapped_module.cross_attn.q.lora_A...`. The gathered FULL_STATE_DICT uses
+        # clean FQNs, so matching the two verbatim dropped every adapter (they sit inside wrapped
+        # blocks) while keeping the projectors (which do not) — a checkpoint that loads, runs, and
+        # scores exactly like the base model.
+        trainable = {name.replace(_FSDP_PREFIX, "") for name, p in self.named_parameters() if p.requires_grad}
         full = self.state_dict() if state_dict is None else state_dict
         delta = {k: v for k, v in full.items() if k in trainable}
         if not delta:
             raise ValueError("save_lora_only=True but no parameter requires grad — nothing to save.")
+        if self.config.training_mode == "lora" and not any("lora_" in k for k in trainable):
+            raise RuntimeError(
+                f"training_mode=lora but none of the {len(trainable)} trainable parameters is a "
+                "LoRA adapter, so this checkpoint would hold only the projectors. The adapters "
+                "were never injected on the object being saved."
+            )
+        # Belt and braces: whatever the naming, every trainable tensor has to reach the file.
+        missing = sorted(trainable - set(delta))
+        if missing:
+            raise RuntimeError(
+                f"{len(missing)} of {len(trainable)} trainable parameters are absent from the "
+                f"state dict being saved, e.g. {missing[:5]}. Saving would silently discard them. "
+                "Under FSDP this means the gathered full state dict does not name them the way "
+                "`named_parameters()` does; use --policy.save_lora_only=false for a complete "
+                "checkpoint until that is resolved."
+            )
         total = sum(t.numel() * t.element_size() for t in delta.values())
         save_torch_state_dict(delta, str(save_directory), max_shard_size=max(total, 1))
         gear_checkpoint.write_adapter_manifest(
