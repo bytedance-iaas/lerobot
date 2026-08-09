@@ -265,11 +265,22 @@ class DreamZeroConfig(PreTrainedConfig):
     # block, 19.2 M adapters) but NOT `cross_attn.k_img` / `v_img`, the image-conditioning
     # projections — add `k_img,v_img` to include them (12 modules per block, 22.5 M).
     lora_target_modules: str = "q,k,v,o,ffn.0,ffn.2"
-    # Save only what training updated (~0.2 GB) instead of the full ~46 GB of weights, as
-    # upstream's LoRA script does. The checkpoint is then not self-contained: it records the base
-    # checkpoint it was trained from and reloads through it. Ignored when `training_mode="full"`,
-    # which rewrites the whole DiT and so has no frozen remainder worth deferring.
-    save_lora_only: bool = True
+    # Write only the parameters training updated, instead of every weight. Lossless: what is left
+    # out is bit-identical to the base checkpoint, which the saved manifest names and the loader
+    # reads back. Not low-rank and not an approximation — a `full` run stores its 16,484 M dense
+    # DiT weights and merely omits the 6,440 M text/image/VAE encoders that `WANPolicyHead` freezes
+    # in every mode.
+    #
+    #   lora, rank 4    108.6 M    0.4 GB   instead of 46 GB
+    #   full         16,484.0 M   66.0 GB   instead of 92 GB (fp32 master under FSDP)
+    #
+    # The cost is that the checkpoint is not self-contained; loading raises rather than guess if
+    # the base has moved. Set false for a standalone checkpoint.
+    save_trainable_only: bool = True
+    # Deprecated spelling of `save_trainable_only`. The old name described the LoRA case only,
+    # which misled once the same mechanism started applying to `full` runs. Set it and it still
+    # wins, with a warning.
+    save_lora_only: bool | None = None
     tune_projector: bool = True
     tune_diffusion_model: bool = True
 
@@ -297,6 +308,13 @@ class DreamZeroConfig(PreTrainedConfig):
             raise ValueError(
                 f"Unknown training_mode {self.training_mode!r}; expected one of {list(TRAINING_MODES)}."
             )
+        if self.save_lora_only is not None:
+            logger.warning(
+                "save_lora_only is deprecated (it stores every trainable parameter, not just LoRA "
+                "ones, and now applies to `full` too); use save_trainable_only=%s.",
+                self.save_lora_only,
+            )
+            self.save_trainable_only = self.save_lora_only
         if self.lora_rank < 1:
             raise ValueError(f"lora_rank must be >= 1, got {self.lora_rank}.")
         if self.model_variant not in _DIT_PRESETS:

@@ -93,7 +93,7 @@ class DreamZeroPolicy(PreTrainedPolicy):
         # fine-tuned checkpoint that lost them would decode actions as if unnormalized — wrong, but
         # not obviously so. Set by `from_pretrained`; stays None for a freshly-initialised policy.
         self.checkpoint_statistics: dict | None = None
-        # Where the frozen weights came from. Recorded so a `save_lora_only` checkpoint, which
+        # Where the frozen weights came from. Recorded so a `save_trainable_only` checkpoint, which
         # stores only the trainable delta, can say what it needs to be loaded against.
         self.base_checkpoint_path: str | None = None
 
@@ -194,7 +194,7 @@ class DreamZeroPolicy(PreTrainedPolicy):
             raise FileNotFoundError(
                 f"{path} stores only the trainable delta and needs its base checkpoint "
                 f"{base!r}, which is not present. Restore it, or re-run the fine-tune with "
-                f"--policy.save_lora_only=false to get a self-contained checkpoint."
+                f"--policy.save_trainable_only=false to get a self-contained checkpoint."
             )
         if config is None:
             config = PreTrainedConfig.from_pretrained(path)
@@ -239,9 +239,12 @@ class DreamZeroPolicy(PreTrainedPolicy):
     def _saves_adapter_only(config: DreamZeroConfig) -> bool:
         """Whether `_save_pretrained` writes only the trainable delta.
 
+        True for both modes: even a `full` run leaves the 6,440 M text/image/VAE encoders frozen
+        and bit-identical to the base, so rewriting them costs ~26 GB per checkpoint for nothing.
+
         Static so it can be checked against a config without constructing 23B parameters.
         """
-        return config.training_mode == "lora" and config.save_lora_only
+        return config.save_trainable_only
 
     def _save_adapter(self, save_directory: Path, state_dict: dict[str, Tensor] | None) -> None:
         """Write only the parameters training updated, plus a manifest naming the base checkpoint.
@@ -258,9 +261,9 @@ class DreamZeroPolicy(PreTrainedPolicy):
 
         if self.base_checkpoint_path is None:
             raise ValueError(
-                "save_lora_only=True needs the base checkpoint this run started from, but this "
+                "save_trainable_only=True needs the base checkpoint this run started from, but this "
                 "policy was not loaded from one. Load through `from_pretrained`, or set "
-                "`--policy.save_lora_only=false` to write complete weights."
+                "`--policy.save_trainable_only=false` to write complete weights."
             )
         self.config._save_pretrained(save_directory)
         # `accelerator.unwrap_model` strips only the OUTERMOST FSDP wrapper, so with a per-block
@@ -273,7 +276,7 @@ class DreamZeroPolicy(PreTrainedPolicy):
         full = self.state_dict() if state_dict is None else state_dict
         delta = {k: v for k, v in full.items() if k in trainable}
         if not delta:
-            raise ValueError("save_lora_only=True but no parameter requires grad — nothing to save.")
+            raise ValueError("save_trainable_only=True but no parameter requires grad — nothing to save.")
         if self.config.training_mode == "lora" and not any("lora_" in k for k in trainable):
             raise RuntimeError(
                 f"training_mode=lora but none of the {len(trainable)} trainable parameters is a "
@@ -287,7 +290,7 @@ class DreamZeroPolicy(PreTrainedPolicy):
                 f"{len(missing)} of {len(trainable)} trainable parameters are absent from the "
                 f"state dict being saved, e.g. {missing[:5]}. Saving would silently discard them. "
                 "Under FSDP this means the gathered full state dict does not name them the way "
-                "`named_parameters()` does; use --policy.save_lora_only=false for a complete "
+                "`named_parameters()` does; use --policy.save_trainable_only=false for a complete "
                 "checkpoint until that is resolved."
             )
         total = sum(t.numel() * t.element_size() for t in delta.values())
