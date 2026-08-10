@@ -62,6 +62,23 @@ RUN apt-get update \
     && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys /root/.ssh/id_ed25519 \
     && sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
 
+# --- RDMA userspace, so NCCL can actually use the RoCE NICs ------------------- #
+# The nodes expose /dev/infiniband/uverbs* into the container, but the image had no
+# userspace stack at all — so NCCL logged `Failed to open libibverbs.so[.1]` and fell back
+# to TCP *silently*: multi-node training still ran, just over a fraction of the available
+# bandwidth, with nothing in the output saying so.
+#   libibverbs1       — the verbs library NCCL dlopen()s
+#   ibverbs-providers — THE critical one: the userspace device drivers (libmlx5). Without it
+#                       libibverbs loads but enumerates ZERO devices, which looks identical
+#                       to having no RDMA at all.
+#   ibverbs-utils     — ibv_devinfo / ibv_devices, so the M0b check can inspect port state,
+#                       link_layer (RoCE vs IB) and GIDs from inside the pod.
+# librdmacm1 is not packaged separately on Debian 13 (rdma-core provides it); NCCL does not
+# need it for the IB transport. Verify with NCCL_DEBUG=INFO showing NET/IB, never assume.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libibverbs1 ibverbs-providers ibverbs-utils \
+    && rm -rf /var/lib/apt/lists/*
+
 # --- oniond: Volcengine TOS model/dataset downloader (onion-ai-data) ---------- #
 # The skill prefers oniond for external models/datasets (fast, TOS-local, no AK/SK), then
 # falls back to HF (hf-mirror) — see vendor/robot_sft/scripts/fetch.py. Install like
