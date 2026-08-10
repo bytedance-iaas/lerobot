@@ -195,22 +195,45 @@ python src/lerobot/async_inference/robot_client.py \
 把 **NVIDIA GEAR 的 DreamZero** 移植成了 LeRobot 树内策略（注册名 `dreamzero`）。它不是常规 VLA，而是基于 **Wan 视频扩散**的 **World Action Model**：一个因果 DiT 在同一条 token 序列里**联合去噪「视频 latent + 动作寄存器 + 状态寄存器」**，推理时用 KV-cache 逐 block 自回归地吐出 action chunk——即"一边预测未来画面、一边输出动作"。
 
 - **原生推理，不走 vllm**：移植的是上游自己的 PyTorch KV-cache 因果推理路径（`lazy_joint_video_action`），包进 LeRobot 的 `select_action` / `predict_action_chunk`；远程部署直接复用 LeRobot 自带的 gRPC `PolicyServer`。
-- **两档模型**：`wan21_14b`（DreamZero-DROID/AgiBot，VAE 16ch）与 `wan22_5b`（Wan2.2-TI2V-5B，VAE38 48ch / 160×320）。
-- **checkpoint 转换器**：把 NVIDIA 发布的 `GEAR-Dreams/DreamZero-*`（GEAR `VLA` 布局）转成 LeRobot checkpoint（`config.json` + `model.safetensors` + `statistics.json`），转完即可 `from_pretrained` 加载。
-- **离线开环评估**:留出 episode 逐帧回放，输出 action MSE（与 fp8 无关，纯 bf16 也可用）。
-- **SFT（LoRA）**:LoRA + 冻结 VAE/文本/图像编码器已在动作头内接好，训练侧的动作打包（q99 归一化 + 相对动作）已实现。
-- **当前状态(如实说明)**:归一化/视角拼接/相对动作解码等数值逻辑已有 CPU 单测锁定;**GPU 端到端与官方 checkpoint 的数值对齐仍待在 H20 上验证**——`processor` 的 umt5 tokenizer 路径与官方权重的精确配置需要实机确认后才算完成。
+- **移植保真度**：模型核心与上游源码**按函数逐一 diff 校验，254 个函数中 249 个逐字节一致**（2245 行的联合视频+动作因果 DiT 是 35/35 一致，VAE 56/56）；不一致的 5 个都是刻意的（去 hydra `instantiate`、TensorRT 路径改为报错等）并已逐条记录。
+- **无需转换，直接加载官方 checkpoint**：`gear_checkpoint.py` 直接读 `GEAR-Dreams/DreamZero-DROID` 自带的 `config.json`（几何）、`experiment_cfg/conf.yaml`（state/action 拼接顺序）与 `metadata.json`（q01/q99 统计），**没有转换步骤**。
+- **只支持 14B**（`wan21_14b`）：这不是偷懒——它是**唯一有已发布权重**的骨干；Wan2.2-TI2V-5B 在上游只是从基础组件冷启动、没有可对照的官方 checkpoint，带一条无法验证的代码路径不如不带。加载时按名字校验，几何不符直接拒绝。
+- **离线开环评估：已端到端跑通**（`DreamZero-DROID` × `lerobot/droid_1.0.1`）。不止报 MSE——绝对关节角下"原地不动"就能拿到很低的 MSE，所以同时给出 `hold_state_mse`（不动基线，必须被打败）、`delta_corr`（预测位移与真实位移的相关性）、`delta_slope`（幅度是否标定），避免被漂亮的 MSE 骗了。
+- **SFT 已跑通**：`lerobot-train` 直接微调官方 checkpoint，支持 **单卡 / 8 卡 LoRA** 与 **8 卡 FSDP 全参微调**；文本/图像/VAE 编码器由动作头自行冻结。
+- **换机器人（新 embodiment）**：通用 2×2 画布 + 自动生成的视角描述 prompt + 帧率拉伸，**8 卡 SO-101 微调已跑通**。
+
+**一个值得说的实测结论**：把 DROID checkpoint 迁到 SO-101（60 条示教，10 条留出集开环打分）——
+
+| | action MSE | 对比"原地不动"(126.7) | 赢的 episode | delta corr |
+|---|---|---|---|---|
+| 原始 checkpoint | 197.1 | 更差 | 0/10 | -0.088 |
+| `lora` rank 4 | 256.4 | 更差 | 0/10 | -0.239 |
+| `lora` rank 32 | 158.8 | 更差 | 3/10 | 0.320 |
+| **`full` 全参** | **79.7** | **好 37%** | **10/10** | **0.633** |
+
+**换本体时 LoRA 不够用**：提高 rank 会让运动方向单调变好，但没有任何 rank 打赢"输出当前状态不动"——新机器人需要的改变不在低秩子空间里。（这个结论只针对**换本体**；同一机器人上用 LoRA 是上游自己的用法，我们没测。）另外步数不是瓶颈：3000 步反而比 1000 步各项指标都差，**上限在数据不在优化**。
 
 ```bash
-# 1) 转换官方 checkpoint
-python -m lerobot.policies.dreamzero.scripts.convert_dreamzero_checkpoint \
-    --src <GEAR-Dreams/DreamZero-DROID 本地目录> --dst <lerobot 格式输出目录> \
-    --embodiment-tag oxe_droid --model-variant wan22_5b
+# 1) 拉官方 checkpoint（tensorrt/ 是 19GB 的 Blackwell 专用资产，排除）
+hf download GEAR-Dreams/DreamZero-DROID --local-dir /data/models/DreamZero-DROID --exclude 'tensorrt/*'
 
-# 2) 留出集离线开环评估
-python -m lerobot.policies.dreamzero.scripts.offline_eval \
-    --checkpoint <上一步输出> --repo-id <留出数据集> --episode 0 --device cuda
+# 2) 留出集离线开环评估（无需转换，直接指向 checkpoint 目录）
+uv run python examples/eval_open_loop.py \
+    --policy.path=/data/models/DreamZero-DROID \
+    --dataset.repo_id=lerobot/droid_1.0.1 --dataset.root=/data/datasets/droid_1.0.1 \
+    --episodes='[1,2,3,7,8,9]' --max_frames_per_episode=96 --device=cuda
+
+# 3) 继续 SFT。注意用 --policy.type + --policy.pretrained_path，不是 --policy.path
+#    （后者会走 PreTrainedConfig.from_pretrained，解析不了 GEAR 的 config.json）
+lerobot-train --policy.type=dreamzero \
+    --policy.pretrained_path=/data/models/DreamZero-DROID \
+    --policy.training_mode=lora \        # 换本体请用 full，理由见上表
+    --dataset.repo_id=lerobot/droid_1.0.1 --dataset.episodes='[0,1,2,3]' \
+    --batch_size=1 --steps=2 --output_dir=outputs/train/dreamzero_smoke
 ```
+
+> `--policy.training_mode` **务必显式写**（即使 `lora` 是默认）：两种模式训练的参数量差两个数量级（0.47% vs 71.9%）、产物差 200 倍（208MB vs 46GB），不写的命令事后无法复现。启动时会打印实际生效的模式作为权威记录。
+> **限制**：`num_envs == 1`（KV cache 无 batch 语义）。新 embodiment 的策略质量尚未系统评估。
 
 ---
 
