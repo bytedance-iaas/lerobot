@@ -17,8 +17,8 @@
 """Pre/post processing for the DreamZero policy.
 
 Faithful port of DreamZero's ``ComposedModalityTransform`` inference path for the
-oxe_droid / DROID embodiment (see ``dreamzero_port_plan.md`` M2 and the upstream
-sources cited inline). The preprocessor turns a LeRobot observation into DreamZero's
+oxe_droid / DROID embodiment (see the upstream sources cited inline, and this policy's
+README.md). The preprocessor turns a LeRobot observation into DreamZero's
 action-input dict (``images`` / ``text`` / ``text_attention_mask`` / ``text_negative``
 / ``text_attention_mask_negative`` / ``state`` / ``embodiment_id``); the postprocessor
 unnormalizes the predicted chunk and converts relative joint deltas back to absolute.

@@ -18,7 +18,7 @@
 
 These lock the deterministic parts of the port — q99 (de)normalization, the oxe_droid
 multi-view stitch, per-view crop/resize, and the relative->absolute action decode — against
-the upstream DreamZero semantics (dreamzero_port_plan.md M2). The umt5 tokenizer path and the
+the upstream DreamZero semantics. The umt5 tokenizer path and the
 GPU model are validated separately (they need the released checkpoint + a GPU).
 """
 
