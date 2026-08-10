@@ -523,18 +523,22 @@ PORT_ACTIVE`. Check `link_layer`:
   needs `NCCL_IB_GID_INDEX=<n>` (pick the v2/IPv4 GID for the right interface from
   `/sys/class/infiniband/<dev>/ports/1/gids/`).
 
-**2. Pick the HCA by GPU affinity, PER NODE.** `nvidia-smi topo -m` shows GPU↔NIC distance; choose
-the `PIX` (same PCIe switch) NIC. ⚠️ **This is the one legitimate exception to "the same command on
-every node"**: the nearest HCA can differ per machine (e.g. master `mlx5_3`, worker `mlx5_4`), so
-`NCCL_IB_HCA` is set **per node**, while every `lerobot-train` flag stays identical. With several
-GPUs per node, list several HCAs (`NCCL_IB_HCA=mlx5_0,mlx5_1,…`) — pinning one NIC caps you at that
-NIC's bandwidth.
+**2. Pick the HCA by GPU affinity, PER NODE — always measure, never assume a device name.**
+Run `nvidia-smi topo -m` **on each node** and take the NIC marked `PIX` (same PCIe switch) for the
+GPU(s) that node trains with. ⚠️ **This is the one legitimate exception to "the same command on
+every node"**: the nearest HCA genuinely differs per machine, so `NCCL_IB_HCA` is set **per node**
+while every `lerobot-train` flag stays identical. With several GPUs per node, list several HCAs —
+pinning one NIC caps you at that NIC's bandwidth.
+> Device names like `mlx5_3` are **per-machine facts, not constants** — never copy one from these
+> docs or from another cluster. `multinode.py check` prints each node's topology row for exactly
+> this reason.
 
-**3. Env, set per node:**
+**3. Env, set per node** (every `<…>` below is measured on that node, not copied):
 ```bash
-export NCCL_IB_DISABLE=0            # 1 forces TCP — never set it to 1 "to test"
-export NCCL_IB_HCA=<this node's nearest HCA>
-export NCCL_SOCKET_IFNAME=eth0      # bootstrap/out-of-band only, NOT the data path
+export NCCL_IB_DISABLE=0                  # 1 forces TCP — never set it to 1 "to test"
+export NCCL_IB_HCA=<this node's PIX HCA>  # from nvidia-smi topo -m ON THIS NODE
+export NCCL_SOCKET_IFNAME=<data iface>    # bootstrap/out-of-band only, NOT the data path;
+                                          # get it from `ip -o -4 addr` (often eth0, don't assume)
 # RoCE only, if the default GID is wrong:  export NCCL_IB_GID_INDEX=<n>
 ```
 
