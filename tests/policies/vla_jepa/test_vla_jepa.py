@@ -455,7 +455,8 @@ def test_postprocessor_applied_after_predict_action_chunk(
     cfg.binarize_gripper_action = False
     policy = VLAJEPAPolicy(cfg)
     policy.eval()
-    monkeypatch.setattr(policy.model, "predict_action", lambda *a, **kw: raw_actions.clone())
+    # predict_action returns (actions, action_tokens); action_tokens is None with feedback off.
+    monkeypatch.setattr(policy.model, "predict_action", lambda *a, **kw: (raw_actions.clone(), None))
 
     dataset_stats = _make_dataset_stats()
     _, postprocessor = make_vla_jepa_pre_post_processors(cfg, dataset_stats)
@@ -598,3 +599,157 @@ def test_excess_views_trimmed_for_world_model(patch_vla_jepa_external_models: No
 
     # Only B*2 items must reach the encoder, not B*3.
     assert len(captured_videos) == BATCH_SIZE * 2
+
+
+# ---------------------------------------------------------------------------
+# World-model prediction-error feedback: action-token exposure
+# ---------------------------------------------------------------------------
+
+
+def test_predict_action_returns_no_tokens_when_feedback_disabled(
+    patch_vla_jepa_external_models: None,
+) -> None:
+    policy = VLAJEPAPolicy(make_config(enable_wm_feedback=False))
+    policy.eval()
+    inputs = policy._prepare_model_inputs(make_inference_batch(), training=False)
+
+    actions, action_tokens = policy.model.predict_action(
+        inputs["images"], inputs["instructions"], inputs.get("state")
+    )
+    assert actions.shape == EXPECTED_ACTION_CHUNK_SHAPE
+    assert action_tokens is None
+
+
+def test_predict_action_returns_tokens_when_feedback_enabled(
+    patch_vla_jepa_external_models: None,
+) -> None:
+    policy = VLAJEPAPolicy(make_config(enable_wm_feedback=True))
+    policy.eval()
+    inputs = policy._prepare_model_inputs(make_inference_batch(), training=False)
+
+    actions, action_tokens = policy.model.predict_action(
+        inputs["images"], inputs["instructions"], inputs.get("state")
+    )
+    assert actions.shape == EXPECTED_ACTION_CHUNK_SHAPE
+    assert action_tokens is not None
+    assert action_tokens.ndim == 3
+    assert action_tokens.shape[0] == BATCH_SIZE
+    assert action_tokens.shape[-1] == QWEN_HIDDEN_SIZE
+
+
+def test_predict_action_chunk_caches_action_tokens(patch_vla_jepa_external_models: None) -> None:
+    policy = VLAJEPAPolicy(make_config(enable_wm_feedback=True))
+    policy.eval()
+    assert policy._last_action_tokens is None
+
+    policy.predict_action_chunk(make_inference_batch())
+    assert policy._last_action_tokens is not None
+    assert policy._last_action_tokens.shape[0] == BATCH_SIZE
+
+
+def test_predict_action_chunk_return_type_unchanged(patch_vla_jepa_external_models: None) -> None:
+    """The public chunk API must stay a bare Tensor whether or not feedback is on."""
+    for enabled in (False, True):
+        policy = VLAJEPAPolicy(make_config(enable_wm_feedback=enabled))
+        policy.eval()
+        chunk = policy.predict_action_chunk(make_inference_batch())
+        assert isinstance(chunk, Tensor)
+        assert chunk.shape == EXPECTED_ACTION_CHUNK_SHAPE
+
+
+# ---------------------------------------------------------------------------
+# World-model prediction-error feedback: monitor lifecycle and replan gate
+# ---------------------------------------------------------------------------
+
+
+def test_monitor_absent_when_feedback_disabled(patch_vla_jepa_external_models: None) -> None:
+    policy = VLAJEPAPolicy(make_config(enable_wm_feedback=False))
+    assert policy.monitor is None
+    assert policy.last_wm_error is None
+
+
+def test_monitor_present_when_feedback_enabled(patch_vla_jepa_external_models: None) -> None:
+    policy = VLAJEPAPolicy(make_config(enable_wm_feedback=True))
+    assert policy.monitor is not None
+
+
+def test_select_action_populates_wm_error(patch_vla_jepa_external_models: None) -> None:
+    policy = VLAJEPAPolicy(make_config(enable_wm_feedback=True))
+    policy.eval()
+    batch = make_inference_batch()
+
+    policy.select_action(batch)
+    # tubelet_size=1 in tests, so the second observation completes the window.
+    policy.select_action(batch)
+    assert policy.last_wm_error is not None
+    assert policy.last_wm_error >= 0.0
+
+
+def test_zero_threshold_forces_replan_every_emit(patch_vla_jepa_external_models: None) -> None:
+    """A threshold of 0 makes every measured error 'surprising', so the queue never survives."""
+    policy = VLAJEPAPolicy(
+        make_config(enable_wm_feedback=True, wm_error_threshold=0.0, wm_replan_on_surprise=True)
+    )
+    policy.eval()
+    batch = make_inference_batch()
+
+    policy.select_action(batch)
+    policy.select_action(batch)
+    # The gate fired on the second step, refilling the queue, so exactly one action was popped
+    # from a freshly predicted chunk.
+    assert len(policy._queues[ACTION]) == N_ACTION_STEPS - 1
+
+
+def test_huge_threshold_never_replans_early(patch_vla_jepa_external_models: None) -> None:
+    policy = VLAJEPAPolicy(
+        make_config(enable_wm_feedback=True, wm_error_threshold=1e9, wm_replan_on_surprise=True)
+    )
+    policy.eval()
+    batch = make_inference_batch()
+
+    for _ in range(N_ACTION_STEPS):
+        policy.select_action(batch)
+    # The queue drained normally without an early refill.
+    assert len(policy._queues[ACTION]) == 0
+
+
+def test_replan_disabled_measures_but_does_not_gate(patch_vla_jepa_external_models: None) -> None:
+    policy = VLAJEPAPolicy(
+        make_config(enable_wm_feedback=True, wm_error_threshold=0.0, wm_replan_on_surprise=False)
+    )
+    policy.eval()
+    batch = make_inference_batch()
+
+    for _ in range(N_ACTION_STEPS):
+        policy.select_action(batch)
+    assert policy.last_wm_error is not None
+    assert len(policy._queues[ACTION]) == 0
+
+
+def test_reset_clears_monitor_state(patch_vla_jepa_external_models: None) -> None:
+    policy = VLAJEPAPolicy(make_config(enable_wm_feedback=True))
+    policy.eval()
+    batch = make_inference_batch()
+
+    policy.select_action(batch)
+    policy.select_action(batch)
+    assert policy.last_wm_error is not None
+
+    policy.reset()
+    assert policy.last_wm_error is None
+    assert policy.monitor.error_history == []
+    assert len(policy._queues[ACTION]) == 0
+
+
+def test_feedback_disabled_skips_all_monitor_work(patch_vla_jepa_external_models: None) -> None:
+    """With the flag off, no action tokens are gathered and no error is ever measured."""
+    policy = VLAJEPAPolicy(make_config(enable_wm_feedback=False))
+    policy.eval()
+    batch = make_inference_batch()
+
+    for _ in range(N_ACTION_STEPS + 1):
+        policy.select_action(batch)
+
+    assert policy.monitor is None
+    assert policy._last_action_tokens is None
+    assert policy.last_wm_error is None

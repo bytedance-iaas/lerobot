@@ -89,6 +89,15 @@ class VLAJEPAConfig(PreTrainedConfig):
     binarize_gripper_action: bool = True
     pre_snap_gripper_action: bool = True
     clip_normalized_actions: bool = True
+
+    # --- World-model prediction-error feedback (inference only) ---
+    # Master switch. When False every feedback code path is inert and behavior is
+    # byte-identical to a build without this feature.
+    enable_wm_feedback: bool = False
+    # Replan threshold on the monitor's scalar L1 error. None => monitor logs only, never gates.
+    wm_error_threshold: float | None = None
+    # Whether exceeding the threshold flushes the action queue and forces an early replan.
+    wm_replan_on_surprise: bool = True
     gripper_dim: int = 6
     gripper_threshold: float = 0.5
     torch_dtype: str = "bfloat16"
@@ -107,6 +116,13 @@ class VLAJEPAConfig(PreTrainedConfig):
         if self.freeze_qwen and self.enable_world_model:
             # freezing qwen backbone makes world model training irrelevant since no grad flows
             self.enable_world_model = False
+        if self.enable_wm_feedback and not self.enable_world_model:
+            raise ValueError(
+                "enable_wm_feedback requires enable_world_model=True: the feedback monitor "
+                "needs the V-JEPA encoder and the action-conditioned predictor."
+            )
+        if self.wm_error_threshold is not None and not self.enable_wm_feedback:
+            raise ValueError("wm_error_threshold requires enable_wm_feedback=True.")
         if self.n_action_steps > self.chunk_size:
             raise ValueError("`n_action_steps` must be <= `chunk_size`.")
         if self.num_video_frames < 2 * self.jepa_tubelet_size:
