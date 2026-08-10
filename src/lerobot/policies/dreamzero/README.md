@@ -388,10 +388,29 @@ and likewise takes its order from the checkpoint.
 
 ### `training_mode`
 
-| mode | trainable | when |
+| mode | trainable | cost |
 |---|---|---|
-| **`lora`** (default) | 108.6 M of 22,943 M (0.47%) | **what a fine-tune should normally use.** One GPU, 208 MB checkpoints. |
-| `full` | 16,484 M of 22,924 M (71.9%) | how upstream and RLinf train DROID. Here **for parity, not as a recommendation**: fp32 master weights sharded across ~8 GPUs at 57 GB each, and a 46 GB checkpoint per save. Reach for it only once LoRA has been shown not to be enough. |
+| **`lora`** (default) | 108.6 M of 22,943 M (0.47%) | one GPU at 42.5 GB, 0.2 GB checkpoints, 7.7 s/step |
+| `full` | 16,484 M of 22,924 M (71.9%) | ~8 GPUs at 57 GB each, 66 GB checkpoints, 7.1 s/step. Upstream's and RLinf's published DROID recipe. |
+
+**On a new embodiment, `full` is the one that works.** Fine-tuning the released DROID checkpoint
+on 60 episodes of SO-101 cube pick-and-place and scoring 10 held-out episodes open-loop:
+
+| | action MSE | vs. hold-state (126.7) | episodes won | delta corr |
+|---|---|---|---|---|
+| base checkpoint | 197.1 | worse | 0/10 | -0.088 |
+| `lora`, rank 4 | 256.4 | worse | 0/10 | -0.239 |
+| `lora`, rank 32 | 158.8 | worse | 3/10 | 0.320 |
+| `lora`, rank 128 | 176.1 | worse | 1/10 | 0.410 |
+| **`full`** | **79.7** | **37% better** | **10/10** | **0.633** |
+
+Raising the rank moves the direction of the predicted motion monotonically the right way, but no
+rank tested ever beat "output the current state unchanged" — the change a new robot needs is not
+in a low-rank subspace. Note also that more steps did not help: 3000 steps (1.11 epoch) scored
+*worse* than 1000 (0.38 epoch) on every metric, so the ceiling here is data, not optimisation.
+
+That result is specific to a change of embodiment. `lora` on the *same* robot — upstream's own
+use for it, e.g. their LIBERO configs starting from `DreamZero-DROID` — is untested here.
 
 Neither mode touches the text/image/VAE encoders — `WANPolicyHead` freezes those itself, which is
 why even `full` leaves 6,440 M parameters untouched.
