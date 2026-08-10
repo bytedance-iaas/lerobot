@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
 from collections import deque
 from collections.abc import Callable, Generator, Iterable, Iterator
 from pathlib import Path
@@ -338,6 +339,16 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
 
         self.num_shards = min(self.hf_dataset.num_shards, max_num_shards)
 
+        # Capture the DDP topology HERE, in the main process, where the process group is
+        # definitely initialized (lerobot-train builds the Accelerator before the dataset).
+        # `__iter__` runs inside DataLoader workers: forked workers inherit this state, but
+        # SPAWNED ones would see `is_initialized() == False` and silently fall back to
+        # rank 0 / world 1 — i.e. every rank reading the whole stream, with no error.
+        self._ddp_rank, self._ddp_world_size = 0, 1
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            self._ddp_rank = torch.distributed.get_rank()
+            self._ddp_world_size = torch.distributed.get_world_size()
+
     def _load_hf_dataset(self) -> datasets.IterableDataset:
         """Build the streaming HF dataset over the low-dim parquet shards.
 
@@ -386,7 +397,55 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
     # The current sequential iteration is a bottleneck. A producer-consumer pattern
     # could be used with a ThreadPoolExecutor to run `make_frame` (especially video decoding)
     # in parallel, feeding a queue from which this iterator will yield processed items.
+    def _ddp_shard_plan(self) -> tuple[list[int], int, int]:
+        """Split the stream across DDP ranks *and* DataLoader workers.
+
+        An ``IterableDataset`` has no sampler, so nothing else splits it: without this every
+        rank would iterate the SAME frames (duplicated gradients), which is why Accelerate
+        otherwise has to fall back to ``dispatch_batches`` — funnelling all data through rank 0
+        and moving each batch across processes (a bottleneck, and it cannot move the non-tensor
+        fields like ``task``). Sharding here lets every consumer read its own disjoint slice.
+
+        Returns ``(shard_ids, stride, offset)``. Normally the split is at *shard* granularity
+        (no duplicate reads). When there are fewer shards than consumers — common for small
+        datasets — shards cannot be divided, so every consumer reads all shards and takes every
+        ``stride``-th frame instead: still disjoint, at the cost of re-reading.
+        """
+        # Captured in __init__ (main process); see there for why we do not read it here.
+        rank, world_size = getattr(self, "_ddp_rank", 0), getattr(self, "_ddp_world_size", 1)
+
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id, num_workers = (worker_info.id, worker_info.num_workers) if worker_info else (0, 1)
+
+        consumer = rank * num_workers + worker_id
+        num_consumers = world_size * num_workers
+        if num_consumers == 1:
+            return list(range(self.num_shards)), 1, 0
+        if self.num_shards >= num_consumers:
+            return list(range(consumer, self.num_shards, num_consumers)), 1, 0
+
+        logging.warning(
+            "StreamingLeRobotDataset: %d shards < %d consumers (world_size=%d x num_workers=%d); "
+            "falling back to per-frame striding, so every consumer reads every shard. Raise "
+            "`max_num_shards` (or re-shard the dataset) to split at shard granularity instead.",
+            self.num_shards,
+            num_consumers,
+            world_size,
+            num_workers,
+        )
+        return list(range(self.num_shards)), num_consumers, consumer
+
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
+        shard_ids, stride, offset = self._ddp_shard_plan()
+        frames = self._iter_frames(shard_ids)
+        if stride == 1:
+            yield from frames
+            return
+        for i, frame in enumerate(frames):
+            if i % stride == offset:
+                yield frame
+
+    def _iter_frames(self, shard_ids: list[int]) -> Iterator[dict[str, torch.Tensor]]:
         if self.video_decoder_cache is None:
             self.video_decoder_cache = VideoDecoderCache()
 
@@ -397,7 +456,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
 
         idx_to_backtrack_dataset = {
             idx: self._make_backtrackable_dataset(safe_shard(self.hf_dataset, idx, self.num_shards))
-            for idx in range(self.num_shards)
+            for idx in shard_ids
         }
 
         # This buffer is populated while iterating on the dataset's shards

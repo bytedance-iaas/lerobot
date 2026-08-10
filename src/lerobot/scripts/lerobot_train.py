@@ -197,7 +197,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     from lerobot.utils.import_utils import require_package
 
     require_package("accelerate", extra="training")
-    from accelerate import Accelerator
+    from accelerate import Accelerator, DataLoaderConfiguration
     from accelerate.utils import DistributedDataParallelKwargs, DistributedType
 
     cfg.validate()
@@ -214,11 +214,18 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         # Drive Accelerate's autocast from policy.dtype (bf16/fp16 activate it; float32/absent -> launcher default).
         policy_dtype = getattr(cfg.trainable_config, "dtype", None)
         mixed_precision = {"bfloat16": "bf16", "float16": "fp16", "float32": "no"}.get(policy_dtype)
+        # dispatch_batches=False: every rank pulls its OWN batches. Accelerate otherwise defaults
+        # this to True for IterableDataset (our streaming datasets), which makes rank 0 read all
+        # data and ship each batch to the other ranks — a rank-0 bottleneck, and it cannot move
+        # non-tensor fields (the `task` instruction string) across processes at all.
+        # StreamingLeRobotDataset now splits itself across ranks/workers (`_ddp_shard_plan`), so
+        # dispatching would ALSO re-split the already-split stream, leaving each rank with 1/N².
         accelerator = Accelerator(
             step_scheduler_with_optimizer=False,
             mixed_precision=mixed_precision,
             kwargs_handlers=[ddp_kwargs],
             cpu=force_cpu,
+            dataloader_config=DataLoaderConfiguration(dispatch_batches=False),
         )
 
     init_logging(accelerator=accelerator)
