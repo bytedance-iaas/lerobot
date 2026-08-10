@@ -248,12 +248,17 @@ class DreamZeroConfig(PreTrainedConfig):
     # Which parameters fine-tuning updates. The released checkpoint is the starting point
     # (continued training), not a cold start from the base Wan weights:
     #   "lora"   — the default. The action/state projectors (89.4 M) plus rank-`lora_rank` adapters
-    #              on the DiT blocks (19.2 M at rank 4). Fits on one GPU, and its checkpoints are
-    #              ~0.2 GB rather than ~46 GB. This is what a fine-tune should normally use.
-    #   "full"   — the whole DiT incl. projectors (16.48 B). This is how upstream and RLinf train
-    #              DROID, and it is here for parity with them, not as a recommendation: it needs
-    #              fp32 master weights sharded across ~8 GPUs (57 GB each) and writes a 46 GB
-    #              checkpoint per save. Reach for it only when LoRA has been shown not to be enough.
+    #              on the DiT blocks (19.2 M at rank 4). One GPU at 42.5 GB, 0.2 GB checkpoints.
+    #   "full"   — the whole DiT incl. projectors (16.48 B), which is how upstream and RLinf train
+    #              DROID. Needs fp32 master weights sharded across ~8 GPUs (57 GB each) and writes
+    #              a 66 GB checkpoint per save.
+    #
+    # For a change of EMBODIMENT, "full" is the mode that works: fine-tuning the released DROID
+    # checkpoint on SO-101 and scoring held-out episodes open-loop, `full` beat the "hold the
+    # current state" baseline on 10 of 10 episodes (action MSE 79.7 vs 126.7) while ranks 4, 32 and
+    # 128 lost on every one of them — raising the rank improved the predicted direction monotonically
+    # but never enough. See the README for the table. Using "lora" on the SAME robot, which is what
+    # upstream ships it for, is untested here.
     # The text/image/VAE encoders are frozen in both modes (WANPolicyHead does that itself), which
     # is why even "full" leaves 6.44 B parameters untouched.
     training_mode: str = "lora"
