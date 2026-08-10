@@ -168,7 +168,32 @@ def cmd_check(a) -> int:
         r.check(f"{w}: GPUs idle", all(u < 1024 for u in used) if used else False,
                 f"in use: {out.strip()} — run `multinode.py clean` first" if used else out)
 
-        # 8. output_dir must NOT exist: lerobot-train aborts on an existing dir without --resume
+        # 8. RDMA. Gradient all-reduce is the cross-node bottleneck; if these NICs exist NCCL
+        #    should use them, but a misconfig makes it fall back to TCP SILENTLY (no error, just
+        #    many times slower). Report capability here; only a NCCL_DEBUG=INFO run showing
+        #    "NET/IB" proves it is actually used (see SKILL.md M0b).
+        rc, out = run_remote(w, "ls /dev/infiniband/uverbs* 2>/dev/null | wc -l")
+        n_uverbs = int(out.strip().splitlines()[-1]) if out.strip().split() and out.strip().splitlines()[-1].strip().isdigit() else 0
+        if n_uverbs:
+            rc, act = run_remote(
+                w, "for d in /sys/class/infiniband/*; do "
+                   "s=$(cat $d/ports/1/state 2>/dev/null); l=$(cat $d/ports/1/link_layer 2>/dev/null); "
+                   "case \"$s\" in *ACTIVE*) echo \"$(basename $d):$l\";; esac; done")
+            actives = [x for x in act.splitlines() if ":" in x]
+            r.check(f"{w}: RDMA devices ACTIVE", bool(actives),
+                    "uverbs present but no port ACTIVE — NCCL will fall back to TCP",
+                    ok_detail=" ".join(actives))
+            if any(x.strip().endswith("Ethernet") for x in actives):
+                print(f"       note: RoCE (link_layer=Ethernet) — needs a valid GID bound to the "
+                      f"data NIC; may need NCCL_IB_GID_INDEX. Verify with NCCL_DEBUG=INFO -> NET/IB.")
+            # Nearest NIC per GPU (PIX = same PCIe switch) — NCCL_IB_HCA is set PER NODE.
+            rc, topo = run_remote(w, "nvidia-smi topo -m 2>/dev/null | grep -iE '^GPU0' | head -1")
+            if topo.strip():
+                print(f"       topo GPU0: {topo.strip()[:110]}")
+        else:
+            print(f"[INFO] {w}: no /dev/infiniband/uverbs* — no RDMA, NCCL will use TCP")
+
+        # 9. output_dir must NOT exist: lerobot-train aborts on an existing dir without --resume
         if a.output_dir:
             rc, out = run_remote(w, f"test -e {shlex.quote(a.output_dir)} && echo exists || echo clean")
             r.check(f"{w}: output_dir clean", out.strip().endswith("clean"),

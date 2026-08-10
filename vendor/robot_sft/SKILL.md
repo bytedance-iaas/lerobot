@@ -509,6 +509,46 @@ Why these specific gates — each one is a failure we hit and misdiagnosed:
 still a separate, later gate: M0 proves the nodes can talk, the smoke test proves accelerate/NCCL
 actually rendezvous and train.
 
+### M0b — RDMA (RoCE / InfiniBand): prefer it, and PROVE you got it
+Gradient all-reduce is the cross-node bottleneck, and it runs over NCCL. If the nodes have RDMA
+NICs, NCCL should use them — **but when anything is misconfigured NCCL silently falls back to TCP:
+no error, no warning, just a run that is many times slower.** Never assume; verify.
+
+**1. Detect the hardware** (per node): `ls /dev/infiniband/uverbs*` must exist and be readable by
+the container, and `ibv_devinfo` (or `/sys/class/infiniband/*/ports/1/`) should show `state:
+PORT_ACTIVE`. Check `link_layer`:
+- `InfiniBand` — native IB, usually works once the device is visible.
+- **`Ethernet` — this is RoCE**, and it additionally needs a valid **GID** bound to the data
+  interface. A device that is ACTIVE with no usable GID still fails over to TCP. RoCEv2 often
+  needs `NCCL_IB_GID_INDEX=<n>` (pick the v2/IPv4 GID for the right interface from
+  `/sys/class/infiniband/<dev>/ports/1/gids/`).
+
+**2. Pick the HCA by GPU affinity, PER NODE.** `nvidia-smi topo -m` shows GPU↔NIC distance; choose
+the `PIX` (same PCIe switch) NIC. ⚠️ **This is the one legitimate exception to "the same command on
+every node"**: the nearest HCA can differ per machine (e.g. master `mlx5_3`, worker `mlx5_4`), so
+`NCCL_IB_HCA` is set **per node**, while every `lerobot-train` flag stays identical. With several
+GPUs per node, list several HCAs (`NCCL_IB_HCA=mlx5_0,mlx5_1,…`) — pinning one NIC caps you at that
+NIC's bandwidth.
+
+**3. Env, set per node:**
+```bash
+export NCCL_IB_DISABLE=0            # 1 forces TCP — never set it to 1 "to test"
+export NCCL_IB_HCA=<this node's nearest HCA>
+export NCCL_SOCKET_IFNAME=eth0      # bootstrap/out-of-band only, NOT the data path
+# RoCE only, if the default GID is wrong:  export NCCL_IB_GID_INDEX=<n>
+```
+
+**4. PROVE it — the whole point.** Run a 2-node NCCL all-reduce (or the multi-node smoke test)
+with `NCCL_DEBUG=INFO` and read the transport line:
+- **`NET/IB`** → RDMA is in use ✅
+- **`NET/Socket`** → it fell back to TCP ❌ — fix it before burning GPU-hours; do not proceed and
+  call it "working".
+Also scan for `NCCL WARN`, GID/HCA selection errors, and "no usable device" notes. Report which
+transport was selected; "the job started" is NOT evidence of RDMA.
+
+This check is cheap (tens of seconds) and belongs **before** the real run — a run that quietly
+trains over TCP looks healthy on every dashboard while wasting most of the interconnect.
+
 **Plan with cross-node totals (steps math) but master-local eval:** run `plan_training.py` with
 **`--gpus <TOTAL GPUs across ALL nodes>`** (so `global_batch = batch × total_processes` and the
 steps/save_freq math is right) **and `--cuda <master-local training GPU indices>`** (so the
@@ -562,7 +602,9 @@ throwaway `--output_dir`, and confirm every rank reaches step 2 and the master w
 it kills leftover ranks, verifies the GPUs actually came back, and removes the dir everywhere.
 lerobot-train aborts on an existing output_dir without `--resume`, and an orphaned rank still
 holding GPU memory makes the retry OOM — so skipping this makes every retry fail identically.
-Debug aids: `NCCL_DEBUG=INFO`; if rendezvous connects but NCCL hangs on a multi-NIC node, set
+Run the smoke test with **`NCCL_DEBUG=INFO`** and confirm the transport line says **`NET/IB`**
+(RDMA) and not `NET/Socket` (silent TCP fallback) — see M0b; this is the cheapest place to catch it.
+Other aids: if rendezvous connects but NCCL hangs on a multi-NIC node, set
 `NCCL_SOCKET_IFNAME=<iface>`. Note NCCL also uses **ephemeral ports beyond 29500** — open
 node↔node traffic, not just one port; and if two trainings share a master box, give each a
 distinct `--main_process_port`.
