@@ -59,6 +59,7 @@ from lerobot.utils.constants import (
 )
 
 from ..pi_te_fp8 import (
+    StateDictLoadError,
     build_vlm_mlp_fp8_recipe,
     configure_vlm_mlp_fp8,
     get_mlp_weight_dtype,
@@ -1119,7 +1120,7 @@ class PI0Policy(PreTrainedPolicy):
 
             # Honor strict for any REMAINING (genuine) gap — after the fp8 _extra_state is excluded.
             if strict and (missing_keys or unexpected_keys):
-                raise RuntimeError(
+                raise StateDictLoadError(
                     f"Error(s) in loading state_dict for {type(model).__name__}: "
                     f"{len(missing_keys)} missing and {len(unexpected_keys)} unexpected key(s) "
                     "remain after excluding expected fp8 _extra_state buffers."
@@ -1148,6 +1149,9 @@ class PI0Policy(PreTrainedPolicy):
             if not missing_keys and not unexpected_keys:
                 print("All keys loaded successfully!")
 
+        except StateDictLoadError:
+            # A genuine key mismatch must fail loud — don't return a partially random model.
+            raise
         except Exception as e:
             print(f"Warning: Could not load state dict: {e}")
 
