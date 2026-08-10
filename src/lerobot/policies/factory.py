@@ -46,10 +46,10 @@ from lerobot.utils.feature_utils import dataset_to_policy_features
 
 from .act.configuration_act import ACTConfig
 from .diffusion.configuration_diffusion import DiffusionConfig
+from .dreamzero.configuration_dreamzero import DreamZeroConfig
 from .eo1.configuration_eo1 import EO1Config
 from .evo1.configuration_evo1 import Evo1Config
 from .fastwam.configuration_fastwam import FastWAMConfig
-from .dreamzero.configuration_dreamzero import DreamZeroConfig
 from .gaussian_actor.configuration_gaussian_actor import GaussianActorConfig
 from .groot.configuration_groot import GrootConfig
 from .lingbot_va.configuration_lingbot_va import LingBotVAConfig
@@ -309,6 +309,22 @@ def make_pre_post_processors(
             policy configuration type.
     """
     if pretrained_path:
+        if isinstance(policy_cfg, DreamZeroConfig):
+            # Like GR00T below, DreamZero carries its normalization statistics in the checkpoint
+            # (a released NVIDIA one keeps them in experiment_cfg/metadata.json) rather than in a
+            # serialized processor pipeline, so there is no policy_preprocessor.json to load.
+            from .dreamzero.processor_dreamzero import (
+                make_dreamzero_pre_post_processors_from_pretrained,
+            )
+
+            return make_dreamzero_pre_post_processors_from_pretrained(
+                config=policy_cfg,
+                pretrained_path=pretrained_path,
+                dataset_stats=kwargs.get("dataset_stats"),
+                preprocessor_overrides=kwargs.get("preprocessor_overrides"),
+                postprocessor_overrides=kwargs.get("postprocessor_overrides"),
+            )
+
         if isinstance(policy_cfg, GrootConfig):
             from .groot.processor_groot import make_groot_pre_post_processors_from_pretrained
 

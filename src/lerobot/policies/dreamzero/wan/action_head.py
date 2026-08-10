@@ -79,6 +79,7 @@ def _component_kwargs(cfg):
 
 KVCacheType: TypeAlias = torch.Tensor
 
+
 @dataclass
 class WANPolicyHeadConfig:
     add_pos_embed: bool = field(
@@ -216,6 +217,10 @@ class WANPolicyHead(ActionHead):
         self.kv_cache_neg: KVCacheType | None = None
         self.crossattn_cache: KVCacheType | None = None
         self.crossattn_cache_neg: KVCacheType | None = None
+        # Upstream only assigns this in `post_initialize`, which also torch.compiles the encoders.
+        # `_run_diffusion_steps` reads it on every step, so it must exist from construction —
+        # otherwise inference without that (optional, slow-to-warm-up) hook raises AttributeError.
+        self.trt_engine = None
 
         self.global_step = 0
         self.max_steps = 0
@@ -237,20 +242,13 @@ class WANPolicyHead(ActionHead):
         self.dynamic_cache_schedule = os.getenv("DYNAMIC_CACHE_SCHEDULE", "False").lower() == "true"
 
 
-        num_dit_steps = 8
-        if os.getenv("NUM_DIT_STEPS") is not None:
-            num_dit_steps = int(os.getenv("NUM_DIT_STEPS"))
-        if num_dit_steps == 5:
-            self.dit_step_mask = [True, True, True, False, False, False, False, True, False, False, False, False, True, False, False, False]
-        elif num_dit_steps == 6:
-            self.dit_step_mask = [True, True, False, False, False, True, False, False, False, False, True, False, False, False, True, True]
-        elif num_dit_steps == 7:
-            self.dit_step_mask = [True, True, True, False, False, False, True, False, False, False, True, False, False, False, True, True]
-        elif num_dit_steps == 8:
-            self.dit_step_mask = [True, True, True, False, False, False, True, False, False, False, True, False, False, True, True, True]
-        else:
-            self.dit_step_mask = [True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True]
-        assert self.dit_step_mask[0] == True, "first step must be True"
+        # Upstream ships hand-tuned schedules that evaluate the DiT on only 5-8 of the 16
+        # diffusion steps (reusing the previous prediction on the rest), selected by a
+        # NUM_DIT_STEPS env var and defaulting to 8. This port always runs all 16. Measured on
+        # DROID the skip schedule was not faster-and-equal but faster-and-slightly-different, and
+        # an approximation that is on by default silently taints every measurement taken with it
+        # — including any parity comparison against upstream.
+        self.dit_step_mask = [True] * self.num_inference_steps
 
         self.normalize_video = v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 
@@ -269,27 +267,34 @@ class WANPolicyHead(ActionHead):
         self.action_horizon = config.action_horizon
         self.num_inference_timesteps = config.num_inference_timesteps
         
-        text_enc_path = ensure_file(
-            self.text_encoder.text_encoder_pretrained_path,
-            "models_t5_umt5-xxl-enc-bf16.pth",
-        )
-        self.text_encoder.load_state_dict(torch.load(text_enc_path, map_location='cpu'))
+        # Upstream loads the base Wan text/image/VAE weights here unconditionally, guarding only
+        # the DiT with `skip_component_loading`. But a full DreamZero checkpoint supplies all three
+        # (`action_head.text_encoder.*`, `action_head.image_encoder.*`, `action_head.vae.model.*`),
+        # so fetching them costs a 16 GB download and read per load — 11 GB for umt5, 4.5 GB for
+        # CLIP, 485 MB for the VAE — that is then overwritten wholesale. The flag's own docstring
+        # is "used when loading from full pretrained model", so honour it for these too.
+        if not config.skip_component_loading:
+            text_enc_path = ensure_file(
+                self.text_encoder.text_encoder_pretrained_path,
+                "models_t5_umt5-xxl-enc-bf16.pth",
+            )
+            self.text_encoder.load_state_dict(torch.load(text_enc_path, map_location='cpu'))
 
-        img_enc_path = ensure_file(
-            self.image_encoder.image_encoder_pretrained_path,
-            "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
-        )
-        self.image_encoder.model.load_state_dict(torch.load(img_enc_path, map_location='cpu'), strict=False)
+            img_enc_path = ensure_file(
+                self.image_encoder.image_encoder_pretrained_path,
+                "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
+            )
+            self.image_encoder.model.load_state_dict(torch.load(img_enc_path, map_location='cpu'), strict=False)
 
-        # Wan2.2 (WanVideoVAE38, z_dim=48) uses Wan2.2_VAE.pth; Wan2.1 uses Wan2.1_VAE.pth
-        vae_hf_filename = "Wan2.2_VAE.pth" if getattr(self.vae, "z_dim", 16) == 48 else "Wan2.1_VAE.pth"
-        vae_repo_id = WAN22_HF_REPO_ID if getattr(self.vae, "z_dim", 16) == 48 else WAN_HF_REPO_ID
-        vae_path = ensure_file(
-            self.vae.vae_pretrained_path,
-            vae_hf_filename,
-            repo_id=vae_repo_id,
-        )
-        self.vae.model.load_state_dict(torch.load(vae_path, map_location='cpu'))
+            # Wan2.2 (WanVideoVAE38, z_dim=48) uses Wan2.2_VAE.pth; Wan2.1 uses Wan2.1_VAE.pth
+            vae_hf_filename = "Wan2.2_VAE.pth" if getattr(self.vae, "z_dim", 16) == 48 else "Wan2.1_VAE.pth"
+            vae_repo_id = WAN22_HF_REPO_ID if getattr(self.vae, "z_dim", 16) == 48 else WAN_HF_REPO_ID
+            vae_path = ensure_file(
+                self.vae.vae_pretrained_path,
+                vae_hf_filename,
+                repo_id=vae_repo_id,
+            )
+            self.vae.model.load_state_dict(torch.load(vae_path, map_location='cpu'))
 
         if not config.skip_component_loading:
             dit_dir = self.model.diffusion_model_pretrained_path
@@ -349,7 +354,6 @@ class WANPolicyHead(ActionHead):
         self.config = config
         self._noise_logged = False
         self.defer_lora_injection = config.defer_lora_injection
-        print("defer_lora_injection@@", self.defer_lora_injection)
         self.set_trainable_parameters(config.tune_projector, config.tune_diffusion_model)
 
     def set_trainable_parameters(self, tune_projector: bool, tune_diffusion_model: bool):

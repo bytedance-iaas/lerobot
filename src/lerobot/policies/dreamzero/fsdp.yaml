@@ -1,0 +1,43 @@
+# Accelerate FSDP config for a DreamZero FULL fine-tune on 8 GPUs.
+#
+# Mirrors RLinf's droid_sft_dreamzero_14b.yaml: full sharding, fp32 master weights with bf16
+# compute and bf16 gradient reduction, no grad scaler (bf16's exponent range makes loss scaling
+# unnecessary), and per-transformer-block wrapping.
+#
+#   accelerate launch --config_file src/lerobot/policies/dreamzero/fsdp.yaml \
+#     $(which lerobot-train) \
+#     --policy.type=dreamzero \
+#     --policy.pretrained_path=/data/models/DreamZero-DROID \
+#     --policy.training_mode=full \
+#     --policy.compute_dtype=float32 \
+#     ...
+#
+# `--policy.compute_dtype=float32` is what makes the master weights fp32; `mixed_precision: bf16`
+# below is what keeps the forward/backward in bf16. Both are needed — see the comment on
+# `DreamZeroConfig.compute_dtype` for why bf16 master weights lose ~84% of updates at lr 1e-5.
+
+compute_environment: LOCAL_MACHINE
+distributed_type: FSDP
+mixed_precision: bf16
+num_machines: 1
+num_processes: 8
+rdzv_backend: static
+same_network: true
+use_cpu: false
+
+fsdp_config:
+  fsdp_sharding_strategy: FULL_SHARD
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  # The DiT blocks plus the frozen encoders' attention blocks — RLinf's `_no_split_modules`.
+  # Wrapping the encoders too keeps the frozen 6.4 B of umt5/CLIP/VAE sharded rather than
+  # replicated on every rank.
+  fsdp_transformer_layer_cls_to_wrap: CausalWanAttentionBlock,T5SelfAttention,AttentionBlock
+  # Required: LeRobot builds the optimizer from `policy.get_optim_params()` before
+  # `accelerator.prepare()`, so the parameter objects the optimizer holds must stay the same ones.
+  fsdp_use_orig_params: true
+  fsdp_backward_prefetch: BACKWARD_PRE
+  fsdp_forward_prefetch: false
+  fsdp_offload_params: false
+  fsdp_state_dict_type: FULL_STATE_DICT
+  fsdp_sync_module_states: true
+  fsdp_cpu_ram_efficient_loading: false
