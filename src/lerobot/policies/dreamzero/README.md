@@ -20,8 +20,7 @@ Registered as `dreamzero`. Install extra: `pip install -e ".[dreamzero]"`.
 | Statistics for a new dataset (`scripts/compute_statistics.py`) | done + CPU-tested, cross-checked against the released quantiles (M5) |
 | New embodiments (generic canvas + prompt + frame-rate stretch) | **8-GPU SO-101 fine-tune runs**; policy quality unevaluated — see "Training a new robot" |
 
-**num_envs == 1** only (the KV cache has no batch semantics). See `dreamzero_port_plan.md` for the
-full plan.
+**num_envs == 1** only (the KV cache has no batch semantics).
 
 ## Port fidelity
 
