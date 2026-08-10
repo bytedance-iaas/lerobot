@@ -198,20 +198,9 @@ python src/lerobot/async_inference/robot_client.py \
 - **移植保真度**：模型核心与上游源码**按函数逐一 diff 校验，254 个函数中 249 个逐字节一致**（2245 行的联合视频+动作因果 DiT 是 35/35 一致，VAE 56/56）；不一致的 5 个都是刻意的（去 hydra `instantiate`、TensorRT 路径改为报错等）并已逐条记录。
 - **无需转换，直接加载官方 checkpoint**：`gear_checkpoint.py` 直接读 `GEAR-Dreams/DreamZero-DROID` 自带的 `config.json`（几何）、`experiment_cfg/conf.yaml`（state/action 拼接顺序）与 `metadata.json`（q01/q99 统计），**没有转换步骤**。
 - **只支持 14B**（`wan21_14b`）：这不是偷懒——它是**唯一有已发布权重**的骨干；Wan2.2-TI2V-5B 在上游只是从基础组件冷启动、没有可对照的官方 checkpoint，带一条无法验证的代码路径不如不带。加载时按名字校验，几何不符直接拒绝。
-- **离线开环评估：已端到端跑通**（`DreamZero-DROID` × `lerobot/droid_1.0.1`）。不止报 MSE——绝对关节角下"原地不动"就能拿到很低的 MSE，所以同时给出 `hold_state_mse`（不动基线，必须被打败）、`delta_corr`（预测位移与真实位移的相关性）、`delta_slope`（幅度是否标定），避免被漂亮的 MSE 骗了。
-- **SFT 已跑通**：`lerobot-train` 直接微调官方 checkpoint，支持 **单卡 / 8 卡 LoRA** 与 **8 卡 FSDP 全参微调**；文本/图像/VAE 编码器由动作头自行冻结。
-- **换机器人（新 embodiment）**：通用 2×2 画布 + 自动生成的视角描述 prompt + 帧率拉伸，**8 卡 SO-101 微调已跑通**。
-
-**一个值得说的实测结论**：把 DROID checkpoint 迁到 SO-101（60 条示教，10 条留出集开环打分）——
-
-| | action MSE | 对比"原地不动"(126.7) | 赢的 episode | delta corr |
-|---|---|---|---|---|
-| 原始 checkpoint | 197.1 | 更差 | 0/10 | -0.088 |
-| `lora` rank 4 | 256.4 | 更差 | 0/10 | -0.239 |
-| `lora` rank 32 | 158.8 | 更差 | 3/10 | 0.320 |
-| **`full` 全参** | **79.7** | **好 37%** | **10/10** | **0.633** |
-
-**换本体时 LoRA 不够用**：提高 rank 会让运动方向单调变好，但没有任何 rank 打赢"输出当前状态不动"——新机器人需要的改变不在低秩子空间里。（这个结论只针对**换本体**；同一机器人上用 LoRA 是上游自己的用法，我们没测。）另外步数不是瓶颈：3000 步反而比 1000 步各项指标都差，**上限在数据不在优化**。
+- **离线开环评估**：留出 episode 逐帧回放。除 action MSE 外还给出 `hold_state_mse`（"原地不动"基线）、`delta_corr`、`delta_slope`——绝对关节角下不动就能拿到很低的 MSE，只看 MSE 会被误导。
+- **继续 SFT**：`lerobot-train` 直接微调官方 checkpoint，支持 LoRA 与 FSDP 全参两种模式；文本/图像/VAE 编码器由动作头自行冻结。
+- **换机器人（新 embodiment）**：通用 2×2 画布 + 自动生成的视角描述 prompt + 帧率拉伸。
 
 ```bash
 # 1) 拉官方 checkpoint（tensorrt/ 是 19GB 的 Blackwell 专用资产，排除）
@@ -227,7 +216,7 @@ uv run python examples/eval_open_loop.py \
 #    （后者会走 PreTrainedConfig.from_pretrained，解析不了 GEAR 的 config.json）
 lerobot-train --policy.type=dreamzero \
     --policy.pretrained_path=/data/models/DreamZero-DROID \
-    --policy.training_mode=lora \        # 换本体请用 full，理由见上表
+    --policy.training_mode=lora \        # 或 full（全参）
     --dataset.repo_id=lerobot/droid_1.0.1 --dataset.episodes='[0,1,2,3]' \
     --batch_size=1 --steps=2 --output_dir=outputs/train/dreamzero_smoke
 ```
