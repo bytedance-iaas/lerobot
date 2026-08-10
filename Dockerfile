@@ -15,7 +15,7 @@
 #     --build-arg CONSOLE_COMMIT=$(git rev-parse HEAD) \
 #     --output type=image,name=<registry>/lerobot-agent-console:<tag>,push=true,compression=gzip,oci-mediatypes=true \
 #     .
-ARG BASE_IMAGE=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot:073768dbd8ceb35014d38b958b29758712bd9371
+ARG BASE_IMAGE=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot:18cd48ce718176258aa1a685622f9933f1549a9e
 FROM ${BASE_IMAGE}
 
 # lerobot's Dockerfile.user ends with `USER user_lerobot` (non-root). The build
