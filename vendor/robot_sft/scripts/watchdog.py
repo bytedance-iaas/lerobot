@@ -167,9 +167,47 @@ def assess(step, max_step, loss, best_loss, best_loss_step, evals):
     }
 
 
-def tail_metrics(log_path: str, max_bytes: int = 200_000):
+def cfg_steps(plan: dict) -> int | None:
+    """cfg.steps — the total the run is training TO. Without it a resumed tqdm counter
+    cannot be turned into an absolute step (see tail_metrics). The plan records it
+    directly; --steps= in the launch command is the same number, kept as a fallback for
+    older plans. NOTE: resume_command carries no --steps (it resumes via --config_path),
+    which is exactly why this cannot be read off the resume invocation."""
+    v = plan.get("max_steps")
+    if isinstance(v, int) and v > 0:
+        return v
+    if isinstance(v, str) and v.isdigit():
+        return int(v)
+    m = re.search(r"--steps[= ](\d+)", plan.get("launch_command") or "")
+    return int(m.group(1)) if m else None
+
+
+def _scan_max_total(log_path: str) -> int | None:
+    """Largest tqdm total anywhere in the log == cfg.steps. Whole-file fallback for when
+    the plan does not record it; correct but O(filesize), so it is not the primary path."""
+    try:
+        with open(log_path, "rb") as f:
+            text = f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    totals = [int(m.group(2)) for m in STEP_RE.finditer(text)]
+    return max(totals) if totals else None
+
+
+def tail_metrics(log_path: str, max_bytes: int = 200_000, total_steps: int | None = None):
     """Return (last_step, max_step, last_loss, loss_is_bad) from the log tail.
-    Step comes from tqdm's exact "N/M [" (lerobot's tracker line rounds step to K)."""
+    Step comes from tqdm's exact "N/M [" (lerobot's tracker line rounds step to K).
+
+    RESUME: lerobot builds the bar as `tqdm(total=cfg.steps - step)` with no `initial=`
+    (lerobot_train.py), so resuming from ckpt-K restarts the counter at 0 with total =
+    cfg.steps - K. The raw count is therefore SEGMENT-relative — after resuming at 3200
+    the log reads "58/4708" and a naive read reports step 58 instead of 3258.
+
+    The offset is cfg.steps - total. Do NOT infer cfg.steps from the log window: with two
+    resumes the 200KB tail can hold only the 2nd and 3rd segments, making the largest
+    total in view an INTERMEDIATE segment's — measured 3058 instead of 6258, and max_step
+    4708 instead of 7908, so the progress bar is wrong too. `total_steps` comes from the
+    plan (authoritative); only if it is missing do we scan the whole log."""
     try:
         size = os.path.getsize(log_path)
         with open(log_path, "rb") as f:
@@ -177,10 +215,18 @@ def tail_metrics(log_path: str, max_bytes: int = 200_000):
             text = f.read().decode("utf-8", "replace")
     except OSError:
         return None, None, None, False
-    last_step = max_step = last_loss = None
+    last_count = last_total = last_loss = None
     bad = False
     for m in STEP_RE.finditer(text):
-        last_step, max_step = int(m.group(1)), int(m.group(2))
+        last_count, last_total = int(m.group(1)), int(m.group(2))
+    if total_steps is None:
+        total_steps = _scan_max_total(log_path)
+    last_step, max_step = last_count, last_total
+    if last_count is not None and last_total is not None and total_steps:
+        # A resumed segment's total is SMALLER than cfg.steps; the difference is the
+        # checkpoint it resumed from (0 for a fresh run, whose total == cfg.steps).
+        last_step = last_count + max(0, total_steps - last_total)
+        max_step = total_steps
     losses = LOSS_RE.findall(text)
     if losses:
         raw = losses[-1].lower()
@@ -296,10 +342,11 @@ def main() -> None:
     best_loss, best_loss_step = float("inf"), None
     stop_file = os.path.join(run_dir, "STOP")
     stop_requested = False
+    total_steps = cfg_steps(plan)   # resolved once — makes a resumed tqdm count absolute
 
     while True:
         time.sleep(poll)
-        step, max_step, loss, loss_bad = tail_metrics(log_path)
+        step, max_step, loss, loss_bad = tail_metrics(log_path, total_steps=total_steps)
         ckpt = latest_resumable_checkpoint(output_dir)
 
         # track the best (lowest) loss so the assessment can measure plateau length
