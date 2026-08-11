@@ -822,12 +822,21 @@ async def handle_chat(request: web.Request) -> web.WebSocketResponse:
         finally:
             perm_waiters.pop(req_id, None)
 
-    async def _kill_turn(reselect: bool) -> bool:
+    async def _kill_turn(reselect: bool, grace: float = 12.0) -> bool:
         """Reliably end the in-flight turn. Try graceful session/cancel first; if hermes
         doesn't yield quickly (a long-running shell tool can't be interrupted mid-command),
         hard-restart the process so the turn is killed and new work isn't queued behind it
         ("Queued for the next turn"). Returns True if it force-killed (caller must emit 'done'
-        since run_turn was cancelled before it could). reselect keeps the user in the session."""
+        since run_turn was cancelled before it could). reselect keeps the user in the session.
+
+        `grace` is how long to wait for the graceful path, and it encodes INTENT:
+          Stop (default 12s) — "end this turn but KEEP what it produced", so it is worth
+            waiting for hermes to wind down and flush its messages.
+          leaving the session (short) — "I don't want this turn, take me elsewhere". Making
+            the user watch a dead session for 12s is the bug; the messages already written
+            to the session db survive the restart either way.
+        This loop is SEQUENTIAL (`async for msg in ws`), so whatever grace we wait here also
+        stalls every other client message behind it — another reason not to over-wait."""
         t = turn["task"]
         turn["task"] = None
         if not (t and not t.done()):
@@ -841,10 +850,10 @@ async def handle_chat(request: web.Request) -> web.WebSocketResponse:
             # final_response=None → None.startswith, patched in the hermes venv — so the
             # timeout fired 100% of the time and Stop always nuked the process, losing the
             # in-flight turn's messages.) Restart is the last resort, not the normal path.
-            await asyncio.wait_for(asyncio.shield(t), timeout=12.0)
+            await asyncio.wait_for(asyncio.shield(t), timeout=grace)
             return False                              # hermes honored cancel; run_turn sent done/error
         except asyncio.TimeoutError:
-            log.warning("session/cancel not honored in 12s — hard-restarting hermes acp")
+            log.warning("session/cancel not honored in %.1fs — hard-restarting hermes acp", grace)
         await acp.restart()                           # force: kill the stuck turn + its tool
         if not t.done():
             t.cancel()
@@ -893,13 +902,36 @@ async def handle_chat(request: web.Request) -> web.WebSocketResponse:
                 continue
             if ptype in ("session_list", "session_new", "session_load", "session_delete"):
                 # session_list is read-only — safe to run while a turn streams (so the
-                # dropdown can open mid-answer). Creating/loading/deleting changes the
-                # active session, so first abandon any in-flight turn.
+                # dropdown can open mid-answer). The rest may move the user off the session
+                # that is streaming, which means abandoning the in-flight turn first.
                 busy = bool(turn["task"] and not turn["task"].done())
                 if busy and ptype != "session_list":
-                    # Switching/creating/deleting changes the active session — end the current
-                    # turn reliably first (the op re-establishes the session, so no reselect).
-                    await _kill_turn(reselect=False)
+                    # Only ops that actually MOVE the user off the streaming session may kill
+                    # the turn. `acp.session_id` is the authoritative "which session is the
+                    # agent in" — the client used to decide this itself against its optimistic
+                    # `curSession`, which drifts (three racing writers), and when it drifted
+                    # the click on the row matching the header was swallowed client-side and
+                    # that session became permanently unswitchable ("无法切换").
+                    tid = payload.get("id")
+                    if ptype == "session_load" and tid == acp.session_id:
+                        # Clicking the row that is streaming RIGHT NOW means "show me this
+                        # one", not "kill it" — it is already open. Echo the id so the client
+                        # can re-sync the header it optimistically set.
+                        await ws.send_json({"type": "notice", "sessionId": acp.session_id,
+                                            "text": "这个会话正在生成中,已经是当前会话。"})
+                        continue
+                    # Deleting some OTHER session leaves the active one alone — never kill a
+                    # running turn (and never blank the transcript) for that.
+                    if not (ptype == "session_delete" and tid != acp.session_id):
+                        # Leaving: tell the UI FIRST. Ending the turn takes seconds and this
+                        # loop reads nothing meanwhile, so the click would otherwise look dead.
+                        await ws.send_json({"type": "switching"})
+                        # SHORT grace — the user asked to leave, not to preserve this turn's
+                        # tail (see _kill_turn). The op re-establishes the session, no reselect.
+                        if await _kill_turn(reselect=False, grace=2.0):
+                            # Force-killed: run_turn was cancelled before it could send 'done',
+                            # so say it here or the client sits on the stop button forever.
+                            await ws.send_json({"type": "done"})
                 try:
                     await _handle_session_op(ws, acp, ptype, payload)
                 except Exception as e:  # noqa: BLE001

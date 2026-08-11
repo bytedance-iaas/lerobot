@@ -497,33 +497,48 @@
   }
   function setTitle(t) { sessTitle.textContent = cleanTitle(t); }
 
+  // Session ops NEVER pre-send a `stop`, and NEVER guard on `busy` locally. Two reasons:
+  //  1. The server ends the in-flight turn itself as part of the op, with a short 2s grace.
+  //     A client-sent `stop` uses the LONG 12s grace instead, and the server's ws loop is
+  //     sequential — so the op queued behind it waited the full 12s with no feedback, which
+  //     is what "无法切换" looked like.
+  //  2. Every local `busy` guard here was a click the user could never get back: it returned
+  //     silently, drew nothing, and sent nothing. Decisions that need to know which session
+  //     is actually streaming belong on the server, which has the authoritative id.
   function newSession() {
     toggleSessMenu(false);
-    if (busy) stopTurn();                      // abandon any in-flight turn, then switch
-    wsSend({ type: "session_new" });           // server replies session_switched(fresh)
+    wsSend({ type: "session_new" });            // server replies session_switched(fresh)
   }
   function loadSession(id, title) {
     toggleSessMenu(false);
-    // No `id === curSession` early-return: curSession is written by three racing sources
-    // (session_switched, histStart, and late session_list replies re-asserting the server's
-    // old `current`), so right after creating/switching sessions it can disagree with what
-    // the pane shows — and the guard then silently ate the click ("点击session不切换").
-    // Always send the load: re-loading the current session is an idempotent 0.2s history
-    // replay. The one guard kept: clicking the row of the session that is STREAMING right
-    // now must not kill its own turn.
-    if (busy) {
-      if (id === curSession) return;
-      stopTurn();                              // switching away: abandon the in-flight turn
-    }
-    setTitle(title);                           // optimistic title only; curSession is set when the
-    wsSend({ type: "session_load", id });       // server actually starts streaming (history_start).
+    setTitle(title);                            // optimistic; confirmed by history_start / notice
+    wsSend({ type: "session_load", id });
   }
   function deleteSession(id) {
-    if (busy) return;
     wsSend({ type: "session_delete", id });     // server re-lists from the store; onDeleted refreshes
   }
   function refreshSessions() { wsSend({ type: "session_list" }); }
 
+  // Server is ending the in-flight turn so it can switch/create/delete. That takes a couple
+  // of seconds (longer if a shell tool has to be interrupted) and nothing else streams
+  // meanwhile, so say so — silence here reads as a broken button.
+  function onSwitching() {
+    clearChat();
+    const el = document.createElement("div");
+    el.className = "sess-empty";
+    el.textContent = "正在结束当前回合…";
+    body.appendChild(el);
+  }
+  // "You're already in this session" (clicked the row that is streaming now). The id is
+  // authoritative — adopt it so the header/highlight stop disagreeing, which is the drift
+  // that made this row unclickable in the first place.
+  function onNotice(m) {
+    if (m.sessionId) curSession = m.sessionId;
+    // The turn is still streaming, so close the open segment first — otherwise the notice
+    // is appended after it in the DOM while the NEXT token still lands in the (earlier)
+    // open segment, and the transcript reads out of order.
+    if (m.text) { finalizeSeg(); addMsg("bot", m.text); }
+  }
   function onSwitched(id, title, fresh) {
     curSession = id;
     setTitle(title);
@@ -686,6 +701,8 @@
         case "error": finalizeSeg(); clearPending(); addMsg("bot", "⚠️ " + m.error); setBusy(false); break;
         case "need_key": finalizeSeg(); clearPending(); setBusy(false); openKeyModal(); break;
         case "sessions": renderSessions(m.items || [], m.current); break;
+        case "switching": onSwitching(); break;
+        case "notice": onNotice(m); break;
         case "session_switched": onSwitched(m.id, m.title, m.fresh); break;
         case "session_deleted": onDeleted(m.id); break;
         case "history_start": histStart(m.id); break;
