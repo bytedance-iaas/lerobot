@@ -51,9 +51,8 @@ Environment knobs:
 
 | var | default | meaning |
 |---|---|---|
-| `PORT` | `8080` | listen port (HTTP, or HTTPS when TLS is set) |
-| `CONSOLE_TLS_CERT` / `CONSOLE_TLS_KEY` | unset | if both set + exist, the console serves **HTTPS/wss natively** (no TLS sidecar). Unset → plain HTTP. |
-| `CONSOLE_USER` / `CONSOLE_PASSWORD` | unset | single-user HTTP Basic auth (both required to enable) |
+| `PORT` | `8080` | listen port (plain HTTP — the console never terminates TLS itself) |
+| `CONSOLE_USER` / `CONSOLE_PASSWORD` | built-in pair | single-user HTTP Basic auth. **Auth is always on**: if either var is missing the console falls back to a default pair and says so in the UI, so a missing Secret degrades loudly rather than serving unauthenticated. |
 | `CONSOLE_WORKDIR` | cwd | shell + agent working dir (the lerobot checkout). Do NOT use `LEROBOT_HOME` — that's lerobot's own deprecated cache var; the console removes it from the env so it never breaks lerobot CLIs. |
 | `CONSOLE_SHELL` | `bash` | shell for the PTY console |
 | `HERMES_BIN` | `hermes` | hermes executable |
@@ -119,18 +118,18 @@ kubectl get svc lerobot-console-clb -o jsonpath='{.status.loadBalancer.ingress[0
 kubectl exec -it deploy/lerobot-console -- bash
 ```
 
-**TLS (native, recommended):** the console **serves HTTPS itself** from the mounted
-cert (`CONSOLE_TLS_CERT`/`KEY`) — no sidecar. An **L4 CLB** forwards `:443` straight
-to it; WebSocket (wss) works automatically. A self-signed cert is fine (browser
-warns once); no domain needed. This is the only path that's fully **kubectl-only**:
-ALB HTTPS needs a `证书中心` cert-id that can't be created via kubectl, and ALB has
-no auto system-cert through the ingress. For a **trusted** (no-warning) cert, upload
-one to 证书中心 and use an ALB ingress with its cert-id — see `k8s/ingress-alb.yaml`.
+**TLS:** the console does **not** do TLS — it serves plain HTTP on `:8080` and
+`server.py` contains no ssl code. **HTTPS is terminated upstream by APIG**
+(`k8s/apig-ingress.yaml`), which owns the certificate and hands out a managed
+`*.volceapi.com` domain, so there is no cert to mount and no env var to set.
+WebSocket upgrades pass through it (verified 101). Each console (dev / test) sits
+behind its own APIG instance and domain.
 
 **Persistence & auth:** `HERMES_HOME=/opt/data` is a PVC, so the Ark key (entered
 once in the UI), chat sessions, and the `robot_sft` skill survive pod restarts. The
 whole console is behind single-user HTTP Basic auth (`CONSOLE_USER` /
-`CONSOLE_PASSWORD` via the Secret), and enforces a single open session at a time.
+`CONSOLE_PASSWORD`, injected from the `lerobot-console-auth` Secret), and enforces a
+single open session at a time.
 
 > **zstd ↔ VKE note:** the VKE node here runs containerd 1.6.38, whose zstd
 > support is incomplete. Always push this image gzip-compressed. zstd is only
