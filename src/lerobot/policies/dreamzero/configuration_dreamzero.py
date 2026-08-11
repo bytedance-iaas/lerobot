@@ -58,21 +58,21 @@ _REMOVED_TRAINING_MODES = {
     ),
 }
 
-# Embodiment projector indices, from groot/vla/configs/model/dreamzero/transform/base.yaml
-# (embodiment_tag_to_projector_index). Used to select the per-embodiment category head.
-EMBODIMENT_TAG_TO_PROJECTOR_INDEX = {
-    "oxe_droid": 17,
-    "agibot": 26,
-    "yam": 32,
-    # Not an upstream tag. The index is bookkeeping only: the DiT hardcodes `embodiment_id = 0`
-    # before the action/state encoders (causal_wan_model.py) and builds them with
-    # `max_num_embodiments = 1`, so no per-embodiment projector is ever selected. Registering a
-    # tag buys the stitch/prompt branch, not a dedicated adapter — every bit of cross-embodiment
-    # adaptation has to happen in the shared weights.
-    "so100": 64,
-}
+# Embodiments this port knows how to preprocess. The value is the projector index the model
+# would select — and it is 0 for every one of them, because that is the only index that exists.
+#
+# Upstream's `CategorySpecificLinear` keeps a per-embodiment pool (`W[cat_ids]`) and its config
+# names indices 17/26/32 for oxe_droid/agibot/yam, but the released 14B checkpoint has a pool of
+# ONE: `causal_wan_model.py` overrides `max_num_embodiments = 1` when building the encoders, and
+# both forward paths overwrite the incoming `embodiment_id` with 0 before indexing. So the
+# published indices index nothing — passing 17 or 64 would be out of bounds if it were ever used,
+# and identical to 0 because it is not.
+#
+# The tensor still has to be emitted: `_forward_train` reads `.device` off it before discarding
+# the value, so `None` would raise there. What actually distinguishes an embodiment is the data
+# representation — statistics, canvas layout, prompt, and the state/action masks — not this.
+EMBODIMENT_TAG_TO_PROJECTOR_INDEX = dict.fromkeys(("oxe_droid", "agibot", "yam", "so100"), 0)
 
-# Fixed CFG negative prompt shared by all embodiments (see DreamTransform.apply_single).
 DREAMZERO_NEGATIVE_PROMPT = (
     "Vibrant colors, overexposed, static, blurry details, text, subtitles, style, artwork, "
     "painting, image, still, grayscale, dull, worst quality, low quality, JPEG artifacts, ugly, "
@@ -376,6 +376,7 @@ class DreamZeroConfig(PreTrainedConfig):
 
     @property
     def embodiment_projector_index(self) -> int:
+        """Always 0 — see `EMBODIMENT_TAG_TO_PROJECTOR_INDEX`. Kept because the tensor is."""
         return EMBODIMENT_TAG_TO_PROJECTOR_INDEX[self.embodiment_tag]
 
     def build_action_head_config(self, defer_lora_injection: bool = False):
