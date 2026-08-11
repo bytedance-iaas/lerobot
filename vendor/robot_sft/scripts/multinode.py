@@ -166,7 +166,10 @@ def cmd_rdma(a) -> int:
         u = probe_rdma(addr)
         if u:
             h, gi, nd, gid = u[0]
-            print(f"{label:<28} NCCL_IB_HCA={h}   (gid index {gi} on {nd}, {gid})")
+            # sysfs gid index — printed as evidence only. It is NOT NCCL_IB_GID_INDEX: sysfs is
+            # netns-filtered and numbered per pod, while NCCL reads the verbs API, which is not.
+            print(f"{label:<28} NCCL_IB_HCA={h}   (sysfs gid[{gi}] on {nd} = {gid}; "
+                  f"do NOT pass this as NCCL_IB_GID_INDEX)")
         else:
             ok = False
             print(f"{label:<28} NO USABLE HCA — launch with NCCL_IB_DISABLE=1 (TCP) or fix RDMA")

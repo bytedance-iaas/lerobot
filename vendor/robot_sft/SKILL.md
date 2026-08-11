@@ -518,11 +518,18 @@ no error, no warning, just a run that is many times slower.** Never assume; veri
 ```bash
 python scripts/multinode.py rdma --worker <worker-addr>     # one line per node
 ```
-⚠️ **`PORT_ACTIVE` is NOT evidence the HCA works here.** On a VKE console pod `ibv_devinfo` lists
-**six** mlx5 devices, all ACTIVE — but five are the *host's* physical RoCE NICs whose netdevs live
-in the **host** netns; the pod only receives their `/dev/infiniband` char devices. Those have **no
-GID inside the pod** and can never complete a QP. Gating on "a port is ACTIVE" is exactly what lets
-a run start and then die mid-launch.
+⚠️ **`PORT_ACTIVE` is NOT evidence the HCA works here — and neither is `ibv_devinfo` showing a
+GID.** RDMA is split across the container boundary: the `/dev/infiniband/uverbs*` **char devices**
+are files, so they are NOT namespaced and the pod sees ALL of the host's HCAs; the **netdevs** are
+namespaced, so they stay on the host. RoCE GIDs are derived from a netdev's IP, so an HCA whose
+netdev is in the host netns has no GID *that this pod can use*.
+
+The trap: **`ibv_devinfo` (the verbs API, which is what NCCL reads) is not netns-filtered** — it
+happily reports `mlx5_0` GID `::ffff:<the NODE's IP>`. NCCL believes it, selects that HCA, and the
+QP then fails in the kernel with `ibv_modify_qp failed with 19 No such device`. Only **sysfs** is
+filtered by netns, so it is the honest view: the same `mlx5_0` reads back all-zero GIDs inside the
+pod. Gating on "a port is ACTIVE" (or on `ibv_devinfo` showing a GID) is exactly what lets a doomed
+run start and then die mid-launch.
 
 The real test, which `multinode.py rdma` applies: an HCA is usable **iff it has a RoCE v2 GID whose
 backing netdev exists in THIS netns** (`gid_attrs/ndevs/<i>` naming an interface present in
@@ -550,9 +557,18 @@ eval $(python scripts/multinode.py rdma --export)   # -> NCCL_IB_HCA=<this node'
 export NCCL_SOCKET_IFNAME=<data iface>    # bootstrap/out-of-band only, NOT the data path;
                                           # get it from `ip -o -4 addr` (often eth0, don't assume)
 ```
-❌ **Do NOT set `NCCL_IB_GID_INDEX`.** The correct index **differs per node** (measured: 15 on one
-console pod, 19 on the other — same device name, same image): a value that is right on the master
-silently selects the wrong GID on the worker. Once the HCA is pinned, NCCL picks the GID itself.
+❌ **Do NOT set `NCCL_IB_GID_INDEX`** — and be aware there are **two different GID numberings**:
+- **sysfs** (`/sys/class/infiniband/<dev>/ports/1/gids/<i>`) is **filtered by netns**: it shows only
+  GIDs whose netdev is in this pod, indexed per pod (measured 15 on one console pod, 19 on the
+  other, both `::ffff:<that pod's own IP>`). This is the view the detector uses, and the only view
+  that answers "can this HCA work here".
+- **the verbs API** (`ibv_devinfo -v`, and what NCCL reads) is **NOT netns-filtered**: it returns
+  the host's table — both console pods report the same `GID[5] = ::ffff:192.168.1.114` (the ENI's
+  primary IP, not either pod's).
+
+So an index read off sysfs is meaningless to NCCL, and one read off `ibv_devinfo` may name an
+address that does not exist in this netns. Pin the HCA and let NCCL choose — that is verified to
+work (`NET/IB`, all-reduce OK); a hand-picked index is not.
 
 > **No k8s resource request is needed.** Claiming `vke.volcengine.com/rdma` is NOT what enables
 > this — verified by removing the claim from one pod and re-running: it still gets `uverbs0-5` and
