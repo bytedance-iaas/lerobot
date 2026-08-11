@@ -262,6 +262,19 @@ body {
 .bubble.thinking::after { content: "▋"; animation: blink 1s steps(2) infinite; }
 @keyframes blink { 50% { opacity: 0; } }
 
+/* Liveness. Frames are written by ONE JS interval (see app.js `spinner`), not a CSS content
+   animation, so every spinner on the page steps in lockstep and they all stop dead when the turn
+   ends — a spinner still turning after the answer arrived is worse than no spinner at all. */
+.spin { display: inline-block; width: 1em; color: #2f6bff;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.run-status { display: flex; align-items: center; gap: 7px; margin: 0 18px 8px; padding: 6px 11px;
+  border: 1px solid var(--line); border-radius: 8px; background: #f7f9ff;
+  color: #4b5160; font-size: 12.5px; }
+.run-status[hidden] { display: none; }
+/* Elapsed matters more than motion past ~a minute: it separates "slow" from "hung". */
+.run-elapsed { color: var(--muted); font-variant-numeric: tabular-nums; }
+.tool-bubble .spin { margin-right: 3px; }
+
 .chat-quick { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 18px 12px; }
 .q { border: 1px solid var(--line); background: #fff; border-radius: 999px; padding: 6px 13px;
   font-size: 13px; cursor: pointer; color: #4b5160; }

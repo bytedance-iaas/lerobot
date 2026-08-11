@@ -106,6 +106,14 @@
         <button class="q q-green" id="q-release" title="查看更新说明与当前部署版本">📋 更新说明</button>
       </div>
 
+      <!-- Shown for the whole turn. The transcript alone cannot say "still alive": the 思考中
+           placeholder is dropped at the first token, and a tool that runs for minutes (training,
+           downloads) renders as one static line. -->
+      <div class="run-status" id="run-status" hidden>
+        <span class="spin" data-spin></span><span id="run-status-text">运行中</span>
+        <span class="run-elapsed" id="run-elapsed"></span>
+      </div>
+
       <div class="chat-input">
         <textarea id="chat-text" rows="1" placeholder="让 Agent 帮你训练、评估、检查数据集…"></textarea>
         <button id="chat-send" class="send-btn" title="发送">➤</button>

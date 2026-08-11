@@ -305,12 +305,53 @@
     body.scrollTop = body.scrollHeight;
     return bubble;
   }
+  // ----- liveness: one interval drives every spinner + elapsed clock on the page -----
+  // A single timer (not per-element CSS animation) so the frames stay in lockstep and, more
+  // importantly, so they all STOP the instant the turn ends — a spinner still turning after the
+  // answer landed reads as "still working" and is worse than showing nothing.
+  const SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+  const spinner = { timer: null, frame: 0, turnAt: 0 };
+  function fmtElapsed(ms) {
+    const s = Math.floor(ms / 1000);
+    return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`;
+  }
+  function spinTick() {
+    const ch = SPIN[spinner.frame++ % SPIN.length];
+    document.querySelectorAll("[data-spin]").forEach((el) => { el.textContent = ch; });
+    // Each running tool times itself from when its card appeared, not from the turn start —
+    // "this download has been going 4m" is the number you actually want.
+    document.querySelectorAll("[data-since]").forEach((el) => {
+      el.textContent = " · " + fmtElapsed(Date.now() - Number(el.dataset.since));
+    });
+    const e = $("run-elapsed");
+    if (e && spinner.turnAt) e.textContent = "· " + fmtElapsed(Date.now() - spinner.turnAt);
+  }
+  function startSpin() {
+    if (spinner.timer) return;                  // already running: keep the turn's original clock
+    spinner.turnAt = Date.now();
+    spinTick();
+    spinner.timer = setInterval(spinTick, 90);
+  }
+  function stopSpin() {
+    if (spinner.timer) { clearInterval(spinner.timer); spinner.timer = null; }
+    document.querySelectorAll("[data-spin]").forEach((el) => { el.textContent = ""; });
+    const e = $("run-elapsed");
+    if (e) e.textContent = "";
+  }
+  function setRunStatus(text) {
+    const t = $("run-status-text");
+    if (t) t.textContent = text;
+  }
+
   function setBusy(b) {
     busy = b;
     sendBtn.disabled = false;                 // stays clickable so it can stop
     sendBtn.classList.toggle("is-stop", b);
     sendBtn.textContent = b ? "■" : "➤";
     sendBtn.title = b ? "停止" : "发送";
+    const bar = $("run-status");
+    if (bar) bar.hidden = !b;
+    if (b) startSpin(); else stopSpin();
   }
   function stopTurn() {
     if (chatWS && chatWS.readyState === 1) chatWS.send(JSON.stringify({ type: "stop" }));
@@ -329,6 +370,8 @@
     curSeg = null; toolEls = {};
     pendingEl = addMsg("bot", booting ? "正在启动 Agent" : "思考中");
     pendingEl.classList.add("thinking");
+    setBusy(true);                    // arms the status bar + spinner for the whole turn
+    setRunStatus(booting ? "正在启动 Agent" : "思考中");
   }
   function clearPending() { if (pendingEl) { rm(pendingEl); pendingEl = null; } }
 
@@ -366,6 +409,7 @@
   function addThought(text) {
     if (!text) return;
     clearPending();
+    setRunStatus("思考中");        // back from whatever tool name was showing
     if (!curSeg || curSeg.kind !== "think") { finalizeSeg(); newThinkSeg(); }
     curSeg.text += text;
     curSeg.refs.detail.textContent = curSeg.text;
@@ -396,6 +440,7 @@
   }
   function appendToken(t) {
     clearPending();
+    setRunStatus("生成回复中");
     if (!curSeg || curSeg.kind !== "output") { finalizeSeg(); newOutputSeg(); }
     curSeg.text += t;
     scheduleRender();
@@ -418,9 +463,30 @@
     };
     return { head, detail, caret, label: bubble.querySelector(".tool-label") };
   }
-  function setToolBubble(bubble, refs, title, status, detail) {
-    refs.label.textContent = "🔧 " + (title || "工具") + (status ? " · " + status : "");
-    bubble.classList.toggle("tool-done", status === "completed" || status === "failed");
+  function setToolBubble(bubble, refs, title, status, detail, since) {
+    const done = status === "completed" || status === "failed";
+    // Rebuild the label as nodes, not textContent: a running tool needs a live spinner and a
+    // ticking clock inside it. lerobot tools are the LONG part of a turn (a training launch or a
+    // dataset pull runs for minutes) and used to render as one frozen line.
+    // `since` is only passed by the LIVE path, so it doubles as "is this happening now": a tool
+    // replayed from history must never spin or tick, however its status was left.
+    refs.label.textContent = "";
+    if (since && !done) {
+      const s = document.createElement("span");
+      s.className = "spin"; s.setAttribute("data-spin", "");
+      refs.label.appendChild(s);
+    }
+    refs.label.appendChild(document.createTextNode(
+      "🔧 " + (title || "工具") + (status ? " · " + status : "")));
+    if (since) {
+      const e = document.createElement("span");
+      e.className = "run-elapsed";
+      e.textContent = " · " + fmtElapsed(Date.now() - since);
+      // Only a RUNNING tool keeps ticking; a finished one freezes at its final duration.
+      if (!done) e.setAttribute("data-since", String(since));
+      refs.label.appendChild(e);
+    }
+    bubble.classList.toggle("tool-done", done);
     if (detail != null && detail !== "") {
       refs.detail.textContent = detail;                     // latest non-empty wins
       bubble.classList.remove("no-detail");
@@ -439,10 +505,11 @@
       wrap.innerHTML = '<span class="msg-ava tool-ava">⚙</span><div class="bubble tool-bubble"></div>';
       body.appendChild(wrap);
       const bubble = wrap.querySelector(".tool-bubble");
-      t = toolEls[id] = { el: bubble, refs: buildToolBubble(bubble), title: "" };
+      t = toolEls[id] = { el: bubble, refs: buildToolBubble(bubble), title: "", since: Date.now() };
     }
     if (u.title) t.title = u.title;             // tool_call has the title; updates may not
-    setToolBubble(t.el, t.refs, t.title, u.status, u.detail);
+    setToolBubble(t.el, t.refs, t.title, u.status, u.detail, t.since);
+    if (t.title) setRunStatus(t.title.length > 40 ? t.title.slice(0, 40) + "…" : t.title);
     body.scrollTop = body.scrollHeight;
   }
   function addPermission(m) {
@@ -523,6 +590,7 @@
   // of seconds (longer if a shell tool has to be interrupted) and nothing else streams
   // meanwhile, so say so — silence here reads as a broken button.
   function onSwitching() {
+    setRunStatus("正在结束当前回合");
     clearChat();
     const el = document.createElement("div");
     el.className = "sess-empty";
@@ -604,7 +672,10 @@
   // ----- history replay (session_load) -----
   let histAcc = null;  // { role, text } accumulator; consecutive same-role chunks merge
   let histTools = {};  // tool cards by id — dedup so one tool isn't rendered per update event
-  function histStart(id) { clearChat(); setBusy(true); histAcc = null; histTools = {}; if (id) curSession = id; }
+  function histStart(id) {
+    clearChat(); setBusy(true); setRunStatus("载入会话历史");
+    histAcc = null; histTools = {}; if (id) curSession = id;
+  }
   // The first user message carries a "[System] …" steering block. It may be appended (new
   // sessions) or prepended (legacy) — strip it either way so it never shows in the bubble.
   function stripSystemPrefix(s) {
