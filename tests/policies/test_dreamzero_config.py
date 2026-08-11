@@ -71,18 +71,23 @@ def test_lora_injection_can_be_deferred_past_weight_loading(defer):
     assert head.train_architecture == "lora"
 
 
-@pytest.mark.parametrize(("mode", "expected"), [("lora", True), ("full", False)])
-def test_full_always_writes_complete_weights(mode, expected):
-    """A `full` run rewrites the whole DiT, so there is no frozen remainder worth deferring.
-
-    `lora` keeps >99% of the model frozen and bit-identical to the base, which is what makes
-    storing only the trainable delta lossless.
-    """
+@pytest.mark.parametrize("mode", ["lora", "full"])
+def test_both_modes_can_store_only_the_trainable_delta(mode):
+    """Even `full` leaves the 6,440 M text/image/VAE encoders frozen and equal to the base."""
     from lerobot.policies.dreamzero.modeling_dreamzero import DreamZeroPolicy
 
-    cfg = DreamZeroConfig(training_mode=mode, save_lora_only=True)
+    cfg = DreamZeroConfig(training_mode=mode, save_trainable_only=True)
 
-    assert DreamZeroPolicy._saves_adapter_only(cfg) is expected
+    assert DreamZeroPolicy._saves_adapter_only(cfg) is True
+    assert DreamZeroPolicy._saves_adapter_only(DreamZeroConfig(training_mode=mode)) is True
+
+
+def test_the_deprecated_save_lora_only_still_wins():
+    """Old command lines and old checkpoint configs must keep working, loudly."""
+    assert DreamZeroConfig(save_lora_only=False).save_trainable_only is False
+    assert DreamZeroConfig(save_lora_only=True).save_trainable_only is True
+    # Unset leaves the new field alone.
+    assert DreamZeroConfig().save_trainable_only is True
 
 
 def test_lora_hyperparameters_match_the_upstream_droid_recipe():
