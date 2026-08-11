@@ -112,11 +112,75 @@ def hf_cache_dirname(repo_id: str) -> str:
     return "models--" + repo_id.replace("/", "--")
 
 
+# --------------------------------------------------------------------------- RDMA
+# An ACTIVE port is NOT proof an HCA is usable. On a VKE console pod `ibv_devinfo` lists
+# SIX mlx5 devices all PORT_ACTIVE, but five of them are the host's physical RoCE NICs whose
+# netdevs live in the HOST netns — the pod only gets their /dev/infiniband char devices. Left
+# to itself NCCL enumerates all six, picks mlx5_0, reads a GID belonging to the NODE's IP and
+# dies with `ibv_modify_qp failed with 19 No such device`. Measured, not theorised.
+#
+# The discriminator is the GID's backing netdev: gid_attrs/ndevs/<i> names the interface the
+# GID is bound to, and only the HCA whose netdev EXISTS IN THIS NETNS can complete a QP. On a
+# console pod that is the vRDMA device riding the pod's own ENI (ndev=eth0, GID = the POD's
+# IP). Prefer the RoCE v2 IPv4-mapped GID — that is the one that routes.
+_RDMA_PROBE = r"""
+for d in /sys/class/infiniband/*; do
+  [ -e "$d/ports/1/state" ] || continue
+  case "$(cat $d/ports/1/state 2>/dev/null)" in *ACTIVE*) ;; *) continue;; esac
+  n=$(basename $d); best=""
+  for g in $d/ports/1/gids/*; do
+    v=$(cat $g 2>/dev/null); i=$(basename $g)
+    case "$v" in ""|0000:0000:0000:0000:0000:0000:0000:0000) continue;; esac
+    case "$(cat $d/ports/1/gid_attrs/types/$i 2>/dev/null)" in *v2*) ;; *) continue;; esac
+    nd=$(cat $d/ports/1/gid_attrs/ndevs/$i 2>/dev/null)
+    [ -n "$nd" ] && [ -e "/sys/class/net/$nd" ] || continue   # netdev must be in THIS netns
+    case "$v" in *ffff:*) echo "$n $i $nd $v"; best=done; break;; esac  # RoCE v2 IPv4 wins
+    [ -z "$best" ] && best="$n $i $nd $v"
+  done
+  case "$best" in done|"") ;; *) echo "$best";; esac
+done
+"""
+
+
+def probe_rdma(addr: str | None) -> list[tuple[str, str, str, str]]:
+    """[(hca, gid_index, netdev, gid), ...] for HCAs that can actually establish a QP here."""
+    rc, out = (run_local(_RDMA_PROBE) if addr in (None, "local") else run_remote(addr, _RDMA_PROBE))
+    found = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 4 and parts[0].startswith(("mlx", "rocep", "irdma", "bnxt", "hns")):
+            found.append(tuple(parts))  # type: ignore[arg-type]
+    return found
+
+
 # --------------------------------------------------------------------------- check
+def cmd_rdma(a) -> int:
+    """Report the HCA each node can actually use. `--export` prints just this node's, so a
+    launch script can do: `eval $(multinode.py rdma --export)` and stay node-correct."""
+    if a.export:
+        u = probe_rdma(None)
+        print(f"NCCL_IB_HCA={u[0][0]}" if u else "", end="\n" if u else "")
+        return 0 if u else 1
+    ok = True
+    for label, addr in [("master", None)] + [(w, w) for w in a.worker]:
+        u = probe_rdma(addr)
+        if u:
+            h, gi, nd, gid = u[0]
+            print(f"{label:<28} NCCL_IB_HCA={h}   (gid index {gi} on {nd}, {gid})")
+        else:
+            ok = False
+            print(f"{label:<28} NO USABLE HCA — launch with NCCL_IB_DISABLE=1 (TCP) or fix RDMA")
+    if not ok:
+        print("\nNote: an ACTIVE port is not enough — the GID must be bound to a netdev inside "
+              "the pod's own netns, else NCCL fails with `ibv_modify_qp ... 19 No such device`.")
+    return 0 if ok else 1
+
+
 def cmd_check(a) -> int:
     r = Report()
     hf_home = a.hf_home or os.environ.get("HF_HOME") or "/opt/data/.cache/huggingface"
     hub = f"{hf_home}/hub"
+    rdma_hca: dict[str, str] = {}   # node -> its OWN NCCL_IB_HCA (never shared between nodes)
 
     for w in a.worker:
         print(f"\n=== worker {w} ===")
@@ -175,21 +239,21 @@ def cmd_check(a) -> int:
         rc, out = run_remote(w, "ls /dev/infiniband/uverbs* 2>/dev/null | wc -l")
         n_uverbs = int(out.strip().splitlines()[-1]) if out.strip().split() and out.strip().splitlines()[-1].strip().isdigit() else 0
         if n_uverbs:
-            rc, act = run_remote(
-                w, "for d in /sys/class/infiniband/*; do "
-                   "s=$(cat $d/ports/1/state 2>/dev/null); l=$(cat $d/ports/1/link_layer 2>/dev/null); "
-                   "case \"$s\" in *ACTIVE*) echo \"$(basename $d):$l\";; esac; done")
-            actives = [x for x in act.splitlines() if ":" in x]
-            r.check(f"{w}: RDMA devices ACTIVE", bool(actives),
-                    "uverbs present but no port ACTIVE — NCCL will fall back to TCP",
-                    ok_detail=" ".join(actives))
-            if any(x.strip().endswith("Ethernet") for x in actives):
-                print(f"       note: RoCE (link_layer=Ethernet) — needs a valid GID bound to the "
-                      f"data NIC; may need NCCL_IB_GID_INDEX. Verify with NCCL_DEBUG=INFO -> NET/IB.")
-            # Nearest NIC per GPU (PIX = same PCIe switch) — NCCL_IB_HCA is set PER NODE.
-            rc, topo = run_remote(w, "nvidia-smi topo -m 2>/dev/null | grep -iE '^GPU0' | head -1")
-            if topo.strip():
-                print(f"       topo GPU0: {topo.strip()[:110]}")
+            # NOT "is a port ACTIVE" — that is true of HCAs this netns cannot use, and gating on
+            # it is what hides the failure until NCCL dies mid-launch. Gate on a USABLE HCA.
+            usable = probe_rdma(w)
+            r.check(f"{w}: RDMA HCA usable from this netns", bool(usable),
+                    f"{n_uverbs} uverbs device(s) present but NONE has a RoCE v2 GID bound to a "
+                    f"netdev in this netns — NCCL would pick one anyway and die with "
+                    f"`ibv_modify_qp failed with 19 No such device`. Launch WITHOUT RDMA "
+                    f"(NCCL_IB_DISABLE=1) or fix the pod's RDMA networking first.",
+                    ok_detail=" ".join(f"{h}(gid{gi} on {nd})" for h, gi, nd, _ in usable))
+            if usable:
+                hca = usable[0][0]
+                rdma_hca[w] = hca
+                print(f"       -> export NCCL_IB_HCA={hca}   # THIS node only; do not copy to others")
+                print(f"          (leave NCCL_IB_GID_INDEX UNSET — the index differs per node and "
+                      f"NCCL picks the right GID once the HCA is pinned)")
         else:
             print(f"[INFO] {w}: no /dev/infiniband/uverbs* — no RDMA, NCCL will use TCP")
 
@@ -219,6 +283,23 @@ def cmd_check(a) -> int:
     if a.output_dir:
         r.check("master: output_dir clean", not os.path.exists(a.output_dir),
                 "exists — delete it before launching")
+
+    # 11. master's own usable HCA (same rule as the workers — see probe_rdma).
+    if os.path.exists("/dev/infiniband"):
+        usable = probe_rdma(None)
+        r.check("master: RDMA HCA usable from this netns", bool(usable),
+                "no RoCE v2 GID bound to a netdev in this netns — NCCL would pick an unusable "
+                "HCA and die with `ibv_modify_qp failed with 19 No such device`",
+                ok_detail=" ".join(f"{h}(gid{gi} on {nd})" for h, gi, nd, _ in usable))
+        if usable:
+            rdma_hca["master"] = usable[0][0]
+
+    if rdma_hca:
+        print("\n=== NCCL_IB_HCA (per node — NOT interchangeable) ===")
+        for node, hca in rdma_hca.items():
+            print(f"  {node:<28} export NCCL_IB_HCA={hca}")
+        print("  Put this in EACH node's launch env, leave NCCL_IB_GID_INDEX unset, and PROVE it "
+              "with NCCL_DEBUG=INFO: the transport line must read NET/IB and name this HCA.")
 
     return r.done("check")
 
@@ -368,6 +449,12 @@ def main() -> int:
     cl.add_argument("--remove-output-dir", action="store_true",
                     help="also delete output_dir on every node (required before a retry)")
 
+    rd = sub.add_parser("rdma", help="print each node's usable NCCL_IB_HCA (read-only)")
+    rd.add_argument("--worker", action="append", default=[],
+                    help="worker address (repeatable); the master is always probed")
+    rd.add_argument("--export", action="store_true",
+                    help="emit only `NCCL_IB_HCA=<hca>` for the MASTER, for `eval $(...)`")
+
     la = sub.add_parser("launch", help="start workers over ssh; master runs under the watchdog")
     common(la)
     la.add_argument("--command", required=True,
@@ -375,7 +462,7 @@ def main() -> int:
     la.add_argument("--worker-log", default="/opt/data/robot_sft/worker.log")
 
     a = ap.parse_args()
-    return {"check": cmd_check, "status": cmd_status,
+    return {"check": cmd_check, "status": cmd_status, "rdma": cmd_rdma,
             "clean": cmd_clean, "launch": cmd_launch}[a.cmd](a)
 
 

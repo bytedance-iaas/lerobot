@@ -514,33 +514,50 @@ Gradient all-reduce is the cross-node bottleneck, and it runs over NCCL. If the 
 NICs, NCCL should use them — **but when anything is misconfigured NCCL silently falls back to TCP:
 no error, no warning, just a run that is many times slower.** Never assume; verify.
 
-**1. Detect the hardware** (per node): `ls /dev/infiniband/uverbs*` must exist and be readable by
-the container, and `ibv_devinfo` (or `/sys/class/infiniband/*/ports/1/`) should show `state:
-PORT_ACTIVE`. Check `link_layer`:
-- `InfiniBand` — native IB, usually works once the device is visible.
-- **`Ethernet` — this is RoCE**, and it additionally needs a valid **GID** bound to the data
-  interface. A device that is ACTIVE with no usable GID still fails over to TCP. RoCEv2 often
-  needs `NCCL_IB_GID_INDEX=<n>` (pick the v2/IPv4 GID for the right interface from
-  `/sys/class/infiniband/<dev>/ports/1/gids/`).
+**1. Detect the USABLE HCA — run the detector, do not eyeball `ibv_devinfo`.**
+```bash
+python scripts/multinode.py rdma --worker <worker-addr>     # one line per node
+```
+⚠️ **`PORT_ACTIVE` is NOT evidence the HCA works here.** On a VKE console pod `ibv_devinfo` lists
+**six** mlx5 devices, all ACTIVE — but five are the *host's* physical RoCE NICs whose netdevs live
+in the **host** netns; the pod only receives their `/dev/infiniband` char devices. Those have **no
+GID inside the pod** and can never complete a QP. Gating on "a port is ACTIVE" is exactly what lets
+a run start and then die mid-launch.
 
-**2. Pick the HCA by GPU affinity, PER NODE — always measure, never assume a device name.**
-Run `nvidia-smi topo -m` **on each node** and take the NIC marked `PIX` (same PCIe switch) for the
-GPU(s) that node trains with. ⚠️ **This is the one legitimate exception to "the same command on
-every node"**: the nearest HCA genuinely differs per machine, so `NCCL_IB_HCA` is set **per node**
-while every `lerobot-train` flag stays identical. With several GPUs per node, list several HCAs —
-pinning one NIC caps you at that NIC's bandwidth.
-> Device names like `mlx5_3` are **per-machine facts, not constants** — never copy one from these
-> docs or from another cluster. `multinode.py check` prints each node's topology row for exactly
-> this reason.
+The real test, which `multinode.py rdma` applies: an HCA is usable **iff it has a RoCE v2 GID whose
+backing netdev exists in THIS netns** (`gid_attrs/ndevs/<i>` naming an interface present in
+`/sys/class/net/`). On a console pod that is the **vRDMA device riding the pod's own ENI**
+(`ndev=eth0`, GID = the *pod's* IP) — in practice `mlx5_5`, but never hardcode it.
+
+> No usable HCA on some node? Then RDMA is not available to that pod: launch it with
+> `NCCL_IB_DISABLE=1` (honest TCP) rather than let NCCL pick a dead HCA and crash the run.
+
+**2. Pin `NCCL_IB_HCA` per node — this is the whole fix.** Left to itself NCCL enumerates all six
+devices, picks `mlx5_0`, reads a GID belonging to the **node's** IP, and dies with
+`ibv_modify_qp failed with 19 No such device`. Pinning the detected HCA makes the identical job run
+end-to-end over `NET/IB`. ⚠️ **This is the one legitimate exception to "the same command on every
+node"** — the device is a per-machine fact, so `NCCL_IB_HCA` is set per node while every
+`lerobot-train` flag stays identical.
+> Device names like `mlx5_5` are **per-machine facts, not constants** — never copy one from these
+> docs or another cluster. On bare-metal multi-GPU nodes also weigh GPU affinity
+> (`nvidia-smi topo -m`, the NIC marked `PIX`); with several GPUs list several HCAs, since pinning
+> a single NIC caps you at that NIC's bandwidth.
 
 **3. Env, set per node** (every `<…>` below is measured on that node, not copied):
 ```bash
 export NCCL_IB_DISABLE=0                  # 1 forces TCP — never set it to 1 "to test"
-export NCCL_IB_HCA=<this node's PIX HCA>  # from nvidia-smi topo -m ON THIS NODE
+eval $(python scripts/multinode.py rdma --export)   # -> NCCL_IB_HCA=<this node's HCA>
 export NCCL_SOCKET_IFNAME=<data iface>    # bootstrap/out-of-band only, NOT the data path;
                                           # get it from `ip -o -4 addr` (often eth0, don't assume)
-# RoCE only, if the default GID is wrong:  export NCCL_IB_GID_INDEX=<n>
 ```
+❌ **Do NOT set `NCCL_IB_GID_INDEX`.** The correct index **differs per node** (measured: 15 on one
+console pod, 19 on the other — same device name, same image): a value that is right on the master
+silently selects the wrong GID on the worker. Once the HCA is pinned, NCCL picks the GID itself.
+
+> **No k8s resource request is needed.** Claiming `vke.volcengine.com/rdma` is NOT what enables
+> this — verified by removing the claim from one pod and re-running: it still gets `uverbs0-5` and
+> a working vRDMA HCA, and still completes a 2-pod `NET/IB` all-reduce. The claim only adds
+> `umad*`/`issm*` management nodes for a physical NIC, which NCCL never touches.
 
 **4. PROVE it — the whole point.** Run a 2-node NCCL all-reduce (or the multi-node smoke test)
 with `NCCL_DEBUG=INFO` and read the transport line:
@@ -606,8 +623,22 @@ throwaway `--output_dir`, and confirm every rank reaches step 2 and the master w
 it kills leftover ranks, verifies the GPUs actually came back, and removes the dir everywhere.
 lerobot-train aborts on an existing output_dir without `--resume`, and an orphaned rank still
 holding GPU memory makes the retry OOM — so skipping this makes every retry fail identically.
-Run the smoke test with **`NCCL_DEBUG=INFO`** and confirm the transport line says **`NET/IB`**
-(RDMA) and not `NET/Socket` (silent TCP fallback) — see M0b; this is the cheapest place to catch it.
+**RDMA in the smoke run — detect per node, then assert.** Every rank's script must resolve its OWN
+HCA (the device name is per-machine, and `NCCL_IB_GID_INDEX` must stay unset — see M0b):
+```bash
+if hca=$(python scripts/multinode.py rdma --export); then export "$hca"; else export NCCL_IB_DISABLE=1; fi
+export NCCL_DEBUG=INFO
+```
+`--export` prints `NCCL_IB_HCA=<hca>` for the node it runs on and exits non-zero when that node has
+no usable HCA, so the `else` degrades to honest TCP instead of letting NCCL grab a dead device and
+kill the run with `ibv_modify_qp failed with 19 No such device`.
+⚠️ Capture it in a variable as above — **`eval $(… --export) || export NCCL_IB_DISABLE=1` is
+broken**: `eval`'s exit status is that of the string it evaluated, and on failure the string is
+empty, so `eval ""` returns 0 and the fallback never fires.
+Then **assert the transport** in the smoke log: it must say **`NET/IB`** and name that HCA
+(`NET/IB : Using [0]mlx5_5:1/RoCE`), not `NET/Socket` (silent TCP fallback) — see M0b. The smoke
+test is the cheapest place to catch either failure; do not carry an unproven interconnect into a
+run that costs GPU-hours.
 Other aids: if rendezvous connects but NCCL hangs on a multi-NIC node, set
 `NCCL_SOCKET_IFNAME=<iface>`. Note NCCL also uses **ephemeral ports beyond 29500** — open
 node↔node traffic, not just one port; and if two trainings share a master box, give each a
