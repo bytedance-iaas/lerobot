@@ -55,12 +55,41 @@ def session_state():
     return _read(os.path.join(SESSION_DIR, "session.json")) or {}
 
 
+def _tail_tqdm(path: str, max_bytes: int = 65536):
+    """(count, total) from the LAST tqdm token. Tail-only on purpose: this runs on every poll,
+    and unlike _parse_loss (whole file, for the curve) its cost must not grow with the log."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            f.seek(max(0, size - max_bytes))
+            text = f.read().decode("utf-8", "replace")
+    except OSError:
+        return None, None
+    c = t = None
+    for m in re.finditer(r"(\d+)\s*/\s*(\d+)\s*\[", text):
+        c, t = int(m.group(1)), int(m.group(2))
+    return c, t
+
+
 def runs_state():
     out = []
     for rj in sorted(glob.glob(os.path.join(SESSION_DIR, "runs", "*", "run.json"))):
         d = _read(rj)
         if d:
             out.append(d)
+    # run.json is rewritten by the watchdog on ITS poll (60s), so a dashboard refreshing every 5s
+    # still showed a step frozen for a minute and then jumping ~17 at once. Read the live step
+    # straight off the log — the same source the watchdog reads, just not rate-limited by it.
+    # max() so a lagging parse can never walk the counter backwards.
+    if out and out[-1].get("status") == "running":
+        d, log = out[-1], _run_train_log()
+        if log:
+            count, total = _tail_tqdm(log)
+            cfg_steps = d.get("max_step")
+            if count is not None and total and cfg_steps:
+                # Same resume offset as everywhere else: a resumed tqdm restarts at 0 with
+                # total = cfg.steps - K, so absolute = count + (cfg.steps - total).
+                d["last_step"] = max(d.get("last_step") or 0, count + max(0, cfg_steps - total))
     return out
 
 
@@ -298,6 +327,12 @@ function draw(id,pts,o){
    if(!started){g.moveTo(x,y);started=true;}else g.lineTo(x,y);}g.stroke();
  if(o.dots){g.fillStyle=o.color||'#60a5fa';for(const p of pts){if(p[1]==null)continue;g.beginPath();g.arc(X(p[0]),Y(p[1]),2.5,0,7);g.fill();}}
 }
+// Write only what changed. The dashboard re-rendered EVERY section every 5s, and the gallery
+// rebuilt every <img> element each time — the browser re-created and re-decoded images that had
+// not changed, which is what made the page feel sluggish. Stashing the last markup on the node
+// and skipping identical writes turns almost every tick into a few text updates.
+function setHTML(id,h){const e=document.getElementById(id);if(e&&e.__h!==h){e.__h=h;e.innerHTML=h;}}
+function setText(e,v){v=String(v);if(e&&e.textContent!==v)e.textContent=v;}
 async function tick(){
  try{
   const s=await (await fetch('api/session')).json();
@@ -307,23 +342,40 @@ async function tick(){
   const order=['overview','dataset_explore','preprocess','training_plan','train'];
   for(const st of order){const o=(s.stages||{})[st]||{};
     h+='<tr><td>'+st+'</td><td><span class="b '+cls(o.status)+'">'+(o.status||'pending')+'</span></td><td>'+(o.summary||'')+'</td></tr>';}
-  h+='</table>';document.getElementById('stages').innerHTML=h;
+  h+='</table>';setHTML('stages',h);
   const runs=await (await fetch('api/runs')).json();
-  let r='';
-  for(const run of runs){
-   const cur=run.last_step||0,max=run.max_step||0,pct=max?Math.min(100,100*cur/max):0;
-   r+='<div class="card"><div class="row"><b>'+run.run_id+'</b>'
-     +'<span class="b '+cls(run.status)+'">'+(run.status||'')+'</span>'
-     +'<div><span class="k">step</span> <span class="v">'+cur+(max?'/'+max:'')+'</span></div>'
-     +'<div><span class="k">loss</span> <span class="v">'+(run.last_loss??'—')+'</span></div>'
-     +'<div><span class="k">restarts</span> <span class="v">'+(run.restarts||0)+'</span></div>'
-     +'<div><span class="k">ckpt</span> <span class="v">'+(run.checkpoint||'—')+'</span></div></div>'
-     +'<div class="bar"><div class="fill" style="width:'+pct+'%"></div></div>';
-   if(run.reason) r+='<div class="sub" style="margin-top:8px">reason: '+run.reason+'</div>';
-   if(run.resume) r+='<div class="sub">'+run.resume+(run.backoff_s?(' (backoff '+run.backoff_s+'s)'):'')+'</div>';
-   r+='</div>';
+  // Card skeletons are built ONCE per set of run_ids; every later tick only writes the numbers.
+  // step/loss change on every poll, so a guard alone would not help here — rebuilding the card
+  // also recreated the progress bar (killing its transition) and threw away the DOM each time.
+  const wrap=document.getElementById('runs');
+  if(!runs.length){setHTML('runs','<div class="card sub">no runs yet</div>');}
+  else{
+   const ids=runs.map(x=>x.run_id).join(',');
+   if(wrap.__ids!==ids){wrap.__h=null;wrap.__ids=ids;wrap.innerHTML=runs.map(run=>
+     '<div class="card"><div class="row"><b>'+run.run_id+'</b>'
+     +'<span class="b" data-f="status"></span>'
+     +'<div><span class="k">step</span> <span class="v" data-f="step"></span></div>'
+     +'<div><span class="k">loss</span> <span class="v" data-f="loss"></span></div>'
+     +'<div><span class="k">restarts</span> <span class="v" data-f="restarts"></span></div>'
+     +'<div><span class="k">ckpt</span> <span class="v" data-f="ckpt"></span></div></div>'
+     +'<div class="bar"><div class="fill" data-f="bar"></div></div>'
+     +'<div class="sub" data-f="reason" style="margin-top:8px" hidden></div>'
+     +'<div class="sub" data-f="resume" hidden></div></div>').join('');}
+   runs.forEach((run,i)=>{
+    const c=wrap.children[i];if(!c)return;
+    const f=n=>c.querySelector('[data-f="'+n+'"]');
+    const cur=run.last_step||0,max=run.max_step||0,pct=max?Math.min(100,100*cur/max):0;
+    const st=f('status');setText(st,run.status||'');st.className='b '+cls(run.status);
+    setText(f('step'),cur+(max?'/'+max:''));
+    setText(f('loss'),run.last_loss??'—');
+    setText(f('restarts'),run.restarts||0);
+    setText(f('ckpt'),run.checkpoint||'—');
+    f('bar').style.width=pct+'%';
+    const rs=f('reason');rs.hidden=!run.reason;if(run.reason)setText(rs,'reason: '+run.reason);
+    const rr=f('resume');rr.hidden=!run.resume;
+    if(run.resume)setText(rr,run.resume+(run.backoff_s?(' (backoff '+run.backoff_s+'s)'):''));
+   });
   }
-  document.getElementById('runs').innerHTML=r||'<div class="card sub">no runs yet</div>';
   const m=await (await fetch('api/metrics')).json();
   const as=m.assessment||{};
   document.getElementById('assessv').textContent=as.verdict||'—';
@@ -333,7 +385,7 @@ async function tick(){
     for(const[n,d]of Object.entries(ed.per_dataset)){const mm=d.metrics||d;
       t+='<tr><td>'+n+'</td><td>'+(mm.mse!=null?mm.mse.toFixed(3):'—')+'</td><td>'+(mm.mae!=null?mm.mae.toFixed(3):'—')+'</td></tr>';}
     t+='<tr><td><b>mean</b></td><td><b>'+(ed.mean_mse!=null?ed.mean_mse.toFixed(3):'—')+'</b></td><td><b>'+(ed.mean_mae!=null?ed.mean_mae.toFixed(3):'—')+'</b></td></tr></table>';
-    document.getElementById('evaltable').innerHTML=t;}
+    setHTML('evaltable',t);}
   const loss=m.loss||[];draw('lossc',loss,{ylog:true,color:'#4ade80'});
   document.getElementById('lossv').textContent=loss.length?('last '+loss[loss.length-1][1]):'';
   const ev=(m.eval||[]).map(e=>[e[0],e[1]]);draw('evalc',ev,{color:'#60a5fa',dots:true});
@@ -342,13 +394,13 @@ async function tick(){
   const plots=await (await fetch('api/plots')).json();
   const steps=plots.map(p=>p.step);
   let tabs='';for(const st of steps){tabs+='<span class="seltab'+((SELCK===st||(SELCK===null&&st===steps[steps.length-1]))?' on':'')+'" onclick="SELCK='+st+';tick()">ckpt-'+st+'</span>';}
-  document.getElementById('ckpttabs').innerHTML=tabs;
+  setHTML('ckpttabs',tabs);
   const sel=SELCK!==null?plots.find(p=>p.step===SELCK):plots[plots.length-1];
   let g='';if(sel){for(const[name,imgs]of Object.entries(sel.datasets)){
     g+='<div class="gcol"><div class="gname">'+name+'</div>';
     for(const rel of imgs){g+='<img loading="lazy" src="plot?p='+encodeURIComponent(rel)+'">';}
     g+='</div>';}}
-  document.getElementById('gallery').innerHTML=g||'<div class="cv">no plots yet</div>';
+  setHTML('gallery',g||'<div class="cv">no plots yet</div>');   // the expensive one: skips rebuilding every <img>
  }catch(e){}
 }
 tick();setInterval(tick,5000);
