@@ -1,0 +1,37 @@
+{{- $name := default .Release.Name .Values.nameOverride -}}
+{{- if not .Values.nodeIp }}
+{{/* Only exists when the init container has to look the CLB's IP up. Setting nodeIp explicitly
+     removes all three of these objects — worth doing once the IP is known and stable.
+
+     The grant is exactly one verb on one resource kind in one namespace: `get` on Services. It
+     cannot list secrets, read other namespaces, or write anything. */}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}-ip
+  labels: { app: {{ $name }} }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}-ip
+  labels: { app: {{ $name }} }
+rules:
+  - apiGroups: [""]
+    resources: ["services"]
+    resourceNames: ["{{ $name }}-clb"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}-ip
+  labels: { app: {{ $name }} }
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}-ip
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}-ip
+{{- end }}

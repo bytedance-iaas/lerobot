@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# Runtime bootstrap. HERMES_HOME is typically a PVC, so the config + robot_sft
+# skill baked into the image at build time are shadowed by the (initially empty)
+# volume. Restore them from the image's baked snapshot with a LOCAL copy — no
+# network / GitHub access needed at runtime.
+#
+# The Ark api key is NOT in the snapshot: the user enters it once in the UI and it
+# then persists on the PVC. Chat sessions also accumulate on the PVC.
+set -e
+
+export HERMES_HOME="${HERMES_HOME:-/opt/data}"
+mkdir -p "$HERMES_HOME"
+SEED="/opt/hermes-seed"
+
+# --- CPU thread caps: match the cgroup quota, NOT the node's core count -------------------
+# The container sees every core on the node (nproc=180) but is cgroup-limited (e.g. 16 cores).
+# torch/OpenMP/MKL size their thread pools from the visible count, so torch defaults to ~90
+# threads that then thrash over the 16 real cores -> heavy CFS throttling + SLOW imports, model
+# loads, fp8 state-dict remaps, and preprocessing (MEASURED: a CPU matmul was ~2x slower at 90
+# threads vs 16). Derive the real quota from cgroup v2 cpu.max and pin the common knobs. Every
+# child (console server, hermes acp, lerobot-train / preflight subprocesses) inherits these.
+# Respects any value already set in the environment.
+if [ -r /sys/fs/cgroup/cpu.max ]; then
+  read -r _q _p < /sys/fs/cgroup/cpu.max || true
+  if [ "$_q" != "max" ] && [ "${_p:-0}" -gt 0 ] 2>/dev/null; then
+    CORES=$(( _q / _p )); [ "$CORES" -lt 1 ] && CORES=1
+    export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$CORES}"
+    export MKL_NUM_THREADS="${MKL_NUM_THREADS:-$CORES}"
+    export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-$CORES}"
+    export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-$CORES}"
+    export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-$CORES}"
+    echo "==> CPU quota ${CORES} cores -> capped OMP/MKL/OpenBLAS/numexpr/veclib threads to ${CORES} (node has $(nproc) cores)"
+  fi
+fi
+
+# --- sshd: pod-to-pod ssh for multi-node training (checkpoint scp master->workers) --------
+# The image bakes one shared keypair + authorized_keys (see Dockerfile), so any two console
+# pods ssh each other passwordlessly. Host keys are per-boot (pods have no stable identity;
+# the baked ssh config sets StrictHostKeyChecking=no). Never block the console on ssh (|| true).
+if [ -x /usr/sbin/sshd ]; then
+  ssh-keygen -A >/dev/null 2>&1 || true
+  mkdir -p /run/sshd
+  /usr/sbin/sshd 2>/dev/null && echo "==> sshd up (:22, key-only, cluster-internal)" || true
+fi
+
+# --- one shell-init file, hooked from every entry point a bash can take -------------------
+# Four shell flavours, three DIFFERENT hooks, and missing any one of them produces a bug that
+# looks like something else entirely:
+#   login (`bash -l`, ssh login)        -> /etc/profile.d/*.sh
+#   non-interactive (`bash -c`)         -> $BASH_ENV        (reads NO rc file otherwise)
+#   ssh remote command (`ssh h 'cmd'`)  -> ~/.bashrc        (Debian bash sources it when stdin
+#                                                            is a socket; $BASH_ENV does NOT
+#                                                            survive the ssh boundary)
+#   interactive                         -> ~/.bashrc
+#
+# sshd builds its own environment from scratch: neither the image's ENV nor PID 1's exports
+# cross into an ssh session. Measured on the worker, `ssh host 'which accelerate'` came back
+# empty with PATH=/root/.local/bin:/usr/local/sbin:... — no venv — while the same command under
+# `bash -l -s` found it. That is why the venv is put on PATH here rather than only in
+# /etc/profile.d/10-lerobot-venv.sh, which login shells alone read.
+#
+# PATH is extended idempotently instead of sourcing the venv's `activate`: this file is sourced
+# by EVERY bash, including nested ones, and activate prepends unconditionally.
+CONSOLE_ENV="$HERMES_HOME/.console-env.sh"
+SHELL_INIT=/etc/console-shell-init.sh
+if [ ! -e "$CONSOLE_ENV" ]; then
+  printf '# Managed by `multinode.py env`. Exports only.\n' > "$CONSOLE_ENV"
+  chmod 600 "$CONSOLE_ENV"
+fi
+cat > "$SHELL_INIT" <<INIT
+# Managed by docker-entrypoint.sh. Sourced by every shell on this node — keep it cheap and
+# incapable of failing, or every command on the box breaks.
+case ":\$PATH:" in
+  *":/lerobot/.venv/bin:"*) ;;
+  *) [ -d /lerobot/.venv/bin ] && PATH="/lerobot/.venv/bin:\$PATH" && export PATH ;;
+esac
+[ -r $CONSOLE_ENV ] && . $CONSOLE_ENV
+INIT
+printf '[ -r %s ] && . %s\n' "$SHELL_INIT" "$SHELL_INIT" > /etc/profile.d/10-console-env.sh
+export BASH_ENV="$SHELL_INIT"
+# ~/.bashrc is the ONLY one of the three an `ssh host 'cmd'` reads. Appended once, by marker:
+# this runs on every boot, and $HERMES_HOME/.bashrc lives on the PVC.
+for _rc in /root/.bashrc "$HERMES_HOME/.bashrc"; do
+  touch "$_rc" 2>/dev/null || continue
+  grep -q console-shell-init "$_rc" 2>/dev/null && continue
+  printf '\n[ -r %s ] && . %s\n' "$SHELL_INIT" "$SHELL_INIT" >> "$_rc"
+done
+echo "==> shell init: $SHELL_INIT (profile.d + BASH_ENV + ~/.bashrc; venv on PATH for ssh too)"
+
+# Fresh PVC (no config yet) → seed config + skill from the baked image snapshot.
+#
+# Why a snapshot exists at all, when the build installs into HERMES_HOME directly: by the time
+# this script runs the PVC is ALREADY mounted over /opt/data, so the image's own copy of that
+# path is unreachable. $SEED is the same content at a path the mount cannot shadow.
+if [ ! -s "$HERMES_HOME/config.yaml" ] && [ -d "$SEED" ]; then
+  echo "==> seeding HERMES_HOME from baked snapshot (offline)"
+  cp -a "$SEED/." "$HERMES_HOME/"
+fi
+
+# Enforce console policy on EVERY boot. config.yaml lives on the PVC and SHADOWS the image seed,
+# so an image rollout alone never updates an existing PVC — we must re-assert this each start
+# (same reason the skill needs a symlink).
+#   - delegation.orchestrator_enabled=false : the main agent does ALL work in ONE session; no
+#     subagent/task delegation. This is the fix for "switch session shows only the first line":
+#     with delegation on, robot_sft spawned a `source=subagent` CHILD session per stage, so the
+#     main session the console loads held only the first user message while the real work (25/21/16
+#     messages) lived in hidden subagent children. Off → the whole conversation stays in the main
+#     session → switch replays full history. Pairs with CHAT_DIRECTIVE's system-prompt steer.
+#   NOTE: compression stays ENABLED (default) — it is unrelated to this bug and must stay on.
+if command -v hermes >/dev/null 2>&1; then
+  hermes config set delegation.orchestrator_enabled false >/dev/null 2>&1 || true
+  # The REAL subagent kill-switch is disabling the "delegation" TOOLSET. orchestrator_enabled=false
+  # ONLY disables the async orchestrator — the basic `delegate` tool still spawns single subagents
+  # (verified: it kept creating source=subagent child sessions). Must be a YAML LIST: `hermes config
+  # set` stringifies JSON to '["delegation"]' which frozenset()s into chars and is inert. Edit
+  # config.yaml with the hermes interpreter; only rewrites when the entry is missing. Idempotent.
+  /opt/hermes/.venv/bin/python - "$HERMES_HOME/config.yaml" <<'PY' 2>/dev/null || echo "WARN: could not disable the delegation toolset"
+import sys, yaml
+p = sys.argv[1]
+c = yaml.safe_load(open(p)) or {}
+a = c.setdefault("agent", {})
+dt = a.get("disabled_toolsets")
+dt = dt if isinstance(dt, list) else []
+# browser/browser-cdp: the image ships no node and no Chromium (see Dockerfile). hermes would
+# report these unavailable anyway, but "unavailable" is decided by a presence check that its
+# own lazy installer is allowed to FIX at runtime -- which is how a fresh PVC ended up paying
+# a 2m34s download on its first message. Disabling the toolsets is the part that actually
+# guarantees the installer never fires.
+want = ["delegation", "browser", "browser-cdp"]
+missing = [x for x in want if x not in dt]
+if missing:
+    dt.extend(missing)
+    a["disabled_toolsets"] = dt
+    yaml.safe_dump(c, open(p, "w"), default_flow_style=False, allow_unicode=True, sort_keys=False)
+PY
+  echo "==> enforced: agent.disabled_toolsets = delegation (subagents OFF) + browser/browser-cdp (no node/Chromium in image); compression left ENABLED"
+
+  # model.default = ARK_MODELS[0] on EVERY boot. ARK_MODELS is the single source of truth for the
+  # chat model (set in the Dockerfile ENV); the default is always its FIRST entry. Enforced here too
+  # because the PVC's config.yaml shadows the image seed — otherwise a stale/UI-drifted default
+  # (e.g. someone picked deepseek) would stick across rollouts. Users still pick any model per-session
+  # from the dropdown; this only sets the INITIAL default. No-op if ARK_MODELS is unset.
+  ARK_DEFAULT="${ARK_MODELS%%,*}"
+  if [ -n "$ARK_DEFAULT" ]; then
+    hermes config set model.default "$ARK_DEFAULT" >/dev/null 2>&1 \
+      && echo "==> enforced: model.default = ARK_MODELS[0] ($ARK_DEFAULT)" \
+      || echo "WARN: could not set model.default"
+  fi
+fi
+
+# robot_sft skill: keep it OFF the PVC so it TRACKS THE IMAGE and updates on every
+# rollout. The skill content lives in the image at /opt/agent-console/vendor/robot_sft;
+# the PVC's skills/robot_sft is only a SYMLINK to it (hermes follows it — verified).
+# Force the symlink on EVERY boot: a new rollout's vendor/robot_sft wins immediately,
+# and any stale REAL dir left on an older PVC (from the previous copy-based seeding) is
+# replaced. This intentionally means live in-pod edits to the skill do NOT persist — the
+# image is now the single source of truth for robot_sft.
+VENDOR_SKILL=/opt/agent-console/vendor/robot_sft
+if [ -d "$VENDOR_SKILL" ]; then
+  mkdir -p "$HERMES_HOME/skills"
+  rm -rf "$HERMES_HOME/skills/robot_sft"          # drop stale real dir or old symlink
+  ln -sfn "$VENDOR_SKILL" "$HERMES_HOME/skills/robot_sft"
+  echo "==> linked robot_sft -> $VENDOR_SKILL (tracks image, not PVC)"
+elif command -v hermes >/dev/null 2>&1 && ! hermes skills list 2>/dev/null | grep -qi "robot_sft"; then
+  # vendor copy missing (should never happen) → last-resort network install (needs GitHub)
+  echo "==> robot_sft vendor copy missing; attempting network install (needs GitHub)"
+  bash /opt/agent-console/scripts/install_skill.sh || echo "WARN: skill unavailable; chat still works without it"
+fi
+
+exec "$@"

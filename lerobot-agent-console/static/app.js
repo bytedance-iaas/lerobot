@@ -1,0 +1,1005 @@
+/* LeRobot Agent Console — front-end glue.
+ *   - terminal: xterm.js  <-> WS /ws/term  (a real PTY, the "ssh console")
+ *   - chat:     WS /ws/chat <-> hermes agent; HTML answers render in the viewer
+ *   - viewer:   browser-like tabs over /proxy/<port> services + agent HTML output
+ *   - splitters: drag to resize panels
+ *   - first chat use prompts for the Volcengine (Ark) api key (chat only)
+ */
+(() => {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  const wsURL = (p) => (location.protocol === "https:" ? "wss://" : "ws://") + location.host + p;
+  let sessionActive = false;   // single-session lock: only reconnect WS while we hold it
+
+  /* --------------------------------------------------------------- theme */
+  // Two looks: `arco` (matches the Volcengine console) and `classic` (this app's own earlier
+  // identity). The choice is a per-browser preference, so it lives in localStorage — not on the
+  // PVC, where it would follow the pod rather than the person. <head> already applied the stored
+  // value before first paint; this only wires the buttons and keeps them in sync.
+  (function themeSwitch() {
+    const KEY = "console-theme";
+    const root = document.documentElement;
+    const sw = $("theme-switch");
+    if (!sw) return;
+    const paint = (t) => sw.querySelectorAll("[data-theme-opt]").forEach((b) =>
+      b.classList.toggle("on", b.dataset.themeOpt === t));
+    paint(root.dataset.theme || "arco");
+    sw.addEventListener("click", (e) => {
+      const b = e.target.closest("[data-theme-opt]");
+      if (!b) return;
+      const t = b.dataset.themeOpt;
+      root.dataset.theme = t;
+      try { localStorage.setItem(KEY, t); } catch (_) {}
+      paint(t);
+      // The terminal is a canvas, not DOM — its colours come from the xterm theme object, so a
+      // CSS variable change does not reach it. Nothing to repaint here; the panels around it do
+      // follow, which is the visible part.
+    });
+  })();
+
+  /* ------------------------------------------------------- terminal (tabbed) */
+  // Each tab is its own PTY: a /ws/term connection forks a fresh shell server-side,
+  // so tabs are fully independent. The manager owns xterm instances + their sockets.
+  const TERM = (() => {
+    const stack = $("term-stack"), tabBar = $("term-tabs");
+    const TERM_OPTS = {
+      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+      fontSize: 13.5,
+      theme: { background: "#0b0f17", foreground: "#d6deeb", cursor: "#5aa7ff" },
+      cursorBlink: true, convertEol: true,
+    };
+    const tabs = new Map();   // id -> { id, term, fit, ws, el, tabEl }
+    let active = null, seq = 0;
+
+    function sendResize(t) {
+      if (t.ws && t.ws.readyState === 1)
+        t.ws.send(JSON.stringify({ type: "resize", cols: t.term.cols, rows: t.term.rows }));
+    }
+    function refit() {
+      const t = tabs.get(active);
+      if (t) try { t.fit.fit(); sendResize(t); } catch (_) {}
+    }
+    function connect(t) {
+      t.ws = new WebSocket(wsURL("/ws/term"));
+      t.ws.binaryType = "arraybuffer";
+      t.ws.onopen = () => sendResize(t);
+      t.ws.onmessage = (e) => t.term.write(typeof e.data === "string" ? e.data : new Uint8Array(e.data));
+      t.ws.onclose = () => {
+        if (!sessionActive || !tabs.has(t.id)) return;
+        t.term.write("\r\n\x1b[33m[console disconnected — reconnecting…]\x1b[0m\r\n");
+        setTimeout(() => { if (sessionActive && tabs.has(t.id)) connect(t); }, 1500);
+      };
+    }
+    function activate(id) {
+      if (!tabs.has(id)) return;
+      active = id;
+      for (const [tid, t] of tabs) {
+        const on = tid === id;
+        t.el.classList.toggle("active", on);
+        t.tabEl.classList.toggle("active", on);
+      }
+      refit();
+      const t = tabs.get(id);
+      if (t) setTimeout(() => t.term.focus(), 0);
+    }
+    function open() {
+      const id = "term" + ++seq;
+      const el = document.createElement("div");
+      el.className = "term-pane";
+      stack.appendChild(el);
+      const term = new Terminal(TERM_OPTS);
+      const fit = new FitAddon.FitAddon();
+      term.loadAddon(fit);
+      term.open(el);
+      term.onData((d) => {
+        const t = tabs.get(id);
+        if (t && t.ws && t.ws.readyState === 1) t.ws.send(JSON.stringify({ type: "input", data: d }));
+      });
+      const tabEl = document.createElement("button");
+      tabEl.className = "term-tab";
+      tabEl.dataset.id = id;
+      tabEl.innerHTML = `<span class="tt-label"></span><span class="tt-close" title="关闭">✕</span>`;
+      tabEl.querySelector(".tt-label").textContent = "终端 " + seq;
+      tabBar.appendChild(tabEl);
+      const t = { id, term, fit, ws: null, el, tabEl };
+      tabs.set(id, t);
+      connect(t);
+      activate(id);
+      return id;
+    }
+    function close(id) {
+      const t = tabs.get(id);
+      if (!t || tabs.size <= 1) return;   // always keep at least one terminal
+      try { t.ws && t.ws.close(); } catch (_) {}
+      try { t.term.dispose(); } catch (_) {}
+      t.el.remove(); t.tabEl.remove(); tabs.delete(id);
+      if (active === id) activate([...tabs.keys()].pop());
+    }
+    tabBar.addEventListener("click", (e) => {
+      const tab = e.target.closest(".term-tab");
+      if (!tab) return;
+      if (e.target.closest(".tt-close")) close(tab.dataset.id);
+      else activate(tab.dataset.id);
+    });
+    $("term-add").onclick = () => open();
+    $("term-clear").onclick = () => { const t = tabs.get(active); if (t) t.term.clear(); };
+    window.addEventListener("resize", refit);
+
+    return {
+      refit,
+      // (re)connect sockets when our session lock is granted; open one if none yet.
+      start() { if (tabs.size === 0) open(); else for (const t of tabs.values()) if (!t.ws || t.ws.readyState > 1) connect(t); },
+      stop() { for (const t of tabs.values()) try { t.ws && t.ws.close(); } catch (_) {} },
+    };
+  })();
+  const refit = () => TERM.refit();
+
+  /* ------------------------------------------------------------------- viewer */
+  const viewerTabs = $("viewer-tabs"), viewerBody = $("viewer-body"), viewerEmpty = $("viewer-empty");
+  const tabs = new Map();             // id -> { tabEl, paneEl, kind, port }
+  let tabSeq = 0;
+
+  // The viewer is a pure inline browser: no default tab. When empty, show the
+  // "new tab" placeholder; otherwise the active tab's iframe fills the area.
+  function activate(id) {
+    if (!tabs.has(id)) id = null;
+    for (const [tid, t] of tabs) {
+      const on = tid === id;
+      t.tabEl.classList.toggle("active", on);
+      t.paneEl.classList.toggle("active", on);
+    }
+    viewerEmpty.hidden = tabs.size > 0;
+  }
+
+  function makeTab(id, label, { closeable = true, live = false } = {}) {
+    const tabEl = document.createElement("button");
+    tabEl.className = "vtab";
+    tabEl.dataset.tab = id;
+    tabEl.innerHTML =
+      (live ? '<span class="vt-dot"></span>' : "") +
+      `<span class="vt-label"></span>` +
+      (closeable ? '<span class="vt-close" title="关闭">✕</span>' : "");
+    tabEl.querySelector(".vt-label").textContent = label;
+    viewerTabs.appendChild(tabEl);
+    return tabEl;
+  }
+
+  function addServiceTab(port, label) {
+    for (const [tid, t] of tabs) if (t.kind === "service" && t.port === port) { activate(tid); return tid; }
+    const id = "t" + ++tabSeq;
+    const tabEl = makeTab(id, label || ("localhost:" + port), { live: true });
+    const pane = document.createElement("div");
+    pane.className = "vpane";
+    pane.dataset.pane = id;
+    const iframe = document.createElement("iframe");
+    iframe.setAttribute("sandbox", "allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-downloads");
+    iframe.src = "/proxy/" + port + "/";
+    pane.appendChild(iframe);
+    viewerBody.appendChild(pane);
+    tabs.set(id, { tabEl, paneEl: pane, kind: "service", port });
+    activate(id);
+    return id;
+  }
+
+  function addExternalTab(url) {
+    const id = "t" + ++tabSeq;
+    const tabEl = makeTab(id, url.replace(/^https?:\/\//, "").slice(0, 28));
+    const pane = document.createElement("div");
+    pane.className = "vpane";
+    pane.dataset.pane = id;
+    const iframe = document.createElement("iframe");
+    iframe.src = url;
+    pane.appendChild(iframe);
+    viewerBody.appendChild(pane);
+    tabs.set(id, { tabEl, paneEl: pane, kind: "external" });
+    activate(id);
+    return id;
+  }
+
+  // A "doc" tab renders a markdown file (e.g. the Release Notes welcome page) into a
+  // scrollable pane — no iframe, just fetch + a tiny markdown -> HTML pass.
+  // Links in chat/artifacts open in a NEW TAB — a plain <a> would navigate the whole
+  // single-page console away and lose the session. Also harden with rel=noopener.
+  DOMPurify.addHook("afterSanitizeAttributes", (node) => {
+    if (node.tagName === "A" && node.getAttribute("href")) {
+      node.setAttribute("target", "_blank");
+      node.setAttribute("rel", "noopener noreferrer");
+    }
+  });
+  // Render markdown (and any inline HTML the model emits) to safe HTML via marked + DOMPurify.
+  function renderMD(src) {
+    return DOMPurify.sanitize(marked.parse(src || "", { gfm: true, breaks: true }));
+  }
+
+  function addDocTab(id, label, url) {
+    if (tabs.has(id)) { activate(id); return id; }
+    const tabEl = makeTab(id, label);
+    const pane = document.createElement("div");
+    pane.className = "vpane vpane-doc";
+    pane.dataset.pane = id;
+    const doc = document.createElement("div");
+    doc.className = "md-body";
+    doc.innerHTML = '<p class="md-loading">加载中…</p>';
+    pane.appendChild(doc);
+    viewerBody.appendChild(pane);
+    tabs.set(id, { tabEl, paneEl: pane, kind: "doc" });
+    // The welcome/release-notes doc also gets a live deployed-version banner (fetched
+    // server-side, so it's correct regardless of any stale browser cache).
+    const wantVer = id === "welcome";
+    Promise.all([
+      fetch(url).then((r) => r.text()).catch(() => "# " + label + "\n\n(无法加载)"),
+      wantVer
+        ? fetch("/api/version", { cache: "no-store" }).then((r) => r.json()).catch(() => ({}))
+        : Promise.resolve(null),
+    ]).then(([md, ver]) => {
+      let banner = "";
+      if (ver) {
+        const short = (s) => (s || "unknown").slice(0, 12);
+        banner =
+          '<div class="md-ver">当前部署版本 · lerobot <code>' + short(ver.lerobot) +
+          '</code> · console <code>' + short(ver.console) + "</code></div>";
+      }
+      doc.innerHTML = banner + renderMD(md);
+    });
+    activate(id);
+    return id;
+  }
+
+  function closeTab(id) {
+    const t = tabs.get(id);
+    if (!t) return;
+    const wasActive = t.tabEl.classList.contains("active");
+    t.tabEl.remove(); t.paneEl.remove(); tabs.delete(id);
+    if (wasActive) activate([...tabs.keys()].pop() || null);
+  }
+
+  viewerTabs.addEventListener("click", (e) => {
+    const closeBtn = e.target.closest(".vt-close");
+    const tab = e.target.closest(".vtab");
+    if (!tab) return;
+    if (closeBtn) { closeTab(tab.dataset.tab); return; }
+    activate(tab.dataset.tab);
+  });
+
+  // open <url-or-port> heuristics
+  function openTarget(raw) {
+    const s = (raw || "").trim();
+    if (!s) return;
+    let m;
+    if (/^\d+$/.test(s)) return addServiceTab(parseInt(s, 10));
+    if ((m = s.match(/^(?:https?:\/\/)?(?:localhost|127\.0\.0\.1):(\d+)/i))) return addServiceTab(parseInt(m[1], 10));
+    if (s.startsWith("/proxy/")) { const p = s.split("/")[2]; return addServiceTab(parseInt(p, 10)); }
+    if (/^https?:\/\//i.test(s)) return addExternalTab(s);
+    return addExternalTab("http://" + s);
+  }
+
+  /* --------------------------------------------------------------- open menu */
+  const openMenu = $("open-menu"), omList = $("om-list");
+  function toggleOpenMenu(force) {
+    const show = force !== undefined ? force : openMenu.hidden;
+    openMenu.hidden = !show;
+    if (show) {
+      const r = $("viewer-add").getBoundingClientRect();
+      openMenu.style.top = r.bottom + 6 + "px";
+      openMenu.style.left = Math.max(8, r.right - 320) + "px";
+      refreshServices();
+    }
+  }
+  $("viewer-add").onclick = (e) => { e.stopPropagation(); toggleOpenMenu(); };
+  $("viewer-empty-open").onclick = (e) => { e.stopPropagation(); toggleOpenMenu(true); };
+  document.addEventListener("click", (e) => {
+    if (!openMenu.hidden && !openMenu.contains(e.target) && e.target !== $("viewer-add")) toggleOpenMenu(false);
+  });
+  $("om-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    openTarget($("om-url").value);
+    $("om-url").value = "";
+    toggleOpenMenu(false);
+  });
+  async function refreshServices() {
+    try {
+      const { services } = await (await fetch("/api/services")).json();
+      if (!services.length) { omList.innerHTML = '<div class="om-empty">未发现本地服务</div>'; return; }
+      omList.innerHTML = "";
+      services.forEach((s) => {
+        const row = document.createElement("div");
+        row.className = "om-item";
+        row.innerHTML = `<span class="om-port">:${s.port}</span><span class="om-svc"></span><span class="om-proc"></span>`;
+        row.querySelector(".om-svc").textContent = s.label;
+        row.querySelector(".om-proc").textContent = s.proc || "";
+        row.onclick = () => { addServiceTab(s.port, ":" + s.port + " " + (s.proc || "")); toggleOpenMenu(false); };
+        omList.appendChild(row);
+      });
+    } catch (_) { omList.innerHTML = '<div class="om-empty">读取失败</div>'; }
+  }
+
+  /* --------------------------------------------------------------------- chat */
+  const body = $("chat-body"), textEl = $("chat-text"), sendBtn = $("chat-send");
+  let chatWS, busy = false, chatReady = false, pendingText = null;
+
+  function addMsg(role, text) {
+    const wrap = document.createElement("div");
+    wrap.className = "msg " + (role === "user" ? "msg-user" : "msg-bot");
+    const ava = document.createElement("span");
+    ava.className = "msg-ava";
+    ava.textContent = role === "user" ? "你" : "L";
+    const bubble = document.createElement("div");
+    bubble.className = "bubble";
+    bubble.textContent = text;
+    wrap.append(ava, bubble);
+    body.appendChild(wrap);
+    body.scrollTop = body.scrollHeight;
+    return bubble;
+  }
+  // ----- liveness: one interval drives every spinner + elapsed clock on the page -----
+  // A single timer (not per-element CSS animation) so the frames stay in lockstep and, more
+  // importantly, so they all STOP the instant the turn ends — a spinner still turning after the
+  // answer landed reads as "still working" and is worse than showing nothing.
+  const SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+  const spinner = { timer: null, frame: 0, turnAt: 0 };
+  function fmtElapsed(ms) {
+    const s = Math.floor(ms / 1000);
+    return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`;
+  }
+  function spinTick() {
+    const ch = SPIN[spinner.frame++ % SPIN.length];
+    document.querySelectorAll("[data-spin]").forEach((el) => { el.textContent = ch; });
+    // Each running tool times itself from when its card appeared, not from the turn start —
+    // "this download has been going 4m" is the number you actually want.
+    document.querySelectorAll("[data-since]").forEach((el) => {
+      el.textContent = " · " + fmtElapsed(Date.now() - Number(el.dataset.since));
+    });
+    const e = $("run-elapsed");
+    if (e && spinner.turnAt) e.textContent = "· " + fmtElapsed(Date.now() - spinner.turnAt);
+  }
+  function startSpin() {
+    if (spinner.timer) return;                  // already running: keep the turn's original clock
+    spinner.turnAt = Date.now();
+    spinTick();
+    spinner.timer = setInterval(spinTick, 90);
+  }
+  function stopSpin() {
+    if (spinner.timer) { clearInterval(spinner.timer); spinner.timer = null; }
+    document.querySelectorAll("[data-spin]").forEach((el) => { el.textContent = ""; });
+    const e = $("run-elapsed");
+    if (e) e.textContent = "";
+  }
+  function setRunStatus(text) {
+    const t = $("run-status-text");
+    if (t) t.textContent = text;
+  }
+
+  function setBusy(b) {
+    busy = b;
+    sendBtn.disabled = false;                 // stays clickable so it can stop
+    sendBtn.classList.toggle("is-stop", b);
+    sendBtn.textContent = b ? "■" : "➤";
+    sendBtn.title = b ? "停止" : "发送";
+    const bar = $("run-status");
+    if (bar) bar.hidden = !b;
+    if (b) startSpin(); else stopSpin();
+  }
+  function stopTurn() {
+    if (chatWS && chatWS.readyState === 1) chatWS.send(JSON.stringify({ type: "stop" }));
+  }
+
+  // Streaming-turn state. Like Claude Code / Codex, a turn is a CHRONOLOGICAL stream of
+  // segments — reasoning (💭), output (assistant text), and tool cards — in arrival order.
+  // A new tool call closes the current reasoning/output segment; the next chunk opens a
+  // fresh one. So think→output→tool→output→… naturally interleaves.
+  let curSeg = null;      // { kind:'think'|'output', el, refs, text }
+  let toolEls = {};       // tool cards by id (dedup status updates)
+  let pendingEl = null;   // initial "思考中" placeholder, removed on the first content
+  function rm(el) { if (el) el.closest(".msg").remove(); }
+
+  function startTurn(booting, resumed) {
+    curSeg = null; toolEls = {};
+    // `resumed` = we reconnected INTO a turn that was already running. Its earlier output went to
+    // the socket that died and cannot be replayed, so do not pretend this is a fresh turn: just
+    // re-arm the busy state so the tokens still to come actually render.
+    pendingEl = addMsg("bot", resumed ? "（重新连接,该轮仍在进行）" : booting ? "正在启动 Agent" : "思考中");
+    pendingEl.classList.add("thinking");
+    setBusy(true);                    // arms the status bar + spinner for the whole turn
+    setRunStatus(resumed ? "重新连接,该轮仍在进行" : booting ? "正在启动 Agent" : "思考中");
+  }
+  function clearPending() { if (pendingEl) { rm(pendingEl); pendingEl = null; } }
+
+  // Close the current segment: collapse a reasoning card, or finalize an output bubble
+  // (dropping it if it stayed empty).
+  function finalizeSeg() {
+    if (!curSeg) return;
+    if (curSeg.kind === "think") {
+      curSeg.refs.label.textContent = "💭 思考";
+      curSeg.refs.detail.hidden = true;                      // collapse (click to reopen)
+      curSeg.refs.caret.textContent = "▸";
+      if (!curSeg.text.trim()) rm(curSeg.el);
+    } else {
+      curSeg.el.classList.remove("thinking");
+      if (!curSeg.text.trim()) rm(curSeg.el);
+    }
+    curSeg = null;
+  }
+  function newThinkSeg() {
+    const wrap = document.createElement("div");
+    wrap.className = "msg msg-bot";
+    wrap.innerHTML = '<span class="msg-ava tool-ava">💭</span><div class="bubble tool-bubble think-bubble"></div>';
+    body.appendChild(wrap);
+    const bubble = wrap.querySelector(".tool-bubble");
+    const refs = buildToolBubble(bubble);
+    refs.detail.hidden = false;                              // stream expanded (visible live)
+    refs.caret.textContent = "▾";
+    curSeg = { kind: "think", el: bubble, refs, text: "" };
+  }
+  function newOutputSeg() {
+    const bubble = addMsg("bot", "");
+    bubble.classList.add("thinking");                        // blinking cursor while streaming
+    curSeg = { kind: "output", el: bubble, refs: null, text: "" };
+  }
+  function addThought(text) {
+    if (!text) return;
+    clearPending();
+    setRunStatus("思考中");        // back from whatever tool name was showing
+    if (!curSeg || curSeg.kind !== "think") { finalizeSeg(); newThinkSeg(); }
+    curSeg.text += text;
+    curSeg.refs.detail.textContent = curSeg.text;
+    curSeg.refs.label.textContent = "💭 思考中…";
+    curSeg.el.classList.remove("no-detail");
+    body.scrollTop = body.scrollHeight;
+  }
+  // Render a bubble's raw text: full HTML artifacts via sanitize, otherwise markdown — so
+  // **bold** / `code` / lists render *live* while streaming, not as raw text that only snaps
+  // to rendered at the end of the turn.
+  function renderBubble(bubble, raw) {
+    bubble.classList.add("md-chat");
+    bubble.innerHTML = renderMD(raw);   // marked renders markdown + passes inline HTML; DOMPurify sanitizes
+  }
+  // Coalesce streamed tokens to one render per frame (~60fps) so we don't re-parse the whole
+  // bubble on every token.
+  let _renderPending = false;
+  function scheduleRender() {
+    if (_renderPending) return;
+    _renderPending = true;
+    requestAnimationFrame(() => {
+      _renderPending = false;
+      if (!curSeg || curSeg.kind !== "output") return;
+      curSeg.el.classList.remove("thinking");
+      renderBubble(curSeg.el, curSeg.text);
+      body.scrollTop = body.scrollHeight;
+    });
+  }
+  function appendToken(t) {
+    clearPending();
+    setRunStatus("生成回复中");
+    if (!curSeg || curSeg.kind !== "output") { finalizeSeg(); newOutputSeg(); }
+    curSeg.text += t;
+    scheduleRender();
+  }
+  // A tool card: clickable header (🔧 title · status) + a collapsible detail
+  // pane (the full command + output). Header toggles; caret shows the state.
+  function buildToolBubble(bubble) {
+    bubble.innerHTML =
+      '<button class="tool-head" type="button">' +
+      '<span class="tool-caret">▸</span><span class="tool-label"></span></button>' +
+      '<pre class="tool-detail" hidden></pre>';
+    const head = bubble.querySelector(".tool-head");
+    const detail = bubble.querySelector(".tool-detail");
+    const caret = bubble.querySelector(".tool-caret");
+    head.onclick = () => {
+      if (bubble.classList.contains("no-detail")) return;   // nothing to show
+      const open = detail.hidden;
+      detail.hidden = !open;
+      caret.textContent = open ? "▾" : "▸";
+    };
+    return { head, detail, caret, label: bubble.querySelector(".tool-label") };
+  }
+  function setToolBubble(bubble, refs, title, status, detail, since) {
+    const done = status === "completed" || status === "failed";
+    // Rebuild the label as nodes, not textContent: a running tool needs a live spinner and a
+    // ticking clock inside it. lerobot tools are the LONG part of a turn (a training launch or a
+    // dataset pull runs for minutes) and used to render as one frozen line.
+    // `since` is only passed by the LIVE path, so it doubles as "is this happening now": a tool
+    // replayed from history must never spin or tick, however its status was left.
+    refs.label.textContent = "";
+    if (since && !done) {
+      const s = document.createElement("span");
+      s.className = "spin"; s.setAttribute("data-spin", "");
+      refs.label.appendChild(s);
+    }
+    refs.label.appendChild(document.createTextNode(
+      "🔧 " + (title || "工具") + (status ? " · " + status : "")));
+    if (since) {
+      const e = document.createElement("span");
+      e.className = "run-elapsed";
+      e.textContent = " · " + fmtElapsed(Date.now() - since);
+      // Only a RUNNING tool keeps ticking; a finished one freezes at its final duration.
+      if (!done) e.setAttribute("data-since", String(since));
+      refs.label.appendChild(e);
+    }
+    bubble.classList.toggle("tool-done", done);
+    if (detail != null && detail !== "") {
+      refs.detail.textContent = detail;                     // latest non-empty wins
+      bubble.classList.remove("no-detail");
+    } else if (!refs.detail.textContent) {
+      bubble.classList.add("no-detail");                    // no detail yet → not expandable
+    }
+  }
+  function addToolLine(u) {
+    const id = u.id || Math.random();
+    let t = toolEls[id];
+    if (!t) {
+      clearPending();
+      finalizeSeg();                            // a new tool call ends the current think/output
+      const wrap = document.createElement("div");
+      wrap.className = "msg msg-bot";
+      wrap.innerHTML = '<span class="msg-ava tool-ava">⚙</span><div class="bubble tool-bubble"></div>';
+      body.appendChild(wrap);
+      const bubble = wrap.querySelector(".tool-bubble");
+      t = toolEls[id] = { el: bubble, refs: buildToolBubble(bubble), title: "", since: Date.now() };
+    }
+    if (u.title) t.title = u.title;             // tool_call has the title; updates may not
+    setToolBubble(t.el, t.refs, t.title, u.status, u.detail, t.since);
+    if (t.title) setRunStatus(t.title.length > 40 ? t.title.slice(0, 40) + "…" : t.title);
+    body.scrollTop = body.scrollHeight;
+  }
+  const permShown = new Set();
+  let awaitingPerm = false;
+  // "Waiting for the MODEL" and "waiting for YOU" are opposite situations that looked
+  // identical: same spinner, same red stop button. So the approval card got read as ordinary
+  // thinking and nobody answered it until it timed out. The turn IS still in flight (stop stays
+  // available), but the spinner must stop claiming work is happening.
+  function setAwaitingPerm(on) {
+    awaitingPerm = on;
+    if (on) { stopSpin(); setRunStatus("⚠️ 等待你的授权 —— 请点上方的按钮"); }
+    else if (busy) { startSpin(); setRunStatus("思考中"); }
+  }
+  function addPermission(m) {
+    // The server REPLAYS outstanding requests (on reconnect, and when you type while one is
+    // waiting), so the same reqId can arrive more than once. Render it once; if it is already
+    // on screen just bring it back into view.
+    if (m.reqId && permShown.has(m.reqId)) {
+      const prev = document.querySelector(`[data-perm-req="${CSS.escape(m.reqId)}"]`);
+      if (prev) { prev.scrollIntoView({ block: "nearest" }); return; }
+    }
+    if (m.reqId) permShown.add(m.reqId);
+    // Close the streaming segment and drop the "思考中" placeholder first. Otherwise the turn
+    // still looks like it is waiting on the MODEL, when it is actually waiting on YOU — that
+    // reading is what kept the approval from being answered until it timed out.
+    finalizeSeg();
+    clearPending();
+    setAwaitingPerm(true);
+    const bubble = addMsg("bot", "");
+    if (m.reqId) bubble.dataset.permReq = m.reqId;
+    bubble.classList.add("perm");
+    bubble.textContent = "⚠️ 需要授权：" + (m.title || "");
+    const box = document.createElement("div");
+    box.className = "perm-btns";
+    (m.options || []).forEach((o) => {
+      const b = document.createElement("button");
+      b.className = "perm-btn" + (/reject|deny/i.test(o.kind || o.optionId || "") ? " perm-deny" : "");
+      b.textContent = o.name || o.optionId;
+      b.onclick = () => {
+        chatWS.send(JSON.stringify({ type: "permission_response", reqId: m.reqId, optionId: o.optionId }));
+        setAwaitingPerm(false);
+        box.querySelectorAll("button").forEach((x) => (x.disabled = true));
+        b.classList.add("chosen");
+      };
+      box.appendChild(b);
+    });
+    bubble.appendChild(box);
+    body.scrollTop = body.scrollHeight;
+  }
+  function finishTurn() {
+    finalizeSeg();
+    if (pendingEl) {
+      // The turn produced no content at all → turn the placeholder into a done marker.
+      pendingEl.classList.remove("thinking");
+      pendingEl.textContent = "（已完成）";
+      pendingEl.style.color = "#8a90a0";
+      pendingEl = null;
+    }
+    setBusy(false);
+    // The turn is over, so nothing is waiting on the user any more — whether they answered,
+    // let it time out, or stopped it. Leaving this set would wedge the composer.
+    awaitingPerm = false;
+  }
+
+  /* ---------------------------------------------------------- chat sessions */
+  const sessMenu = $("sess-menu"), sessList = $("sess-list"), sessTitle = $("chat-session-title"), sessFoot = $("sess-foot");
+  let curSession = null;
+
+  function clearChat() {
+    body.innerHTML = "";
+    curSeg = null; toolEls = {}; pendingEl = null;
+  }
+  function wsSend(o) { if (chatWS && chatWS.readyState === 1) chatWS.send(JSON.stringify(o)); }
+
+  // A session title can have the "[System] 请用简洁的 Markdown …" steering block folded in —
+  // leading (legacy prepend), trailing (new append), or truncated. Strip it wherever it is.
+  function cleanTitle(t) {
+    t = (t || "").trim();
+    t = t.replace(/^\s*\[System\][\s\S]*?\n\n/, "");   // leading block up to the blank line
+    t = t.replace(/\s*\[System\][\s\S]*$/, "");         // trailing block (or a truncated leading one)
+    return t.trim() || "新会话";
+  }
+  function setTitle(t) { sessTitle.textContent = cleanTitle(t); }
+
+  // Session ops NEVER pre-send a `stop`, and NEVER guard on `busy` locally. Two reasons:
+  //  1. The server ends the in-flight turn itself as part of the op, with a short 2s grace.
+  //     A client-sent `stop` uses the LONG 12s grace instead, and the server's ws loop is
+  //     sequential — so the op queued behind it waited the full 12s with no feedback, which
+  //     is what "无法切换" looked like.
+  //  2. Every local `busy` guard here was a click the user could never get back: it returned
+  //     silently, drew nothing, and sent nothing. Decisions that need to know which session
+  //     is actually streaming belong on the server, which has the authoritative id.
+  function newSession() {
+    toggleSessMenu(false);
+    wsSend({ type: "session_new" });            // server replies session_switched(fresh)
+  }
+  function loadSession(id, title) {
+    toggleSessMenu(false);
+    setTitle(title);                            // optimistic; confirmed by history_start / notice
+    wsSend({ type: "session_load", id });
+  }
+  function deleteSession(id) {
+    wsSend({ type: "session_delete", id });     // server re-lists from the store; onDeleted refreshes
+  }
+  function refreshSessions() { wsSend({ type: "session_list" }); }
+
+  // Server is ending the in-flight turn so it can switch/create/delete. That takes a couple
+  // of seconds (longer if a shell tool has to be interrupted) and nothing else streams
+  // meanwhile, so say so — silence here reads as a broken button.
+  function onSwitching() {
+    setRunStatus("正在结束当前回合");
+    clearChat();
+    const el = document.createElement("div");
+    el.className = "sess-empty";
+    el.textContent = "正在结束当前回合…";
+    body.appendChild(el);
+  }
+  // "You're already in this session" (clicked the row that is streaming now). The id is
+  // authoritative — adopt it so the header/highlight stop disagreeing, which is the drift
+  // that made this row unclickable in the first place.
+  function onNotice(m) {
+    if (m.sessionId) curSession = m.sessionId;
+    // The turn is still streaming, so close the open segment first — otherwise the notice
+    // is appended after it in the DOM while the NEXT token still lands in the (earlier)
+    // open segment, and the transcript reads out of order.
+    if (m.text) { finalizeSeg(); addMsg("bot", m.text); }
+  }
+  function onSwitched(id, title, fresh) {
+    curSession = id;
+    setTitle(title);
+    clearChat();
+    if (fresh) addMsg("bot", "新会话已就绪 👋 直接发消息开始吧。");
+    setBusy(false);
+  }
+  function onDeleted(id) {
+    if (id === curSession) {
+      // Deleted the open session: clear it but DON'T auto-create a new one —
+      // wait for the user to click 新建会话.
+      curSession = null;
+      clearChat();
+      setTitle("");
+      setBusy(false);
+      addMsg("bot", "会话已删除。点上方「＋ 新建会话」开始新的对话。");
+    }
+    refreshSessions();
+  }
+
+  function renderSessions(items, current) {
+    items = items || [];        // the store IS the source of truth now — nothing to filter
+    // Adopt the server's `current` only when idle: while a turn streams or a history load is
+    // in flight (busy), this reply may predate the switch — letting it clobber curSession /
+    // the title mid-load is exactly the desync that made clicks on the "wrong" row no-ops.
+    if (!busy) {
+      curSession = current || curSession;
+      const cur = items.find((s) => s.id === current);
+      if (cur) setTitle(cur.title);
+    }
+    sessList.innerHTML = "";
+    sessFoot.textContent = "";
+    if (!items.length) { sessList.innerHTML = '<div class="sess-empty">还没有会话</div>'; return; }
+    const now = Date.now(), DAY = 864e5;
+    const bucket = (iso) => {
+      const age = now - (Date.parse(iso) || 0);
+      return age <= DAY ? "1天内" : age <= 7 * DAY ? "一周内" : age <= 30 * DAY ? "一个月内" : "更早";
+    };
+    let lastGroup = null;
+    items.forEach((s) => {
+      const g = bucket(s.updatedAt);
+      if (g !== lastGroup) {
+        lastGroup = g;
+        const h = document.createElement("div");
+        h.className = "sess-group"; h.textContent = g;
+        sessList.appendChild(h);
+      }
+      const row = document.createElement("div");
+      row.className = "sess-item" + (s.id === current ? " active" : "");
+      row.innerHTML = '<div class="si-main"><div class="si-title"></div></div><button class="si-del" title="删除会话">🗑</button>';
+      const clean = cleanTitle(s.title);
+      row.querySelector(".si-title").textContent = clean;
+      row.querySelector(".si-main").onclick = () => loadSession(s.id, clean);
+      row.querySelector(".si-del").onclick = (e) => {
+        e.stopPropagation();
+        if (confirm("删除会话「" + clean + "」？此操作不可撤销。")) deleteSession(s.id);
+      };
+      sessList.appendChild(row);
+    });
+    sessFoot.textContent = "已全部加载完成";
+  }
+
+  // ----- history replay (session_load) -----
+  let histAcc = null;  // { role, text } accumulator; consecutive same-role chunks merge
+  let histTools = {};  // tool cards by id — dedup so one tool isn't rendered per update event
+  function histStart(id) {
+    clearChat(); setBusy(true); setRunStatus("载入会话历史");
+    histAcc = null; histTools = {}; if (id) curSession = id;
+  }
+  // The first user message carries a "[System] …" steering block. It may be appended (new
+  // sessions) or prepended (legacy) — strip it either way so it never shows in the bubble.
+  function stripSystemPrefix(s) {
+    return s
+      .replace(/^\s*\[System\][\s\S]*?\n\n/, "")   // legacy: prepended
+      .replace(/\n\n\[System\][\s\S]*$/, "")        // new: appended
+      .trim();
+  }
+  function histFlush() {
+    if (!histAcc) return;
+    const { role, text } = histAcc; histAcc = null;
+    if (role === "user") { const u = stripSystemPrefix(text).trim(); if (u) addMsg("user", u); return; }
+    const t = text.trim();
+    if (!t) return;
+    if (role === "thought") {                          // replayed reasoning → collapsed 💭 card
+      const wrap = document.createElement("div");
+      wrap.className = "msg msg-bot";
+      wrap.innerHTML = '<span class="msg-ava tool-ava">💭</span><div class="bubble tool-bubble think-bubble"></div>';
+      const bubble = wrap.querySelector(".tool-bubble");
+      const refs = buildToolBubble(bubble);
+      refs.label.textContent = "💭 思考";
+      refs.detail.textContent = t;                     // collapsed by default; click to expand
+      body.appendChild(wrap);
+      return;
+    }
+    renderBubble(addMsg("bot", ""), t);
+  }
+  function histChunk(m) {
+    if (m.role === "tool") {
+      histFlush();
+      const id = m.id || Math.random();
+      let t = histTools[id];
+      if (!t) {                                    // one card per tool id, not per update event
+        const wrap = document.createElement("div");
+        wrap.className = "msg msg-bot";
+        wrap.innerHTML = '<span class="msg-ava tool-ava">⚙</span><div class="bubble tool-bubble"></div>';
+        const bubble = wrap.querySelector(".tool-bubble");
+        t = histTools[id] = { el: bubble, refs: buildToolBubble(bubble), title: "" };
+        body.appendChild(wrap);
+      }
+      if (m.title) t.title = m.title;
+      setToolBubble(t.el, t.refs, t.title, m.status, m.detail);
+      return;
+    }
+    if (!histAcc || histAcc.role !== m.role) { histFlush(); histAcc = { role: m.role, text: "" }; }
+    histAcc.text += m.text || "";
+  }
+  function histDone() {
+    histFlush();
+    if (!body.children.length) addMsg("bot", "（这个会话还没有消息）");
+    setBusy(false);
+    body.scrollTop = body.scrollHeight;
+  }
+
+  function toggleSessMenu(force) {
+    const show = force !== undefined ? force : sessMenu.hidden;
+    sessMenu.hidden = !show;
+    if (show) {
+      // drop the panel just under the header (left-aligned to the session button)
+      const head = $("chat").querySelector(".chat-head");
+      sessMenu.style.top = head.offsetHeight + 4 + "px";
+      refreshSessions();
+    }
+  }
+  $("sess-toggle").onclick = (e) => { e.stopPropagation(); toggleSessMenu(); };
+  $("sess-new").onclick = () => newSession();
+  document.addEventListener("click", (e) => {
+    if (!sessMenu.hidden && !sessMenu.contains(e.target) && !$("sess-toggle").contains(e.target)) toggleSessMenu(false);
+  });
+
+  function connectChat() {
+    chatWS = new WebSocket(wsURL("/ws/chat"));
+    chatWS.onopen = () => {
+      // Resync with the server the moment the socket is up. Without this the sidebar
+      // never fetches on a fresh page load (its only other triggers are opening the
+      // dropdown — which races the still-connecting socket and gets silently dropped
+      // by wsSend — a finished turn, or a delete), so a refresh shows an empty list.
+      // It also repairs a reconnect after a rollout: the new server process has no
+      // active session, so drop our stale curSession — otherwise loadSession()'s
+      // `id === curSession` guard would swallow the click and you couldn't re-select
+      // the session you were in. renderSessions() then adopts the server's `current`.
+      curSession = null;
+      refreshSessions();
+    };
+    chatWS.onmessage = (e) => {
+      const m = JSON.parse(e.data);
+      switch (m.type) {
+        case "start": startTurn(m.booting); break;
+        case "thought": addThought(m.text || ""); break;
+        case "token": appendToken(m.text || ""); break;
+        case "tool": addToolLine(m); break;
+        case "permission": addPermission(m); break;
+        case "done": finishTurn(); setTimeout(() => { if (!busy) refreshSessions(); }, 800); break;
+        case "error": finalizeSeg(); clearPending(); addMsg("bot", "⚠️ " + m.error); setBusy(false); break;
+        case "need_key": finalizeSeg(); clearPending(); setBusy(false); openKeyModal(); break;
+        case "sessions": renderSessions(m.items || [], m.current); break;
+        case "switching": onSwitching(); break;
+        case "notice": onNotice(m); break;
+        case "session_switched": onSwitched(m.id, m.title, m.fresh); break;
+        case "session_deleted": onDeleted(m.id); break;
+        case "history_start": histStart(m.id); break;
+        case "hist": histChunk(m); break;
+        case "history_done": histDone(); break;
+      }
+    };
+    chatWS.onclose = () => {
+      // The spinner runs off a local interval, so it keeps turning after the socket dies and the
+      // page looks busy forever. Say what actually happened; the server keeps the turn alive and
+      // re-announces it on reconnect.
+      if (busy) setRunStatus("连接已断开,正在重连…");
+      if (sessionActive) setTimeout(() => sessionActive && connectChat(), 1500);
+    };
+  }
+
+  function send() {
+    const text = textEl.value.trim();
+    if (!text) return;
+    if (awaitingPerm) {
+      // Was a silent return: you type, press Enter, nothing happens, and the reason (an
+      // approval is blocking the agent) is invisible. Point at it instead.
+      const card = document.querySelector("[data-perm-req]");
+      if (card) card.scrollIntoView({ block: "nearest" });
+      setRunStatus("⚠️ 先回答上方的授权请求,agent 才能继续");
+      return;
+    }
+    if (busy) return;
+    if (!chatReady) { pendingText = text; openKeyModal(); return; }
+    addMsg("user", text);
+    textEl.value = ""; textEl.style.height = "auto";
+    setBusy(true);
+    if (chatWS.readyState !== 1) connectChat();
+    chatWS.send(JSON.stringify({ type: "msg", text }));
+  }
+  sendBtn.onclick = () => { if (busy) stopTurn(); else send(); };
+  textEl.addEventListener("keydown", (e) => {
+    // Ignore Enter while an IME is composing — that Enter confirms a candidate (CJK/pinyin),
+    // it must not send, or the box keeps residue. isComposing is the standard flag; keyCode
+    // 229 is the legacy fallback for older browsers.
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
+      e.preventDefault();
+      send();
+    }
+  });
+  textEl.addEventListener("input", () => { textEl.style.height = "auto"; textEl.style.height = Math.min(textEl.scrollHeight, 140) + "px"; });
+  // Release-notes button: always (re)open the doc so clicking gives a visible reaction even
+  // when the tab is already the active one.
+  $("q-release").onclick = () => {
+    if (tabs.has("welcome")) closeTab("welcome");
+    addDocTab("welcome", "更新说明", "/static/release_note.md");
+  };
+  // In-app markdown links like [text](doc:webrtc) open the local lerobot doc (served from
+  // /lerobot in the image) as a doc tab, instead of navigating to an external URL.
+  viewerBody.addEventListener("click", (e) => {
+    const a = e.target.closest('a[href^="doc:"]');
+    if (!a) return;
+    e.preventDefault();
+    const name = a.getAttribute("href").slice(4);
+    addDocTab("doc-" + name, (a.textContent || name).trim(), "/api/lerobot-doc/" + name);
+  });
+  $("chat-quick").addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-q]");
+    if (!b) return;
+    textEl.value = b.dataset.q; textEl.dispatchEvent(new Event("input")); send();
+  });
+
+  /* ------------------------------------------------------------- key handling */
+  const modal = $("key-modal"), keyInput = $("key-input"), keyErr = $("key-err"), saveBtn = $("key-save");
+  function openKeyModal() { modal.hidden = false; keyErr.hidden = true; keyInput.focus(); }
+  function closeKeyModal() { modal.hidden = true; }
+  $("chat-gear").onclick = openKeyModal;
+  $("key-cancel").onclick = closeKeyModal;
+  saveBtn.onclick = async () => {
+    const api_key = keyInput.value.trim();
+    if (!api_key) { keyErr.textContent = "请输入 API Key"; keyErr.hidden = false; return; }
+    saveBtn.disabled = true; saveBtn.textContent = "正在启动 Agent…";
+    try {
+      const r = await fetch("/api/volcano-key", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          api_key,
+          base_url: $("key-baseurl").value.trim() || undefined,
+          model: $("key-model").value.trim() || undefined,
+        }),
+      });
+      const data = await r.json();
+      if (!data.ok) throw new Error(data.error || "保存失败");
+      chatReady = true;
+      if (data.model) $("chat-model").textContent = data.model;
+      $("chat-status").style.background = "";
+      closeKeyModal();
+      if (pendingText) { textEl.value = pendingText; pendingText = null; send(); }
+    } catch (err) { keyErr.textContent = "⚠️ " + err.message; keyErr.hidden = false; }
+    finally { saveBtn.disabled = false; saveBtn.textContent = "保存并开始"; }
+  };
+
+  /* ---------------------------------------------------------------- splitters */
+  function dragSplit(handle, onMove) {
+    handle.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      document.body.classList.add("splitting");
+      const move = (ev) => onMove(ev);
+      const up = () => {
+        document.body.classList.remove("splitting");
+        window.removeEventListener("mousemove", move);
+        window.removeEventListener("mouseup", up);
+        refit();
+      };
+      window.addEventListener("mousemove", move);
+      window.addEventListener("mouseup", up);
+    });
+  }
+  const grid = $("grid"), viewer = $("viewer"), colLeft = $("col-left");
+  dragSplit($("splitter-v"), (e) => {
+    // Resize the chat (right) column; the left stays 1fr so the app always
+    // fills the viewport at any window width.
+    const r = grid.getBoundingClientRect();
+    const right = Math.max(300, Math.min(r.right - e.clientX, r.width - 380));
+    grid.style.setProperty("--right", right + "px");
+  });
+  dragSplit($("splitter-h"), (e) => {
+    const r = colLeft.getBoundingClientRect();
+    const h = Math.max(90, Math.min(e.clientY - r.top, r.height - 140));
+    viewer.style.setProperty("--viewer-h", h + "px");
+    refit();
+  });
+
+  /* ------------------------------------------------------------------ status */
+  function fetchStatus() {
+    fetch("/api/status").then((r) => r.json()).then((s) => {
+      chatReady = !!s.chat_ready;
+      if (s.model) $("chat-model").value = s.model;
+      $("chat-status").style.background = chatReady ? "" : "#c2c7d2";
+    }).catch(() => {});
+  }
+
+  /* -------------------------------------------------------------- start up */
+  // No presence lock — multiple windows/users may be open at once.
+  // Model dropdown: populate from /api/models, switch model on change.
+  function loadModels() {
+    fetch("/api/models").then((r) => r.json()).then((d) => {
+      const sel = $("chat-model");
+      sel.innerHTML = "";
+      (d.models || []).forEach((m) => {
+        const o = document.createElement("option");
+        o.value = m;
+        o.textContent = m;
+        sel.appendChild(o);
+      });
+      if (d.current) sel.value = d.current;
+    }).catch(() => {});
+  }
+  $("chat-model").addEventListener("change", (e) => {
+    fetch("/api/model", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: e.target.value }),
+    }).then((r) => r.json()).then((d) => { if (d.model) $("chat-model").value = d.model; }).catch(() => {});
+  });
+
+  function startApp() {
+    sessionActive = true;
+    TERM.start();
+    if (!chatWS || chatWS.readyState > 1) connectChat();
+    fetchStatus();
+    loadModels();
+  }
+  startApp();
+})();
