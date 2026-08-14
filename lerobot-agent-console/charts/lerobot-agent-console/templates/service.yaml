@@ -1,0 +1,13 @@
+{{/* Headless Service: gives each pod stable DNS (<name>-<n>.<name>.<ns>.svc.cluster.local),
+     which is what the multi-node training uses to address the other console over ssh/NCCL.
+     This is NOT the public entry point — APIG is (see charts/README.md). */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "console.name" . }}
+  labels: {{- include "console.selectorLabels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector: {{- include "console.selectorLabels" . | nindent 4 }}
+  ports:
+    - { name: http, port: 8080, targetPort: 8080, protocol: TCP }

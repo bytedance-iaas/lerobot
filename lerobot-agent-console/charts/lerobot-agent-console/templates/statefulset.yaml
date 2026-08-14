@@ -1,0 +1,77 @@
+{{/* The console is STATEFUL: each pod owns a HERMES_HOME disk (/opt/data) holding the Ark key,
+     chat sessions, and the installed skills. A StatefulSet models that directly — every replica
+     gets its own PVC from volumeClaimTemplates, so scaling gives N independent disks with no
+     shared-writer risk. k8s NEVER deletes those PVCs; `helm uninstall` leaves them behind on
+     purpose, and they must be removed by hand. */}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "console.name" . }}
+  labels: {{- include "console.selectorLabels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "console.name" . }}
+  replicas: 1
+  {{/* Consoles are independent (own disk each), so don't gate pod N on pod N-1 being Ready. */}}
+  podManagementPolicy: Parallel
+  updateStrategy: { type: RollingUpdate }
+  selector:
+    matchLabels: {{- include "console.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "console.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: console
+          image: "{{ .Values.image.repository }}:{{ required "image.tag is required — the chart does not pin one, because the pipeline tags every build with its commit sha and the chart would then need republishing for each. Pass --set image.tag=<sha>, or set it in the values box. List available tags with: oras repo tags iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot-agent-console" .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.capabilities }}
+          securityContext:
+            capabilities:
+              add: {{- toYaml . | nindent 16 }}
+          {{- end }}
+          ports:
+            - { name: http, containerPort: 8080 }
+          env:
+            {{- range .Values.env }}
+            - { name: {{ .name }}, value: {{ .value | quote }} }
+            {{- end }}
+            {{/* Single-user HTTP Basic login. Auth is ALWAYS on: if either var is missing the
+                 console falls back to a built-in pair and says so in the UI, so a broken Secret
+                 degrades loudly instead of serving the console unauthenticated. The Secret is
+                 NOT created here — charts should not carry credentials. */}}
+            - name: CONSOLE_USER
+              valueFrom:
+                secretKeyRef: { name: {{ include "console.name" . }}-auth, key: user }
+            - name: CONSOLE_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: {{ include "console.name" . }}-auth, key: password }
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080, scheme: HTTP }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080, scheme: HTTP }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          volumeMounts:
+            - { name: hermes-home, mountPath: /opt/data }
+            - { name: dshm, mountPath: /dev/shm }
+      volumes:
+        {{/* /dev/shm is per-pod scratch, not state — an emptyDir, never a claim template.
+             tmpfs counts against the memory limit, but only for bytes actually used. */}}
+        - name: dshm
+          emptyDir: { medium: Memory, sizeLimit: {{ .Values.dshmSize }} }
+  volumeClaimTemplates:
+    - metadata:
+        name: hermes-home        {{/* -> hermes-home-<name>-<n> */}}
+        labels: {{- include "console.selectorLabels" . | nindent 10 }}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ .Values.persistence.storageClass }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}

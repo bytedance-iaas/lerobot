@@ -1,0 +1,14 @@
+[project]
+name = "lerobot-agent-console"
+version = "0.1.0"
+description = "Single-page web console to operate LeRobot — shell + hermes agent chat."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = ["aiohttp>=3.9"]
+
+[project.scripts]
+lerobot-agent-console = "server:main"
+
+[tool.setuptools]
+py-modules = ["server"]
