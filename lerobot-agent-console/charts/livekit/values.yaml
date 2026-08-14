@@ -1,0 +1,64 @@
+nameOverride: ""
+
+image:
+  repository: docker.m.daocloud.io/livekit/livekit-server   # daocloud mirror (CN)
+  # Pin a version. `latest` means a restart can silently move a PUBLIC SFU to a new server
+  # build — including across a breaking change — at a moment nobody chose. This is the version
+  # the running deployment resolved `latest` to, so pinning it changes nothing today.
+  tag: v1.13.5
+  pullPolicy: IfNotPresent
+
+# The ICE candidate address clients are told to connect to. It must be the CLB's PUBLIC IP, not
+# a pod or node IP, or signalling succeeds and media never establishes.
+#
+# Leave it empty: an init container waits for this chart's own CLB to be assigned an IP and hands
+# it to the server. (Requiring it as input was circular — the chart creates that CLB, so the IP
+# does not exist until after the first install.) Setting it explicitly skips the wait and drops
+# the init container's ServiceAccount/Role along with it:
+#   kubectl get svc <release>-clb -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+nodeIp: ""
+
+# API credentials. Set them — the chart refuses to install otherwise, and that is deliberate:
+# this SFU sits on a public CLB, so it must never come up with a guessable or absent key.
+#
+# Format is LiveKit's own `keys` map, one `api_key: api_secret` pair per line. Generate a secret
+# with something like `openssl rand -hex 32`; the same pair goes into every client's config.
+#
+#   keys: |
+#     devkey: <a long random string>
+#
+# The chart renders this into a Secret it owns and injects it as LIVEKIT_KEYS, which overrides
+# the ConfigMap's `keys` block — a key committed to a config file is a public key.
+# (It used to expect a hand-made Secret, with `kubectl create secret` in this comment. That
+# cannot be done from the VKE console's Helm page, which has no shell, so the chart was simply
+# not installable there.)
+auth:
+  keys: ""
+
+service:
+  # REQUIRED, and specific to your cluster: the CLB is created from this subnet, which must be
+  # in the cluster's VPC. The value below is an example from one account — it will not exist in
+  # yours, and the CLB then never gets an IP (the init container waits, then fails with that
+  # hint). Find it in the VPC console, or from an existing Service's annotations.
+  #
+  # ⚠️ Once a CLB exists, changing this provisions a NEW load balancer with a NEW public IP and
+  # invalidates every client's --livekit-url. Treat it as immutable after the first install.
+  subnetId: ""
+  addressType: internet
+
+  # Whether `helm uninstall` leaves the CLB behind (helm.sh/resource-policy: keep).
+  #
+  # true for anything real: the CLB holds a PUBLIC IP that every client has baked into its
+  # --livekit-url, it outlives any single release, and deleting it does not give the address
+  # back — a new one comes with a new IP and every robot pointing at the old one is broken.
+  # false for throwaway installs, where the leftover is a billed resource and an EIP out of
+  # quota that someone has to remember to delete by hand.
+  keepOnUninstall: true
+  ports:
+    signal: 7880    # WS signaling
+    rtcTcp: 7881    # WebRTC over TCP (fallback)
+    rtcUdp: 7882    # WebRTC media (primary)
+
+resources:
+  requests: { cpu: 200m, memory: 256Mi }
+  limits:   { cpu: "1",  memory: 1Gi }

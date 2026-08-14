@@ -1,0 +1,130 @@
+# Defaults are installable-anywhere, NOT our deployment: no node pin, APIG off, and the two
+# credentials empty so the install fails loudly rather than coming up unauthenticated.
+# Set auth.password before deploying; everything else works as-is on a GPU cluster.
+
+# Resource names come from the RELEASE name. Pinning a literal here — which this chart used to
+# do — means every install produces the same names no matter what you call the release, so a
+# second copy collides with the first ("invalid ownership metadata") and the chart can only ever
+# exist once per namespace. Our own releases are already named for what they deploy
+# (lerobot-agent-console, lerobot-agent-console-test), so the rendered names are unchanged.
+# ⚠️ The name also determines the PVC (hermes-home-<name>-0) and the pod DNS that multi-node
+# training addresses, so renaming an EXISTING release strands its disk and starts on an empty
+# one. Pick the release name deliberately; do not rename later.
+nameOverride: ""
+
+image:
+  repository: iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot-agent-console
+  # REQUIRED, and deliberately empty: the chart does not track the image. The pipeline tags every
+  # build with its commit sha (there is no `latest`), so a hardcoded tag here means republishing
+  # the chart for every build — the chart version and the image version are not the same thing
+  # and should not be tied together.
+  #
+  # Pass it at deploy time: `--set image.tag=<sha>`, or edit this line in the values box on the
+  # VKE console's Helm page. Find the sha in the CP pipeline's build record, or list them:
+  #   oras repo tags iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot-agent-console
+  # ⚠️ Verify the tag exists before deploying — a sha that was never built gives
+  # ImagePullBackOff, and if you have just deleted the PVC there is nothing to roll back to.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# Empty on purpose. The GPU request below is what schedules this pod, so pinning a node is never
+# required — and a hostname from one cluster leaves the pod Pending forever on any other. Fill it
+# only to force a specific machine: nodeSelector: { kubernetes.io/hostname: "192.168.1.2" }
+# ⚠️ Worth doing once a PVC exists: ebs-* volumes are ZONAL, so a pod rescheduled to another
+# zone can never attach the disk it already has.
+nodeSelector: {}
+
+resources:
+  requests: { cpu: "16", memory: 128Gi, nvidia.com/gpu: "1" }
+  limits:   { cpu: "16", memory: 128Gi, nvidia.com/gpu: "1" }
+
+# RDMA pins (mlocks) memory; the container default `ulimit -l` is 64 KB with an equal hard
+# limit, so NCCL picks the RoCE NIC and then fails to allocate. CAP_IPC_LOCK is the k8s fix.
+capabilities: ["IPC_LOCK"]
+
+persistence:
+  storageClass: ebs-essd
+  # The REAL size: both bound PVCs are 1Ti (spec and status), resized by editing the PVCs
+  # directly. The live StatefulSet templates still say 128Gi, because editing a PVC does not —
+  # and cannot — update the template it came from.
+  # ⚠️ volumeClaimTemplates is IMMUTABLE, so a plain `helm upgrade` against those StatefulSets
+  # is REJECTED while this differs from 128Gi. Adopting them needs a one-time
+  # `kubectl delete sts --cascade=orphan` (keeps pods and PVCs) before the first install —
+  # see charts/README.md. A fresh install gets 1Ti directly and needs none of that.
+  size: 1Ti
+
+# /dev/shm for the PyTorch DataLoader. The 64Mi container default overflows ("Bus error" /
+# "out of shared memory") and the container cannot remount it without CAP_SYS_ADMIN.
+dshmSize: 32Gi
+
+# Console login (HTTP basic auth). Set the password before deploying — it is the only thing
+# between a public endpoint and a root shell on a GPU box; the chart refuses to install without it.
+#
+# Plain values, not a pre-made Secret: this chart is installed from the VKE console's
+# "创建 Helm 应用" page, where values.yaml is the only input and there is no shell in which to run
+# `kubectl create secret` first. A chart that requires one cannot be installed that way at all.
+# The chart renders these into a Secret it owns, so they are not left sitting in the pod spec.
+auth:
+  user: lerobot
+  password: ""
+
+env:
+  # An ORDERED LIST, not a map: Helm's `range` sorts map keys, and reordering container env
+  # changes the pod-template hash — which would restart both consoles on the first upgrade for
+  # no reason. Keep this in the same order as the running StatefulSets.
+  - { name: PORT, value: "8080" }
+  - { name: CONSOLE_WORKDIR, value: /lerobot }        # the lerobot checkout in the image
+  - { name: CONSOLE_SHELL, value: /bin/bash }
+  # lerobot 0.6.x hard-errors if LEROBOT_HOME is set at all; HF_LEROBOT_HOME is the right var,
+  # and it must point at the writable PVC (the image default is unreadable as root).
+  - { name: HF_LEROBOT_HOME, value: /opt/data/.cache/huggingface/lerobot }
+  - { name: HOME, value: /opt/data }                  # image default is 700, owned by another user
+  - { name: HERMES_CHAT_SKILL, value: robot_sft }
+  - { name: HERMES_HOME, value: /opt/data }
+
+# Public HTTPS entry point through Volcengine APIG. OFF by default so a first install succeeds
+# on any cluster; the console is reachable in-cluster either way. Turn it on once you know which
+# gateway it should use.
+apig:
+  enabled: false
+
+  # Two ways to get a gateway, matching the APIGInstance CRD's own two modes:
+  #   create: false -> ADOPT an existing gateway (CRD sets spec.id). Put its instance id, from
+  #                    the APIG console, in existingId.
+  #   create: true  -> PROVISION a new one (CRD sets spec.name + spec.common). subnetIds is then
+  #                    REQUIRED and must be in this cluster's VPC. Takes a few minutes, and bills.
+  #
+  # ⚠️ create=true is a TWO-STEP bootstrap, because the gateway's id does not exist until it has
+  #    been provisioned, and the Ingress needs that id to bind to it. After the first install:
+  #      kubectl get apiginstance <release>-apig -o jsonpath='{.status.id}'
+  #    put that value in existingId (leaving create=true) and upgrade. Until you do, the Ingress
+  #    gets no address and APIG lists no service or domain for the gateway — verified, and it
+  #    resolves within a minute of the id being set.
+  # ⚠️ A gateway this chart provisioned is DELETED by `helm uninstall`, taking its auto-assigned
+  #    *.volceapi.com domain with it — a new one comes back under a different name. Adopt an
+  #    existing gateway for anything whose URL people have bookmarked.
+  create: false
+  existingId: ""                  # create=false: the gateway's instance id
+  instanceName: ""                # create=true: gateway name (default: <release>-apig)
+  subnetIds: []                   # create=true: REQUIRED
+
+  # Gateway sizing. ALL OPTIONAL, and empty means "let the platform choose" — which is the right
+  # default and how our own test gateway was actually created. (The values that appear in
+  # `kubectl get apiginstance -o yaml` afterwards are the platform's answer, not our input; an
+  # earlier version of this chart copied them back in as if they were settings. Pinning them
+  # freezes you on spec codes that the platform is free to retire, and `replicas` is billed.)
+  # Fill in only what you deliberately want to control.
+  replicas: ""                    # gateway replicas — more than one is HA, and costs it
+  instanceSpecCode: ""            # e.g. 1c2g
+  clbSpecCode: ""                 # e.g. small_1
+  publicNetworkBillingType: ""    # e.g. traffic
+
+  ingressName: ""                 # default: <release>-apig
+  # One gateway per ingress class: pointing two consoles at the same class routes them to one
+  # gateway. Default is <release>-apig, which is unique as long as release names are.
+  ingressClassName: ""
+  # A distinct host per environment is what earns each its own managed domain.
+  # ⚠️ Never put the auto-assigned *.volceapi.com name here — doing that once killed the
+  # 443 listener outright (503 -> 000).
+  host: ""                        # default: <release>.apig.local
+  annotations: {}                 # binding annotations are added automatically from existingId
