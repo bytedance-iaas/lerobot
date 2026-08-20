@@ -112,6 +112,11 @@ class LingBotVAConfig(PreTrainedConfig):
     # frames; it is clamped to [1, frame_chunk_size - 1].
     residual_min_exec_frames: int = 2
 
+    # Language ablation: condition on this instruction instead of the one the env supplies.
+    # Set it to another task's instruction (or an empty string) to test how much the policy
+    # actually relies on language; ``None`` uses the env's instruction as usual.
+    prompt_override: str | None = None
+
     # Normalization: IDENTITY here; images are scaled + VAE-encoded and actions are
     # quantile-(un)normalized inside the policy / dedicated processor steps.
     normalization_mapping: dict[str, NormalizationMode] = field(

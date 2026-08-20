@@ -557,6 +557,9 @@ class LingBotVAPolicy(PreTrainedPolicy):
             return
         task = batch.get("task")
         prompt = task[0] if isinstance(task, list | tuple) else task
+        if self.config.prompt_override is not None:
+            # Language ablation: ignore the env's instruction and condition on this one instead.
+            prompt = self.config.prompt_override
         self._prompt = prompt or ""
         self._prompt_embeds, self._negative_prompt_embeds = self._encode_prompt(self._prompt)
 
