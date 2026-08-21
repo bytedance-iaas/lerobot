@@ -181,6 +181,11 @@ class LingBotVAPolicy(PreTrainedPolicy):
         self._pred_latents: Tensor | None = None
         self._pred_offset = 0  # predicted-frame index the first observed keyframe corresponds to
         self.replan_count = 0
+        # Dynamics-context latent ``e`` (see ``context_latent_dim``). Per-episode: the whole point
+        # is that it tracks *this* run's dynamics, so it must not survive a reset.
+        self._ctx_e: Tensor | None = None
+        self._ctx_window: deque = deque(maxlen=max(2, self.config.context_window))
+        self.context_history: list[list[float]] = []
         self._use_cfg = (cfg.guidance_scale > 1) or (cfg.action_guidance_scale > 1)
         # Two independent flow-matching schedulers (video latent + action streams).
         self._scheduler = FlowMatchScheduler(shift=cfg.snr_shift, sigma_min=0.0, extra_one_step=True)
@@ -453,7 +458,11 @@ class LingBotVAPolicy(PreTrainedPolicy):
     @property
     def _residual_enabled(self) -> bool:
         cfg = self.config
-        return cfg.track_prediction_residual or cfg.residual_replan_threshold is not None
+        return (
+            cfg.track_prediction_residual
+            or cfg.residual_replan_threshold is not None
+            or cfg.context_latent_dim is not None
+        )
 
     def _record_residual(self, z_real: Tensor) -> None:
         """Compare the observed keyframe latents against what the model predicted for them.
@@ -484,6 +493,7 @@ class LingBotVAPolicy(PreTrainedPolicy):
         self.last_residual_per_frame = per_frame
         self.last_residual = sum(per_frame) / len(per_frame)
         self.residual_history.append(self.last_residual)
+        self._update_context()
 
     def _should_replan(self) -> bool:
         """Whether to cut the current chunk short because the last residual was too large.
@@ -502,6 +512,98 @@ class LingBotVAPolicy(PreTrainedPolicy):
         if self._exec_step // cfg.action_per_frame < min_frames:
             return False
         return self.last_residual > thr
+
+    # Dynamics-context latent (execution feedback, no weight update)
+    @property
+    def _context_enabled(self) -> bool:
+        return self.config.context_latent_dim is not None
+
+    def _update_context(self) -> None:
+        """Fold the newest residual into the low-dimensional context latent ``e``.
+
+        The absolute residual is dominated by scene/task identity (measured: per-task means range
+        0.31-0.64 against a 0.43 global mean), so it says more about *which* task is running than
+        about whether the dynamics drifted. ``e`` is therefore driven by the standardized deviation
+        from a within-episode sliding baseline, not by the raw value.
+
+        v0 is a fixed rule rather than a learned encoder ``g``: it exists to test whether the
+        injection path can influence behaviour at all, which is a precondition for ``g`` being
+        worth training.
+        """
+        if not self._context_enabled:
+            return
+        cfg = self.config
+        d = cfg.context_latent_dim
+        r = self.last_residual
+        win = self._ctx_window
+
+        if len(win) >= 2:
+            mu = sum(win) / len(win)
+            var = sum((x - mu) ** 2 for x in win) / (len(win) - 1)
+            sigma = max(var**0.5, 1e-6)
+            z = (r - mu) / sigma
+            dz = (r - win[-1]) / sigma
+        else:
+            # Not enough history to standardize against: emit no signal rather than a spurious one.
+            mu, sigma, z, dz = r, 1.0, 0.0, 0.0
+
+        # Per-frame deviations expose *where inside the chunk* the world model came apart, which a
+        # chunk-mean residual averages away.
+        feat = [z, dz] + [(x - mu) / sigma for x in self.last_residual_per_frame]
+        feat = (feat + [0.0] * d)[:d]
+        new = torch.tensor(feat, dtype=torch.float32, device=self.config.device)
+
+        changepoint = abs(z) > cfg.context_reset_z
+        if self._ctx_e is None or changepoint:
+            # Regime change: drop the stale baseline and jump ``e`` straight to the new context
+            # instead of letting the EMA drag it there over the next dozen chunks.
+            self._ctx_e = new
+            if changepoint:
+                win.clear()
+        else:
+            lr = cfg.context_lr
+            self._ctx_e = (1.0 - lr) * self._ctx_e + lr * new
+
+        win.append(r)
+        self.context_history.append(self._ctx_e.tolist())
+
+    def _ctx_proj(self, dim: int, device, dtype) -> Tensor:
+        """Fixed random projection ``[context_latent_dim, text_dim]`` from ``e`` to token space.
+
+        Deliberately *not* a submodule or buffer: it must never enter ``state_dict`` or the
+        checkpoint would no longer round-trip. In v0 it is untrained; a learned injector ``h``
+        would be loaded separately.
+        """
+        seed = self.config.context_proj_seed
+        key = (dim, seed, str(device), dtype)
+        if getattr(self, "_ctx_proj_key", None) != key:
+            g = torch.Generator(device="cpu").manual_seed(seed)
+            w = torch.randn(dim, self.config.text_dim, generator=g) / dim**0.5
+            self._ctx_proj_cache = w.to(device=device, dtype=dtype)
+            self._ctx_proj_key = key
+        return self._ctx_proj_cache
+
+    def _cond_emb(self, prompt_embeds: Tensor) -> Tensor:
+        """Prompt embedding with the context token appended, ``[B, L(+1), text_dim]``.
+
+        ``text_emb`` is cross-attended by every block in *both* the video and the action branch, so
+        one token here modulates both without touching the transformer.
+        """
+        emb = prompt_embeds.to(self.dtype).clone()
+        if not self._context_enabled or self._ctx_e is None:
+            return emb
+        proj = self._ctx_proj(self._ctx_e.shape[0], emb.device, emb.dtype)
+        tok = (self._ctx_e.to(emb.dtype) @ proj).view(1, 1, -1)
+        # Scale relative to the prompt tokens so the injection strength means the same thing across
+        # prompts and checkpoints. ``_get_t5_prompt_embeds`` zero-pads to ``max_sequence_length``
+        # (a ~20-token LIBERO instruction leaves ~490 zero slots), so the reference norm must be
+        # taken over the real tokens only -- averaging over the padding would shrink the injected
+        # token by more than an order of magnitude.
+        norms = emb.float().norm(dim=-1)  # [B, L]
+        real = norms > 0
+        ref_norm = (norms[real].mean() if real.any() else norms.new_ones(())).to(emb.dtype)
+        tok = tok / tok.norm().clamp_min(1e-6) * ref_norm * self.config.context_inject_scale
+        return torch.cat([emb, tok.expand(emb.shape[0], -1, -1)], dim=1)
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
@@ -709,13 +811,17 @@ class LingBotVAPolicy(PreTrainedPolicy):
     def _repeat_input_for_cfg(self, input_dict):
         if self._use_cfg:
             input_dict["noisy_latents"] = input_dict["noisy_latents"].repeat(2, 1, 1, 1, 1)
-            input_dict["text_emb"] = torch.cat(
-                [
-                    self._prompt_embeds.to(self.dtype).clone(),
-                    self._negative_prompt_embeds.to(self.dtype).clone(),
-                ],
-                dim=0,
-            )
+            # NOTE: this overwrites whatever ``_prepare_latent_input`` put in ``text_emb``, so the
+            # context token has to be re-applied here or it silently vanishes under CFG (which is
+            # on by default: guidance_scale=5.0). It goes on the positive branch only -- the
+            # negative branch is the unconditional arm, and ``e`` is conditioning.
+            neg = self._negative_prompt_embeds.to(self.dtype).clone()
+            pos = self._cond_emb(self._prompt_embeds)
+            # Keep the two arms the same length by giving the negative branch a zero context
+            # token -- the same thing the prompt padding already puts there, so it adds nothing.
+            if neg.shape[1] != pos.shape[1]:
+                neg = F.pad(neg, (0, 0, 0, pos.shape[1] - neg.shape[1]))
+            input_dict["text_emb"] = torch.cat([pos, neg], dim=0)
             input_dict["grid_id"] = input_dict["grid_id"][None].repeat(2, 1, 1)
             input_dict["timesteps"] = input_dict["timesteps"][None].repeat(2, 1)
         else:
@@ -750,7 +856,7 @@ class LingBotVAPolicy(PreTrainedPolicy):
                     1,
                     frame_st_id,
                 ).to(device),
-                "text_emb": self._prompt_embeds.to(self.dtype).clone(),
+                "text_emb": self._cond_emb(self._prompt_embeds),
             }
             if latent_cond is not None:
                 out["latent_res_lst"]["noisy_latents"][:, :, 0:1] = latent_cond[:, :, 0:1]
@@ -769,7 +875,7 @@ class LingBotVAPolicy(PreTrainedPolicy):
                     frame_st_id,
                     action=True,
                 ).to(device),
-                "text_emb": self._prompt_embeds.to(self.dtype).clone(),
+                "text_emb": self._cond_emb(self._prompt_embeds),
             }
             if action_cond is not None:
                 out["action_res_lst"]["noisy_latents"][:, :, 0:1] = action_cond[:, :, 0:1]

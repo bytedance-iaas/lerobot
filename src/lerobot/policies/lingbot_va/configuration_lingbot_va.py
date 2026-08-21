@@ -112,6 +112,28 @@ class LingBotVAConfig(PreTrainedConfig):
     # frames; it is clamped to [1, frame_chunk_size - 1].
     residual_min_exec_frames: int = 2
 
+    # Execution feedback via a low-dimensional dynamics-context latent ``e`` (no weight update).
+    # The residual stream measured above is compressed into ``e``, which is injected as an extra
+    # conditioning token alongside the prompt embedding, modulating both the video and the action
+    # branch (they share ``text_emb`` and the KV cache). Frozen base weights; only ``e`` moves, and
+    # only within an episode. ``None`` disables the whole path and keeps behaviour bit-for-bit.
+    context_latent_dim: int | None = None
+    # Scale of the injected token, in units of the mean prompt-token norm. 0.0 injects a zero token
+    # (a useful control arm: exercises the same code path with no signal).
+    context_inject_scale: float = 1.0
+    # EMA rate at which ``e`` follows the residual features. 1.0 = no smoothing.
+    context_lr: float = 0.05
+    # Sliding window (in chunks) used as the within-episode residual baseline. The absolute residual
+    # is dominated by scene identity, so ``e`` is driven by the deviation from this baseline.
+    context_window: int = 8
+    # Changepoint detection: a residual this many sigmas above the window baseline is treated as a
+    # dynamics regime change -- the window is dropped so ``e`` can move to the new regime fast.
+    context_reset_z: float = 3.0
+    # Seed for the fixed random projection from ``e`` to the text-embedding space. In v0 this
+    # projection is untrained (the point is to test whether the injection path can change behaviour
+    # at all); a trained injector would replace it.
+    context_proj_seed: int = 0
+
     # Language ablation: condition on this instruction instead of the one the env supplies.
     # Set it to another task's instruction (or an empty string) to test how much the policy
     # actually relies on language; ``None`` uses the env's instruction as usual.
