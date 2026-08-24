@@ -12,8 +12,13 @@ first", because on that page you cannot.
   different things. Pass `--set image.tag=<sha>` (or set it in the values box), and check the
   tag exists first — `oras repo tags <repo>` — because a sha that was never built gives
   ImagePullBackOff.
-- `auth.password` is empty and the install FAILS with a message until you set it. This console
-  hands out a root shell on a GPU node; it must not come up reachable without credentials.
+- `auth.existingSecret` names a Secret you create beforehand; the install FAILS until it is set.
+  The chart will not take credentials through values: Helm keeps values verbatim in the release
+  history, so `helm get values` reads them back — on every past revision, which means rotating a
+  password does not remove the old one. Create it on the VKE console's 密钥 page (no shell
+  needed) or with `kubectl create secret generic <name> --from-literal=username=… --from-literal=password=…`,
+  in the SAME namespace as the release. Key names default to `username`/`password`; point
+  `auth.usernameKey` / `auth.passwordKey` at whatever your Secret already uses.
 - `nodeSelector: {}` — the GPU request schedules the pod. A hostname from our cluster would
   leave it Pending forever on yours.
 - `apig.enabled: false` — the console works in-cluster without it. Turn it on when you know which
