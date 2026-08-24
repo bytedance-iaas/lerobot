@@ -1,9 +1,9 @@
 ## Installing
 
 The real install path is the **VKE console → 创建 Helm 应用** page: pick the chart, edit
-`values.yaml` in the text box, name the release, deploy. There is no shell in that flow, which is
-why this chart creates everything it needs — nothing here says "run `kubectl create secret`
-first", because on that page you cannot.
+`values.yaml` in the text box, name the release, deploy. There is no shell in that flow, so the
+charts create everything they need — with one deliberate exception: credentials. Those come from
+a Secret you make first, on the console's own **密钥 (Secret)** page, which needs no shell either.
 
 `values.yaml` therefore ships **installable-anywhere defaults**, not our deployment:
 - `image.tag` is empty and required. The chart deliberately does not track the image: the
@@ -72,11 +72,12 @@ For a throwaway install that protection is only a billed leftover and an EIP out
 ### Deploying with the CLI instead
 
 There are no per-environment values files in this repo on purpose — an environment's file wants
-to hold its password, and that is not a thing to commit. Generate one at deploy time:
+to hold its password, and that is not a thing to commit (nor, since the `existingSecret` change,
+a thing the charts will read). Generate one at deploy time:
 
 ```bash
 cat charts/lerobot-agent-console/values.yaml > /tmp/values-activate.yaml   # start from the defaults
-# then append the environment's overrides + credentials, e.g. auth.user/auth.password, apig.*
+# then append the environment's overrides, e.g. auth.existingSecret, image.tag, apig.*
 helm upgrade --install <release> charts/lerobot-agent-console \
   -f /tmp/values-activate.yaml --reset-values
 ```
@@ -191,21 +192,48 @@ helm template lerobot-agent-console charts/lerobot-agent-console | kubectl apply
 Both charts reference Secrets by name and never create them:
 
 ```bash
-kubectl create secret generic lerobot-console-auth --from-literal=user=<u> --from-literal=password=<p>
+kubectl create secret generic lerobot-console-auth --from-literal=username=<u> --from-literal=password=<p>
 kubectl create secret generic livekit-auth --from-literal=keys='<api_key>: <api_secret>'
 ```
 
-`livekit` has **no credential fallback on purpose** — that SFU is on a public CLB, so a key
-committed here would be readable by anyone who can read the repo. A missing Secret holds the pod
-in `CreateContainerConfigError`, which is the intended failure.
+Neither chart has a credential fallback, on purpose: one hands out a root shell on a GPU node,
+the other signs access tokens for an SFU on a public CLB. Point `auth.existingSecret` at the
+Secret's name; it must be in the same namespace as the release. Rendering fails without it, which
+is a better failure than starting.
+
+Key names are configurable so an existing Secret can be adopted as-is. Ours predates the chart
+and uses `user`, hence:
+
+```bash
+helm upgrade --install <release> charts/lerobot-agent-console \
+  --set auth.existingSecret=lerobot-console-auth --set auth.usernameKey=user
+```
 
 ## Publishing to the OCI registry
 
 ```bash
-helm registry login iaas-us-cn-beijing.cr.volces.com -u <account>@<account-id>
-helm package charts/lerobot-agent-console
-helm push lerobot-agent-console-<version>.tgz oci://iaas-us-cn-beijing.cr.volces.com/physicalai
+export HELM_REGISTRY_HOST=iaas-us-cn-beijing.cr.volces.com
+export HELM_REGISTRY_NAMESPACE=physicalai
+export HELM_REGISTRY_USERNAME=<account>@<account-id> HELM_REGISTRY_PASSWORD=<password>
+
+DRY_RUN=1 bash scripts/publish_charts.sh          # package + gate only, touches no registry
+bash scripts/publish_charts.sh                    # push every chart
+bash scripts/publish_charts.sh livekit            # or just one
 ```
+
+Adapted from RLinf's `docker/publish_charts.sh`, so the same script works on a CI runner with no
+helm, no root and no package manager: it unpacks a static helm into a temp dir, and logs in
+through a throwaway `--registry-config` so the robot account is not left behind for the next job.
+
+Before packaging, each chart is rendered with placeholder values. That gate is `helm template`,
+not `helm lint`: on helm v4.2.3 a template that calls `fail` — which is how both charts refuse a
+missing `auth.existingSecret` — lints as `level=INFO` and still reports "0 chart(s) failed",
+exit 0. Placeholder values live in a `case` block in the script; a chart added without an entry
+there stops the run rather than being published unrendered.
+
+The push refuses a version already in the registry (`ALLOW_OVERWRITE=1` to override). That is the
+same rule `scripts/check-chart-version.sh` enforces against git, asked of the registry instead, so
+it still holds in a shallow CI clone where no base ref resolves.
 
 The chart is named after the product, so it lands in the **same repo as the image**
 (`physicalai/lerobot-agent-console`). They coexist: image tags are 40-char commit SHAs, chart

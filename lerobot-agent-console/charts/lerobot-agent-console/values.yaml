@@ -1,6 +1,7 @@
-# Defaults are installable-anywhere, NOT our deployment: no node pin, APIG off, and the two
-# credentials empty so the install fails loudly rather than coming up unauthenticated.
-# Set auth.password before deploying; everything else works as-is on a GPU cluster.
+# Defaults are installable-anywhere, NOT our deployment: no node pin, APIG off, and no
+# credentials, so the install fails loudly rather than coming up unauthenticated.
+# Set image.tag and auth.existingSecret before deploying (the chart refuses to render without
+# either); everything else works as-is on a GPU cluster.
 
 # Resource names come from the RELEASE name. Pinning a literal here — which this chart used to
 # do — means every install produces the same names no matter what you call the release, so a
