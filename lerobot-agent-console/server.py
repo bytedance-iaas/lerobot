@@ -106,8 +106,10 @@ def _require_auth_credentials() -> None:
     log.error(
         "REFUSING TO START: %s not set. This console gives shell access to a GPU node and is "
         "normally published over HTTPS, so it must never come up without credentials. "
-        "Under Helm, set auth.user / auth.password in values.yaml (the chart refuses to install "
-        "otherwise). Running the container directly: pass -e CONSOLE_USER -e CONSOLE_PASSWORD.",
+        "Under Helm, create a Secret and point auth.existingSecret at it (the chart refuses to "
+        "render otherwise); if the pod started but the vars are empty, auth.usernameKey / "
+        "auth.passwordKey name keys the Secret does not have. Running the container directly: "
+        "pass -e CONSOLE_USER -e CONSOLE_PASSWORD.",
         " and ".join(missing))
     raise SystemExit(2)
 # The console serves plain HTTP :8080. TLS/HTTPS is terminated upstream — by APIG (the

@@ -41,10 +41,12 @@ spec:
             {{- range .Values.env }}
             - { name: {{ .name }}, value: {{ .value | quote }} }
             {{- end }}
-            {{/* Single-user HTTP Basic login. Auth is ALWAYS on: if either var is missing the
-                 console falls back to a built-in pair and says so in the UI, so a broken Secret
-                 degrades loudly instead of serving the console unauthenticated. The Secret is
-                 NOT created here — charts should not carry credentials. */}}
+            {{/* Single-user HTTP Basic login. There is no fallback pair: with either var
+                 missing the server exits 2 (server.py _require_auth_credentials), and a Secret
+                 whose name or key is wrong never gets that far — the pod stays in
+                 CreateContainerConfigError. Both are better than a console on a public HTTPS
+                 endpoint handing out a root shell to whoever asks. The Secret is NOT created
+                 here; see auth.existingSecret in values.yaml for why. */}}
             - name: CONSOLE_USER
               valueFrom:
                 secretKeyRef: { name: {{ .Values.auth.existingSecret }}, key: {{ .Values.auth.usernameKey }} }
