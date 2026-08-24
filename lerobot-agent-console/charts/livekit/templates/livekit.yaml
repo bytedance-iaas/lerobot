@@ -1,3 +1,6 @@
+{{- if not .Values.auth.existingSecret }}
+{{- fail "livekit: auth.existingSecret is empty. This SFU is published on a CLB and its key signs access tokens for any room, so it must not start without one — and the chart will not take the key through values, because Helm keeps values verbatim in the release history where `helm get values` can read it back.\n\nCreate the Secret first (the VKE console has a 密钥 page — no shell needed):\n  kubectl create secret generic livekit-auth -n <ns> --from-literal=keys='devkey: <openssl rand -hex 32>'\n\nThen set auth.existingSecret to its name. The SAME Secret must be readable by whatever publishes to this server, or the two ends authenticate against different keys." }}
+{{- end }}
 {{/* Self-hosted LiveKit SFU. The Mac daemon (home robot) and the in-pod controller both DIAL
      OUT to it, which sidesteps home/cloud symmetric NAT — only the CLB needs inbound. */}}
 {{- $name := default .Release.Name .Values.nameOverride -}}
@@ -110,7 +113,7 @@ spec:
                  CreateContainerConfigError rather than start a public SFU with no credentials. */}}
             - name: LIVEKIT_KEYS
               valueFrom:
-                secretKeyRef: { name: {{ $name }}-auth, key: keys }
+                secretKeyRef: { name: {{ .Values.auth.existingSecret }}, key: {{ .Values.auth.keysKey }} }
           ports:
             - { containerPort: {{ .Values.service.ports.signal }} }
             - { containerPort: {{ .Values.service.ports.rtcTcp }} }

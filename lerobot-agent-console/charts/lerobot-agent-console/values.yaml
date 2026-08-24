@@ -57,16 +57,26 @@ persistence:
 # "out of shared memory") and the container cannot remount it without CAP_SYS_ADMIN.
 dshmSize: 32Gi
 
-# Console login (HTTP basic auth). Set the password before deploying — it is the only thing
-# between a public endpoint and a root shell on a GPU box; the chart refuses to install without it.
+# Console login (HTTP basic auth), supplied only through a Secret you create beforehand.
 #
-# Plain values, not a pre-made Secret: this chart is installed from the VKE console's
-# "创建 Helm 应用" page, where values.yaml is the only input and there is no shell in which to run
-# `kubectl create secret` first. A chart that requires one cannot be installed that way at all.
-# The chart renders these into a Secret it owns, so they are not left sitting in the pod spec.
+# The chart deliberately cannot build one from values: Helm stores values verbatim in the release
+# history, so a password passed that way stays readable to anyone who can run `helm get values` —
+# and it stays there for every past revision, so rotating it does not remove the old one. This
+# console hands out a root shell on a GPU node, which makes that the wrong trade.
+#
+# Create it first — the VKE console has a 密钥 (Secret) page, no shell required:
+#   kubectl create secret generic lerobot-console-auth -n <namespace> \
+#     --from-literal=username=<user> --from-literal=password=<password>
+#
+# The Secret must live in the SAME namespace as the release — Kubernetes does not let a pod
+# reference a Secret from another one.
+#
+# Key names default to RLinf's (username/password). Point them at whatever your Secret already
+# uses instead of rebuilding it, e.g. usernameKey: user.
 auth:
-  user: lerobot
-  password: ""
+  existingSecret: ""        # REQUIRED — the chart refuses to render without it
+  usernameKey: username
+  passwordKey: password
 
 env:
   # An ORDERED LIST, not a map: Helm's `range` sorts map keys, and reordering container env
