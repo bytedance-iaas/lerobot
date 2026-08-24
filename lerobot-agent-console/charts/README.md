@@ -192,8 +192,8 @@ helm template lerobot-agent-console charts/lerobot-agent-console | kubectl apply
 Both charts reference Secrets by name and never create them:
 
 ```bash
-kubectl create secret generic lerobot-console-auth --from-literal=username=<u> --from-literal=password=<p>
-kubectl create secret generic livekit-auth --from-literal=keys='<api_key>: <api_secret>'
+kubectl create secret generic <console-secret> --from-literal=username=<u> --from-literal=password=<p>
+kubectl create secret generic <livekit-secret> --from-literal=keys='<api_key>: <api_secret>'
 ```
 
 Neither chart has a credential fallback, on purpose: one hands out a root shell on a GPU node,
@@ -201,13 +201,16 @@ the other signs access tokens for an SFU on a public CLB. Point `auth.existingSe
 Secret's name; it must be in the same namespace as the release. Rendering fails without it, which
 is a better failure than starting.
 
-Key names are configurable so an existing Secret can be adopted as-is. Ours predates the chart
-and uses `user`, hence:
-
 ```bash
 helm upgrade --install <release> charts/lerobot-agent-console \
-  --set auth.existingSecret=lerobot-console-auth --set auth.usernameKey=user
+  --set image.tag=<sha> --set auth.existingSecret=lerobot-console-auth
 ```
+
+`auth.usernameKey` / `auth.passwordKey` exist for adopting a Secret that already uses other key
+names, without rebuilding it around a live password. Ours needed that once — `lerobot-console-auth`
+predates the chart and stored the name under `user` — but it now carries `username` as well, so
+the defaults apply and nothing overrides them. The old `user` key is still there because the
+running release references it; drop it once every release is on a chart ≥ 0.4.
 
 ## Publishing to the OCI registry
 

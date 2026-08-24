@@ -66,14 +66,15 @@ dshmSize: 32Gi
 # console hands out a root shell on a GPU node, which makes that the wrong trade.
 #
 # Create it first — the VKE console has a 密钥 (Secret) page, no shell required:
-#   kubectl create secret generic lerobot-console-auth -n <namespace> \
+#   kubectl create secret generic <secret-name> -n <namespace> \
 #     --from-literal=username=<user> --from-literal=password=<password>
 #
 # The Secret must live in the SAME namespace as the release — Kubernetes does not let a pod
 # reference a Secret from another one.
 #
-# Key names default to RLinf's (username/password). Point them at whatever your Secret already
-# uses instead of rebuilding it, e.g. usernameKey: user.
+# Key names match the command above and RLinf's chart; leave them alone unless you are adopting
+# a Secret that already exists with different ones, which the two keys below let you do without
+# rebuilding it around a live password.
 auth:
   existingSecret: ""        # REQUIRED — the chart refuses to render without it
   usernameKey: username
