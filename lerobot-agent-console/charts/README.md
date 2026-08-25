@@ -26,16 +26,19 @@ a Secret you make first, on the console's own **密钥 (Secret)** page, which ne
   + `subnetIds` provisions a new one. ⚠️ A provisioned gateway is deleted by `helm uninstall`,
   taking its `*.volceapi.com` domain with it.
 
-  **`create: true` is a two-step bootstrap.** The Ingress binds to a gateway through a
-  `loadbalancer-id` annotation, and that id does not exist until the gateway has been
-  provisioned — so the first render cannot carry it. Verified on a real install: without it the
-  Ingress never gets an address and APIG lists no service for the gateway; setting the id made
-  both appear within a minute. After the first install:
+  **Both modes install in one step.** They bind from opposite sides, which is why:
 
-  ```bash
-  kubectl get apiginstance <release>-apig -o jsonpath='{.status.id}'
-  ```
-  put that in `apig.existingId` (leave `create: true`) and upgrade.
+  | | binds by | renders an APIGInstance |
+  |---|---|---|
+  | `create: false` | `loadbalancer-id` annotation on the Ingress, from `existingId` | no — the adopted gateway has its own |
+  | `create: true` | the APIGInstance watching this namespace and ingress class | yes |
+
+  So with `create: true` the gateway's id never has to come back into values, and it must not:
+  writing `existingId` sets `spec.id`, which the CRD treats as immutable, and every later upgrade
+  is then rejected with `spec.id: Forbidden: forbidden to update`. The chart refuses that
+  combination at render time. An earlier version of this chart did require reading `status.id`
+  back and upgrading again; `apig.retainOnDelete` also arrived with that change, and the fields
+  now match the RLinf chart one for one.
 
   The gateway's public `*.volceapi.com` name is assigned by APIG and is **not exposed anywhere in
   Kubernetes** — not in the CRD status, not on the Ingress. Read it from the APIG console. For
@@ -251,3 +254,8 @@ even when you are logged in. A read probe returning **404 rather than 401** mean
 `k8s/apig-ingress*.yaml` and `k8s/apig-instance-test.yaml` stay raw. They create Volcengine
 `APIGInstance` CRDs that own **provisioned gateways with public domains**; a stray
 `helm uninstall` would delete the gateway and the domain with it. They change roughly never.
+
+That reason is now weaker than it was: `apig.retainOnDelete=true` renders
+`helm.sh/resource-policy: keep`, which survives `helm uninstall`. It has to be set BEFORE the
+uninstall, though — Helm reads the annotation from the manifest stored in the release, not from
+the live object — so a gateway that is already live and unannotated is still safer outside Helm.

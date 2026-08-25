@@ -1,0 +1,58 @@
+{{/*
+Provisions a NEW gateway (its own CLB and public IP, billed). Omitting spec.id is what tells the
+operator to provision rather than adopt, and it stays omitted for the life of the release: the
+provisioned id lands in status.id, and spec.id is immutable — setting it later is rejected by the
+admission webhook with "spec.id: Forbidden: forbidden to update", which fails every subsequent
+upgrade until the value is removed again.
+
+Adopting an existing gateway renders nothing here: that gateway already has its own APIGInstance,
+and the Ingress binds to it by id through the annotations in console.apig.annotations.
+
+⚠️ `helm uninstall` deletes this gateway and its auto-assigned *.volceapi.com domain with it.
+Set apig.retainOnDelete=true to keep it instead. That has to be decided BEFORE the uninstall and
+applied with an upgrade: Helm reads the retention annotation from the manifest stored in the
+release, not from the live object, so annotating the object with kubectl afterwards does not
+save it.
+*/}}
+{{- include "console.apig.validate" . -}}
+{{- if and .Values.apig.enabled .Values.apig.create }}
+apiVersion: loadbalancer.vke.volcengine.com/v1beta1
+kind: APIGInstance
+metadata:
+  name: {{ include "console.apig.instanceObjectName" . }}
+  labels:
+    app: {{ include "console.name" . }}-apig
+  {{- if .Values.apig.retainOnDelete }}
+  annotations:
+    helm.sh/resource-policy: keep
+  {{- end }}
+spec:
+  name: {{ default (printf "%s-apig" (include "console.name" .)) .Values.apig.instanceName }}
+  common:
+    network:
+      subnetIds:
+        {{- toYaml .Values.apig.subnetIds | nindent 8 }}
+    {{- $res := dict }}
+    {{- with .Values.apig.replicas }}{{ $_ := set $res "replicas" (int .) }}{{ end }}
+    {{- with .Values.apig.instanceSpecCode }}{{ $_ := set $res "instanceSpecCode" . }}{{ end }}
+    {{- with .Values.apig.clbSpecCode }}{{ $_ := set $res "clbSpecCode" . }}{{ end }}
+    {{- with .Values.apig.publicNetworkBillingType }}{{ $_ := set $res "publicNetworkBillingType" . }}{{ end }}
+    {{- with .Values.apig.publicNetworkBandwidth }}{{ $_ := set $res "publicNetworkBandwidth" (int .) }}{{ end }}
+    {{- if $res }}
+    # Only the fields you set explicitly; anything omitted is the platform's own default.
+    resource:
+      {{- toYaml $res | nindent 6 }}
+    {{- end }}
+  ingress:
+    enable: true
+    # Scoped to this release's namespace and class, so the gateway never picks up someone else's
+    # Ingress — and so it claims OURS without being told the gateway's id, which is what removes
+    # the read-status.id-and-upgrade-again step.
+    enableAllIngressClasses: false
+    enableAllNamespaces: false
+    enableIngressWithoutIngressClass: false
+    ingressClasses:
+      - {{ include "console.apig.ingressClassName" . }}
+    watchNamespaces:
+      - {{ .Release.Namespace }}
+{{- end }}
