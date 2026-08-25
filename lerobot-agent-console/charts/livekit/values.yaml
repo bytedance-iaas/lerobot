@@ -54,25 +54,29 @@ service:
   # ⚠️ An unrecognised value is IGNORED, not rejected, and the platform then defaults to PUBLIC.
   addressType: PUBLIC
 
-  # Public bandwidth CAP for the CLB's EIP, in Mbps (1–500).
+  # Public bandwidth CAP for the CLB's EIP, in Mbps (1–500). Applies WHEN THE CLB IS CREATED.
   #
-  # ⚠️ EMPTY MEANS 1 Mbps, and 1 Mbps cannot carry WebRTC media — one 720p stream alone wants
-  # about 2. This is not a guess: the EIP the platform created for this chart reports
-  # Bandwidth=1, BillingType=3 (by traffic), read back from DescribeEipAddresses. Reachability
-  # tests pass at that cap — small packets get through fine — so nothing looks wrong until real
-  # media flows and every participant degrades at once.
+  # Not optional in practice, which is why it is not empty: leave the annotation off and the
+  # platform picks 1 Mbps. One 720p stream wants about twice that, so a real session degrades for
+  # everyone while every check you would think to run still passes — reachability tests move a few
+  # KB and never approach the cap. Measured on this deployment's own EIP before it was fixed:
+  # Bandwidth=1, BillingType=3 (by traffic), read from DescribeEipAddresses.
   #
-  # 200 is the sensible value for an SFU. It is left empty rather than defaulted because the
-  # cap's cost depends on the EIP's billing type, which is the account's to decide: by traffic
-  # (what this one uses) makes it a ceiling you only pay for when you use it, but by bandwidth
-  # bills the reservation.
-  bandwidth: ""
+  # Billing type is the platform's default, by traffic, so this is a ceiling you pay for only when
+  # you use it. If your account's EIPs bill by bandwidth instead, this becomes a reservation —
+  # lower it deliberately then.
+  bandwidth: "200"
 
-  # Only for changing fields on an EXISTING CLB. The platform documents sync-fields as required
-  # when updating the instance spec; whether bandwidth alone needs it is NOT confirmed here, so
-  # it is exposed rather than assumed. If a bandwidth change does not show up in the EIP, set
-  # this and try again.
-  syncFields: ""
+  # ⚠️ CHANGING THIS ON AN EXISTING CLB DOES NOTHING. Measured 2026-08-26: the annotation was
+  # added to a live Service, the controller logged EnsuredLoadBalancer with no warning, and the
+  # EIP stayed at 1 Mbps. Adding sync-fields: bandwidth changed nothing either — that annotation
+  # covers the instance spec, not the EIP. CCM simply does not reconcile EIP bandwidth after
+  # creation, in either direction.
+  #
+  # To fix a CLB that already exists, change the EIP itself and leave Helm out of it:
+  #   AllocationId=$(...DescribeEipAddresses on the CLB's public IP...)
+  #   ModifyEipAddressAttributes  AllocationId=<id>  Bandwidth=200
+  # The address does not change, and a forced reconcile afterwards did not revert it — verified.
 
   # Whether `helm uninstall` leaves the CLB behind (helm.sh/resource-policy: keep).
   #
