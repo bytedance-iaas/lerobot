@@ -52,10 +52,6 @@ service:
 
   # PUBLIC or PRIVATE — Volcengine's own spelling, and the only two values it accepts.
   # ⚠️ An unrecognised value is IGNORED, not rejected, and the platform then defaults to PUBLIC.
-  # This chart shipped `internet` (that is Alibaba Cloud SLB's spelling) and got a public CLB the
-  # whole time — by luck, since public was what it wanted. Someone asking for a private CLB the
-  # same way would have been handed a public one holding an SFU. The chart now refuses any value
-  # other than these two rather than let the platform quietly pick.
   addressType: PUBLIC
 
   # Public bandwidth CAP for the CLB's EIP, in Mbps (1–500).
