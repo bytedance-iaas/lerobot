@@ -215,7 +215,7 @@ running release references it; drop it once every release is on a chart ≥ 0.4.
 ## Publishing to the OCI registry
 
 ```bash
-export HELM_REGISTRY_HOST=iaas-us-cn-beijing.cr.volces.com
+export HELM_REGISTRY_HOST=ai-containers-cn-beijing.cr.volces.com
 export HELM_REGISTRY_NAMESPACE=physicalai
 export HELM_REGISTRY_USERNAME=<account>@<account-id> HELM_REGISTRY_PASSWORD=<password>
 

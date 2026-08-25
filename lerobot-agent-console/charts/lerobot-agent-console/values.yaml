@@ -14,9 +14,6 @@
 nameOverride: ""
 
 image:
-  # NOTE the host here is NOT the one README.md's buildx line pushes to (iaas-us-cn-beijing).
-  # That difference is deliberate — the cluster pulls from this host. Do not "fix" it by making
-  # the two match; changing this line changes where every deployment pulls from.
   repository: ai-containers-cn-beijing.cr.volces.com/physicalai/lerobot-agent-console
   # REQUIRED, and deliberately empty: the chart does not track the image. The pipeline tags every
   # build with its commit sha (there is no `latest`), so a hardcoded tag here means republishing
