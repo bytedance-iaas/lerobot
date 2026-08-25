@@ -92,7 +92,7 @@ pip-installing optional tools at runtime.
 # image by the same commit. (The lerobot commit comes from BASE_IMAGE's tag automatically.)
 COMMIT=$(git rev-parse HEAD)
 docker buildx build \
-  --build-arg BASE_IMAGE=ai-containers-cn-beijing.cr.volces.com/physicalai/lerobot:44effcd03b79f91b0c7ab4d30e757493ca049146 \
+  --build-arg BASE_IMAGE=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot:44effcd03b79f91b0c7ab4d30e757493ca049146 \
   --build-arg CONSOLE_COMMIT=$COMMIT \
   --output type=image,name=ai-containers-cn-beijing.cr.volces.com/physicalai/lerobot-agent-console:$COMMIT,push=true,compression=gzip,oci-mediatypes=true \
   .

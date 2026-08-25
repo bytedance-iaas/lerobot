@@ -11,11 +11,16 @@
 # 1.6.x rejects zstd. The lerobot base images are gzip, so the console image is
 # gzip too.
 #   docker buildx build \
-#     --build-arg BASE_IMAGE=ai-containers-cn-beijing.cr.volces.com/physicalai/lerobot:<lerobot-tag> \
+#     --build-arg BASE_IMAGE=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot:<lerobot-tag> \
 #     --build-arg CONSOLE_COMMIT=$(git rev-parse HEAD) \
 #     --output type=image,name=<registry>/lerobot-agent-console:<tag>,push=true,compression=gzip,oci-mediatypes=true \
 #     .
-ARG BASE_IMAGE=ai-containers-cn-beijing.cr.volces.com/physicalai/lerobot:18cd48ce718176258aa1a685622f9933f1549a9e
+# ⚠️ iaas-us, NOT ai-containers. The base images live in one registry and the images built from
+# them are pushed to the other; they are not interchangeable. Verified 2026-08-26 with
+# `oras manifest fetch`: physicalai/lerobot:18cd48ce exists on iaas-us only, and
+# physicalai/lerobot-agent-console exists on ai-containers only. A blanket registry rename put
+# this line on ai-containers and CI failed at FROM (run 957327e9).
+ARG BASE_IMAGE=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot:18cd48ce718176258aa1a685622f9933f1549a9e
 FROM ${BASE_IMAGE}
 
 # lerobot's Dockerfile.user ends with `USER user_lerobot` (non-root). The build

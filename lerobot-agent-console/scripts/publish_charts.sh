@@ -145,22 +145,40 @@ printf '%s' "${HELM_REGISTRY_PASSWORD}" |
   helm registry login "${registry}" --username "${HELM_REGISTRY_USERNAME}" \
     --password-stdin --registry-config "${config}"
 
+# Republishing the SAME chart under the SAME version is what CI does on every commit that did
+# not touch a chart, so it must not be an error. Publishing a DIFFERENT chart under a version
+# already taken is the thing worth stopping for: helm push overwrites without complaint, and two
+# different charts then answer to one number with no way to tell them apart afterwards. So the
+# check is on content, not on presence — and every chart is processed before exiting, or a
+# conflict in the first would keep a legitimately bumped second one from ever being published.
+conflicts=0
 for entry in "${packages[@]}"; do
   IFS='|' read -r name version package <<< "${entry}"
+  ref="oci://${registry}/${namespace}/${name}"
 
-  # helm push overwrites an existing tag without complaint, which would leave two
-  # different charts answering to one version — the same failure scripts/check-chart-version.sh
-  # guards against in git. This asks the registry instead, so it still holds on a shallow
-  # clone where that script cannot resolve a base ref.
   if [[ "${ALLOW_OVERWRITE:-0}" != "1" ]] &&
-     helm show chart "oci://${registry}/${namespace}/${name}" --version "${version}" \
-       --registry-config "${config}" >/dev/null 2>&1; then
-    echo "error: ${name} ${version} is already in the registry." >&2
+     helm show chart "${ref}" --version "${version}" --registry-config "${config}" >/dev/null 2>&1; then
+    # Compare extracted trees rather than digests: `helm package` records file mtimes, so
+    # repackaging the same source yields a different byte stream and a different digest.
+    cmp_dir="${work}/cmp/${name}"
+    mkdir -p "${cmp_dir}/remote" "${cmp_dir}/local"
+    if helm pull "${ref}" --version "${version}" -d "${cmp_dir}/remote" \
+         --registry-config "${config}" >/dev/null 2>&1 &&
+       tar -xzf "${cmp_dir}/remote"/*.tgz -C "${cmp_dir}/remote" &&
+       tar -xzf "${package}" -C "${cmp_dir}/local" &&
+       diff -r "${cmp_dir}/remote/${name}" "${cmp_dir}/local/${name}" >/dev/null 2>&1; then
+      echo "${name} ${version} is already published and identical — nothing to do."
+      continue
+    fi
+    echo "error: ${name} ${version} is already in the registry, with DIFFERENT content." >&2
     echo "       Bump version: in charts/${name}/Chart.yaml, or set ALLOW_OVERWRITE=1 if you" >&2
-    echo "       really mean to replace it." >&2
-    exit 1
+    echo "       really mean to replace what is published." >&2
+    conflicts=$((conflicts + 1))
+    continue
   fi
 
   # helm push reports the pushed reference and its digest on success.
   helm push "${package}" "oci://${registry}/${namespace}" --registry-config "${config}"
 done
+
+[[ "${conflicts}" -eq 0 ]] || exit 1
