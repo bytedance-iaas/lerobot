@@ -28,7 +28,7 @@ spec:
       {{- end }}
       containers:
         - name: console
-          image: "{{ .Values.image.repository }}:{{ required "image.tag is required — the chart does not pin one, because the pipeline tags every build with its commit sha and the chart would then need republishing for each. Pass --set image.tag=<sha>, or set it in the values box. List available tags with: oras repo tags iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot-agent-console" .Values.image.tag }}"
+          image: "{{ .Values.image.repository }}:{{ required "image.tag is required — the chart does not pin one, because the pipeline tags every build with its commit sha and the chart would then need republishing for each. Pass --set image.tag=<sha>, or set it in the values box. List available tags with: oras repo tags ai-containers-cn-beijing.cr.volces.com/physicalai/lerobot-agent-console" .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           {{- with .Values.capabilities }}
           securityContext:
