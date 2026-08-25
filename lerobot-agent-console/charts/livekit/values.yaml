@@ -49,7 +49,38 @@ service:
   # ⚠️ Once a CLB exists, changing this provisions a NEW load balancer with a NEW public IP and
   # invalidates every client's --livekit-url. Treat it as immutable after the first install.
   subnetId: ""
-  addressType: internet
+
+  # PUBLIC or PRIVATE — Volcengine's own spelling, and the only two values it accepts.
+  # ⚠️ An unrecognised value is IGNORED, not rejected, and the platform then defaults to PUBLIC.
+  addressType: PUBLIC
+
+  # Public bandwidth CAP for the CLB's EIP, in Mbps (1–500). Applies WHEN THE CLB IS CREATED.
+  #
+  # Not optional in practice, which is why it is not empty: leave the annotation off and the
+  # platform picks 1 Mbps. One 720p stream wants about twice that, so a real session degrades for
+  # everyone while every check you would think to run still passes — reachability tests move a few
+  # KB and never approach the cap. Measured on this deployment's own EIP before it was fixed:
+  # Bandwidth=1, BillingType=3 (by traffic), read from DescribeEipAddresses.
+  #
+  # Billing type is the platform's default, by traffic, so this is a ceiling you pay for only when
+  # you use it. If your account's EIPs bill by bandwidth instead, this becomes a reservation.
+  #
+  # 10 covers a handful of concurrent 720p streams and is the deliberate choice here — enough
+  # that the SFU works out of the box, low enough that a runaway session cannot run up a large
+  # traffic bill unnoticed. Raise it for real fleets: the ceiling is 500, and once media is
+  # actually flowing this is the first thing to check when quality degrades for everyone at once.
+  bandwidth: "10"
+
+  # ⚠️ CHANGING THIS ON AN EXISTING CLB DOES NOTHING. Measured 2026-08-26: the annotation was
+  # added to a live Service, the controller logged EnsuredLoadBalancer with no warning, and the
+  # EIP stayed at 1 Mbps. Adding sync-fields: bandwidth changed nothing either — that annotation
+  # covers the instance spec, not the EIP. CCM simply does not reconcile EIP bandwidth after
+  # creation, in either direction.
+  #
+  # To fix a CLB that already exists, change the EIP itself and leave Helm out of it:
+  #   AllocationId=$(...DescribeEipAddresses on the CLB's public IP...)
+  #   ModifyEipAddressAttributes  AllocationId=<id>  Bandwidth=10
+  # The address does not change, and a forced reconcile afterwards did not revert it — verified.
 
   # Whether `helm uninstall` leaves the CLB behind (helm.sh/resource-policy: keep).
   #

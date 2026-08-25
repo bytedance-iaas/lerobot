@@ -151,6 +151,12 @@ metadata:
     {{- end }}
     service.beta.kubernetes.io/volcengine-loadbalancer-subnet-id: {{ .Values.service.subnetId | quote }}
     service.beta.kubernetes.io/volcengine-loadbalancer-address-type: {{ .Values.service.addressType | quote }}
+    {{- with .Values.service.bandwidth }}
+    service.beta.kubernetes.io/volcengine-loadbalancer-bandwidth: {{ . | quote }}
+    {{- end }}
+    {{- if not (has .Values.service.addressType (list "PUBLIC" "PRIVATE")) }}
+    {{- fail (printf "service.addressType must be PUBLIC or PRIVATE, got %q. Volcengine ignores anything else and falls back to PUBLIC, so a typo here hands you an internet-facing CLB in front of the SFU instead of failing." .Values.service.addressType) }}
+    {{- end }}
 spec:
   type: LoadBalancer
   externalTrafficPolicy: Cluster
