@@ -58,6 +58,26 @@ service:
   # other than these two rather than let the platform quietly pick.
   addressType: PUBLIC
 
+  # Public bandwidth CAP for the CLB's EIP, in Mbps (1–500).
+  #
+  # ⚠️ EMPTY MEANS 1 Mbps, and 1 Mbps cannot carry WebRTC media — one 720p stream alone wants
+  # about 2. This is not a guess: the EIP the platform created for this chart reports
+  # Bandwidth=1, BillingType=3 (by traffic), read back from DescribeEipAddresses. Reachability
+  # tests pass at that cap — small packets get through fine — so nothing looks wrong until real
+  # media flows and every participant degrades at once.
+  #
+  # 200 is the sensible value for an SFU. It is left empty rather than defaulted because the
+  # cap's cost depends on the EIP's billing type, which is the account's to decide: by traffic
+  # (what this one uses) makes it a ceiling you only pay for when you use it, but by bandwidth
+  # bills the reservation.
+  bandwidth: ""
+
+  # Only for changing fields on an EXISTING CLB. The platform documents sync-fields as required
+  # when updating the instance spec; whether bandwidth alone needs it is NOT confirmed here, so
+  # it is exposed rather than assumed. If a bandwidth change does not show up in the EIP, set
+  # this and try again.
+  syncFields: ""
+
   # Whether `helm uninstall` leaves the CLB behind (helm.sh/resource-policy: keep).
   #
   # true for anything real: the CLB holds a PUBLIC IP that every client has baked into its
