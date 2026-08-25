@@ -14,7 +14,7 @@
 nameOverride: ""
 
 image:
-  repository: iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot-agent-console
+  repository: ai-containers-cn-beijing.cr.volces.com/physicalai/lerobot-agent-console
   # REQUIRED, and deliberately empty: the chart does not track the image. The pipeline tags every
   # build with its commit sha (there is no `latest`), so a hardcoded tag here means republishing
   # the chart for every build — the chart version and the image version are not the same thing
@@ -22,7 +22,7 @@ image:
   #
   # Pass it at deploy time: `--set image.tag=<sha>`, or edit this line in the values box on the
   # VKE console's Helm page. Find the sha in the CP pipeline's build record, or list them:
-  #   oras repo tags iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot-agent-console
+  #   oras repo tags ai-containers-cn-beijing.cr.volces.com/physicalai/lerobot-agent-console
   # ⚠️ Verify the tag exists before deploying — a sha that was never built gives
   # ImagePullBackOff, and if you have just deleted the PVC there is nothing to roll back to.
   tag: ""
