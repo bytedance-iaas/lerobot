@@ -1,0 +1,33 @@
+{{/*
+Publishes the console. The platform issues one managed *.volceapi.com domain per host, so this
+host is what earns the release its own public address.
+
+Templated off the same helpers as the Service, so a rename can never leave the Ingress pointing
+at a backend that no longer exists — the drift a chart exists to prevent.
+*/}}
+{{- include "console.apig.validate" . -}}
+{{- if .Values.apig.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "console.apig.ingressName" . }}
+  labels:
+    app: {{ include "console.name" . }}-apig
+  {{- with (include "console.apig.annotations" . | trim) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  ingressClassName: {{ include "console.apig.ingressClassName" . }}
+  rules:
+    - host: {{ include "console.apig.host" . | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "console.name" . }}
+                port:
+                  number: {{ include "console.port" . }}
+{{- end }}
