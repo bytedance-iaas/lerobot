@@ -49,7 +49,14 @@ service:
   # ⚠️ Once a CLB exists, changing this provisions a NEW load balancer with a NEW public IP and
   # invalidates every client's --livekit-url. Treat it as immutable after the first install.
   subnetId: ""
-  addressType: internet
+
+  # PUBLIC or PRIVATE — Volcengine's own spelling, and the only two values it accepts.
+  # ⚠️ An unrecognised value is IGNORED, not rejected, and the platform then defaults to PUBLIC.
+  # This chart shipped `internet` (that is Alibaba Cloud SLB's spelling) and got a public CLB the
+  # whole time — by luck, since public was what it wanted. Someone asking for a private CLB the
+  # same way would have been handed a public one holding an SFU. The chart now refuses any value
+  # other than these two rather than let the platform quietly pick.
+  addressType: PUBLIC
 
   # Whether `helm uninstall` leaves the CLB behind (helm.sh/resource-policy: keep).
   #
