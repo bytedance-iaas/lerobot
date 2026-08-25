@@ -63,9 +63,13 @@ service:
   # Bandwidth=1, BillingType=3 (by traffic), read from DescribeEipAddresses.
   #
   # Billing type is the platform's default, by traffic, so this is a ceiling you pay for only when
-  # you use it. If your account's EIPs bill by bandwidth instead, this becomes a reservation —
-  # lower it deliberately then.
-  bandwidth: "200"
+  # you use it. If your account's EIPs bill by bandwidth instead, this becomes a reservation.
+  #
+  # 10 covers a handful of concurrent 720p streams and is the deliberate choice here — enough
+  # that the SFU works out of the box, low enough that a runaway session cannot run up a large
+  # traffic bill unnoticed. Raise it for real fleets: the ceiling is 500, and once media is
+  # actually flowing this is the first thing to check when quality degrades for everyone at once.
+  bandwidth: "10"
 
   # ⚠️ CHANGING THIS ON AN EXISTING CLB DOES NOTHING. Measured 2026-08-26: the annotation was
   # added to a live Service, the controller logged EnsuredLoadBalancer with no warning, and the
@@ -75,7 +79,7 @@ service:
   #
   # To fix a CLB that already exists, change the EIP itself and leave Helm out of it:
   #   AllocationId=$(...DescribeEipAddresses on the CLB's public IP...)
-  #   ModifyEipAddressAttributes  AllocationId=<id>  Bandwidth=200
+  #   ModifyEipAddressAttributes  AllocationId=<id>  Bandwidth=10
   # The address does not change, and a forced reconcile afterwards did not revert it — verified.
 
   # Whether `helm uninstall` leaves the CLB behind (helm.sh/resource-policy: keep).
