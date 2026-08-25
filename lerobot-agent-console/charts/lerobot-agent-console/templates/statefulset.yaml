@@ -1,3 +1,6 @@
+{{- if not .Values.auth.existingSecret }}
+{{- fail "auth.existingSecret is empty. This console gives shell access to a GPU node, so it must not start without credentials — and the chart will not take them through values, because Helm keeps values verbatim in the release history where `helm get values` can read them back, on every past revision.\n\nCreate the Secret first (the VKE console has a 密钥 page — no shell needed):\n  kubectl create secret generic <secret-name> -n <ns> --from-literal=username=<user> --from-literal=password=<password>\n\nThen set auth.existingSecret to its name. It must be in the SAME namespace as the release. If your Secret uses different key names, set auth.usernameKey / auth.passwordKey instead of rebuilding it." }}
+{{- end }}
 {{/* The console is STATEFUL: each pod owns a HERMES_HOME disk (/opt/data) holding the Ark key,
      chat sessions, and the installed skills. A StatefulSet models that directly — every replica
      gets its own PVC from volumeClaimTemplates, so scaling gives N independent disks with no
@@ -25,7 +28,7 @@ spec:
       {{- end }}
       containers:
         - name: console
-          image: "{{ .Values.image.repository }}:{{ required "image.tag is required — the chart does not pin one, because the pipeline tags every build with its commit sha and the chart would then need republishing for each. Pass --set image.tag=<sha>, or set it in the values box. List available tags with: oras repo tags iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot-agent-console" .Values.image.tag }}"
+          image: "{{ .Values.image.repository }}:{{ required "image.tag is required — the chart does not pin one, because the pipeline tags every build with its commit sha and the chart would then need republishing for each. Pass --set image.tag=<sha>, or set it in the values box. List available tags with: oras repo tags ai-containers-cn-beijing.cr.volces.com/physicalai/lerobot-agent-console" .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           {{- with .Values.capabilities }}
           securityContext:
@@ -38,16 +41,18 @@ spec:
             {{- range .Values.env }}
             - { name: {{ .name }}, value: {{ .value | quote }} }
             {{- end }}
-            {{/* Single-user HTTP Basic login. Auth is ALWAYS on: if either var is missing the
-                 console falls back to a built-in pair and says so in the UI, so a broken Secret
-                 degrades loudly instead of serving the console unauthenticated. The Secret is
-                 NOT created here — charts should not carry credentials. */}}
+            {{/* Single-user HTTP Basic login. There is no fallback pair: with either var
+                 missing the server exits 2 (server.py _require_auth_credentials), and a Secret
+                 whose name or key is wrong never gets that far — the pod stays in
+                 CreateContainerConfigError. Both are better than a console on a public HTTPS
+                 endpoint handing out a root shell to whoever asks. The Secret is NOT created
+                 here; see auth.existingSecret in values.yaml for why. */}}
             - name: CONSOLE_USER
               valueFrom:
-                secretKeyRef: { name: {{ include "console.name" . }}-auth, key: user }
+                secretKeyRef: { name: {{ .Values.auth.existingSecret }}, key: {{ .Values.auth.usernameKey }} }
             - name: CONSOLE_PASSWORD
               valueFrom:
-                secretKeyRef: { name: {{ include "console.name" . }}-auth, key: password }
+                secretKeyRef: { name: {{ .Values.auth.existingSecret }}, key: {{ .Values.auth.passwordKey }} }
           resources: {{- toYaml .Values.resources | nindent 12 }}
           readinessProbe:
             httpGet: { path: /healthz, port: 8080, scheme: HTTP }

@@ -18,22 +18,27 @@ image:
 #   kubectl get svc <release>-clb -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
 nodeIp: ""
 
-# API credentials. Set them — the chart refuses to install otherwise, and that is deliberate:
-# this SFU sits on a public CLB, so it must never come up with a guessable or absent key.
+# LiveKit API credentials, supplied only through a Secret you create beforehand.
 #
-# Format is LiveKit's own `keys` map, one `api_key: api_secret` pair per line. Generate a secret
-# with something like `openssl rand -hex 32`; the same pair goes into every client's config.
+# Same reasoning as the console: Helm keeps values verbatim in the release history, so a key
+# passed through values is readable by anyone who can run `helm get values`, on every revision
+# that ever held it. This key signs access tokens for an SFU on a public CLB — whoever has it can
+# mint a token for any room.
 #
-#   keys: |
-#     devkey: <a long random string>
+# Create it first — the VKE console has a 密钥 (Secret) page, no shell required. The value is
+# LiveKit's own `keys` map, one `api_key: api_secret` pair per line:
 #
-# The chart renders this into a Secret it owns and injects it as LIVEKIT_KEYS, which overrides
-# the ConfigMap's `keys` block — a key committed to a config file is a public key.
-# (It used to expect a hand-made Secret, with `kubectl create secret` in this comment. That
-# cannot be done from the VKE console's Helm page, which has no shell, so the chart was simply
-# not installable there.)
+#   kubectl create secret generic livekit-auth -n <namespace> --from-literal=keys='devkey: <secret>'
+#     where <secret> is e.g. `openssl rand -hex 32`
+#
+# ⚠️ Use a DEDICATED key here, not one shared with anything else: it has to be handed to every
+# client that publishes or subscribes, so it travels further than a server-side password does.
+#
+# The same Secret must be readable by both ends — the server (this chart) and whatever publishes
+# to it — or they authenticate against different keys and every connection fails.
 auth:
-  keys: ""
+  existingSecret: ""        # REQUIRED — the chart refuses to render without it
+  keysKey: keys
 
 service:
   # REQUIRED, and specific to your cluster: the CLB is created from this subnet, which must be

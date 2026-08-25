@@ -1,6 +1,7 @@
-# Defaults are installable-anywhere, NOT our deployment: no node pin, APIG off, and the two
-# credentials empty so the install fails loudly rather than coming up unauthenticated.
-# Set auth.password before deploying; everything else works as-is on a GPU cluster.
+# Defaults are installable-anywhere, NOT our deployment: no node pin, APIG off, and no
+# credentials, so the install fails loudly rather than coming up unauthenticated.
+# Set image.tag and auth.existingSecret before deploying (the chart refuses to render without
+# either); everything else works as-is on a GPU cluster.
 
 # Resource names come from the RELEASE name. Pinning a literal here — which this chart used to
 # do — means every install produces the same names no matter what you call the release, so a
@@ -13,7 +14,7 @@
 nameOverride: ""
 
 image:
-  repository: iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot-agent-console
+  repository: ai-containers-cn-beijing.cr.volces.com/physicalai/lerobot-agent-console
   # REQUIRED, and deliberately empty: the chart does not track the image. The pipeline tags every
   # build with its commit sha (there is no `latest`), so a hardcoded tag here means republishing
   # the chart for every build — the chart version and the image version are not the same thing
@@ -21,7 +22,7 @@ image:
   #
   # Pass it at deploy time: `--set image.tag=<sha>`, or edit this line in the values box on the
   # VKE console's Helm page. Find the sha in the CP pipeline's build record, or list them:
-  #   oras repo tags iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot-agent-console
+  #   oras repo tags ai-containers-cn-beijing.cr.volces.com/physicalai/lerobot-agent-console
   # ⚠️ Verify the tag exists before deploying — a sha that was never built gives
   # ImagePullBackOff, and if you have just deleted the PVC there is nothing to roll back to.
   tag: ""
@@ -57,16 +58,27 @@ persistence:
 # "out of shared memory") and the container cannot remount it without CAP_SYS_ADMIN.
 dshmSize: 32Gi
 
-# Console login (HTTP basic auth). Set the password before deploying — it is the only thing
-# between a public endpoint and a root shell on a GPU box; the chart refuses to install without it.
+# Console login (HTTP basic auth), supplied only through a Secret you create beforehand.
 #
-# Plain values, not a pre-made Secret: this chart is installed from the VKE console's
-# "创建 Helm 应用" page, where values.yaml is the only input and there is no shell in which to run
-# `kubectl create secret` first. A chart that requires one cannot be installed that way at all.
-# The chart renders these into a Secret it owns, so they are not left sitting in the pod spec.
+# The chart deliberately cannot build one from values: Helm stores values verbatim in the release
+# history, so a password passed that way stays readable to anyone who can run `helm get values` —
+# and it stays there for every past revision, so rotating it does not remove the old one. This
+# console hands out a root shell on a GPU node, which makes that the wrong trade.
+#
+# Create it first — the VKE console has a 密钥 (Secret) page, no shell required:
+#   kubectl create secret generic <secret-name> -n <namespace> \
+#     --from-literal=username=<user> --from-literal=password=<password>
+#
+# The Secret must live in the SAME namespace as the release — Kubernetes does not let a pod
+# reference a Secret from another one.
+#
+# Key names match the command above and RLinf's chart; leave them alone unless you are adopting
+# a Secret that already exists with different ones, which the two keys below let you do without
+# rebuilding it around a live password.
 auth:
-  user: lerobot
-  password: ""
+  existingSecret: ""        # REQUIRED — the chart refuses to render without it
+  usernameKey: username
+  passwordKey: password
 
 env:
   # An ORDERED LIST, not a map: Helm's `range` sorts map keys, and reordering container env
@@ -85,26 +97,43 @@ env:
 # Public HTTPS entry point through Volcengine APIG. OFF by default so a first install succeeds
 # on any cluster; the console is reachable in-cluster either way. Turn it on once you know which
 # gateway it should use.
+#
+# ⚠️ Turning this on puts a root shell on a GPU node behind a public address. The address is not
+#    a secret — the platform issues it and lists it in the APIG console — so the credentials in
+#    auth.existingSecret are the only thing between it and the internet.
+#
+# Field names and meanings are identical to the RLinf chart, deliberately: one story across both
+# products. Change them together.
 apig:
   enabled: false
 
   # Two ways to get a gateway, matching the APIGInstance CRD's own two modes:
-  #   create: false -> ADOPT an existing gateway (CRD sets spec.id). Put its instance id, from
-  #                    the APIG console, in existingId.
+  #   create: false -> ADOPT an existing gateway. Put its instance id, from the APIG console, in
+  #                    existingId; the Ingress binds to it by id. ingressClassName MUST match the
+  #                    class that gateway declares or it will never claim the Ingress.
   #   create: true  -> PROVISION a new one (CRD sets spec.name + spec.common). subnetIds is then
   #                    REQUIRED and must be in this cluster's VPC. Takes a few minutes, and bills.
   #
-  # ⚠️ create=true is a TWO-STEP bootstrap, because the gateway's id does not exist until it has
-  #    been provisioned, and the Ingress needs that id to bind to it. After the first install:
-  #      kubectl get apiginstance <release>-apig -o jsonpath='{.status.id}'
-  #    put that value in existingId (leaving create=true) and upgrade. Until you do, the Ingress
-  #    gets no address and APIG lists no service or domain for the gateway — verified, and it
-  #    resolves within a minute of the id being set.
+  # Either way this is a SINGLE step. With create=true the provisioned gateway claims the Ingress
+  # from its own side — the APIGInstance watches this namespace and this ingress class — so its
+  # id never has to come back into values. An earlier version of this chart did make you read
+  # status.id and upgrade a second time; that is gone.
+  #
+  # ⚠️ With create=true, leave existingId EMPTY and keep it empty. Writing it sets spec.id, which
+  #    the CRD treats as immutable: the admission webhook then rejects every later upgrade with
+  #      spec.id: Forbidden: forbidden to update, old: , new: <id>
+  #    and the release stays failed until the value is removed again. The chart refuses to render
+  #    that combination rather than let you find out at apply time.
   # ⚠️ A gateway this chart provisioned is DELETED by `helm uninstall`, taking its auto-assigned
   #    *.volceapi.com domain with it — a new one comes back under a different name. Adopt an
-  #    existing gateway for anything whose URL people have bookmarked.
+  #    existing gateway for anything whose URL people have bookmarked, or set retainOnDelete.
   create: false
-  existingId: ""                  # create=false: the gateway's instance id
+  # create=true only: keep the provisioned gateway when the release is uninstalled, instead of
+  # deleting it along with its *.volceapi.com domain. Turn it on BEFORE you need it — Helm decides
+  # what to retain from the manifest recorded in the release, so annotating the live object after
+  # the fact has no effect and the gateway still goes.
+  retainOnDelete: false
+  existingId: ""                  # create=false: REQUIRED, the gateway's instance id
   instanceName: ""                # create=true: gateway name (default: <release>-apig)
   subnetIds: []                   # create=true: REQUIRED
 
@@ -118,13 +147,19 @@ apig:
   instanceSpecCode: ""            # e.g. 1c2g
   clbSpecCode: ""                 # e.g. small_1
   publicNetworkBillingType: ""    # e.g. traffic
+  publicNetworkBandwidth: ""      # Mbps, e.g. 200 — the gateway proxies UI traffic only
 
   ingressName: ""                 # default: <release>-apig
+
   # One gateway per ingress class: pointing two consoles at the same class routes them to one
   # gateway. Default is <release>-apig, which is unique as long as release names are.
+  # ⚠️ create=false: this must be the class the ADOPTED gateway declares, not the default. There
+  #    is no default that could be right, so the chart requires it.
   ingressClassName: ""
-  # A distinct host per environment is what earns each its own managed domain.
-  # ⚠️ Never put the auto-assigned *.volceapi.com name here — doing that once killed the
-  # 443 listener outright (503 -> 000).
+  # Internal placeholder host, never public DNS — it is only the key APIG routes on, and each
+  # distinct host is what earns its own managed *.volceapi.com domain. Must not collide with a
+  # host already registered on the same gateway.
+  # ⚠️ Never put the auto-assigned *.volceapi.com name here — doing that once killed the 443
+  #    listener outright (503 -> 000).
   host: ""                        # default: <release>.apig.local
   annotations: {}                 # binding annotations are added automatically from existingId

@@ -1,9 +1,9 @@
 ## Installing
 
 The real install path is the **VKE console → 创建 Helm 应用** page: pick the chart, edit
-`values.yaml` in the text box, name the release, deploy. There is no shell in that flow, which is
-why this chart creates everything it needs — nothing here says "run `kubectl create secret`
-first", because on that page you cannot.
+`values.yaml` in the text box, name the release, deploy. There is no shell in that flow, so the
+charts create everything they need — with one deliberate exception: credentials. Those come from
+a Secret you make first, on the console's own **密钥 (Secret)** page, which needs no shell either.
 
 `values.yaml` therefore ships **installable-anywhere defaults**, not our deployment:
 - `image.tag` is empty and required. The chart deliberately does not track the image: the
@@ -12,8 +12,13 @@ first", because on that page you cannot.
   different things. Pass `--set image.tag=<sha>` (or set it in the values box), and check the
   tag exists first — `oras repo tags <repo>` — because a sha that was never built gives
   ImagePullBackOff.
-- `auth.password` is empty and the install FAILS with a message until you set it. This console
-  hands out a root shell on a GPU node; it must not come up reachable without credentials.
+- `auth.existingSecret` names a Secret you create beforehand; the install FAILS until it is set.
+  The chart will not take credentials through values: Helm keeps values verbatim in the release
+  history, so `helm get values` reads them back — on every past revision, which means rotating a
+  password does not remove the old one. Create it on the VKE console's 密钥 page (no shell
+  needed) or with `kubectl create secret generic <name> --from-literal=username=… --from-literal=password=…`,
+  in the SAME namespace as the release. Key names default to `username`/`password`; point
+  `auth.usernameKey` / `auth.passwordKey` at whatever your Secret already uses.
 - `nodeSelector: {}` — the GPU request schedules the pod. A hostname from our cluster would
   leave it Pending forever on yours.
 - `apig.enabled: false` — the console works in-cluster without it. Turn it on when you know which
@@ -21,16 +26,19 @@ first", because on that page you cannot.
   + `subnetIds` provisions a new one. ⚠️ A provisioned gateway is deleted by `helm uninstall`,
   taking its `*.volceapi.com` domain with it.
 
-  **`create: true` is a two-step bootstrap.** The Ingress binds to a gateway through a
-  `loadbalancer-id` annotation, and that id does not exist until the gateway has been
-  provisioned — so the first render cannot carry it. Verified on a real install: without it the
-  Ingress never gets an address and APIG lists no service for the gateway; setting the id made
-  both appear within a minute. After the first install:
+  **Both modes install in one step.** They bind from opposite sides, which is why:
 
-  ```bash
-  kubectl get apiginstance <release>-apig -o jsonpath='{.status.id}'
-  ```
-  put that in `apig.existingId` (leave `create: true`) and upgrade.
+  | | binds by | renders an APIGInstance |
+  |---|---|---|
+  | `create: false` | `loadbalancer-id` annotation on the Ingress, from `existingId` | no — the adopted gateway has its own |
+  | `create: true` | the APIGInstance watching this namespace and ingress class | yes |
+
+  So with `create: true` the gateway's id never has to come back into values, and it must not:
+  writing `existingId` sets `spec.id`, which the CRD treats as immutable, and every later upgrade
+  is then rejected with `spec.id: Forbidden: forbidden to update`. The chart refuses that
+  combination at render time. An earlier version of this chart did require reading `status.id`
+  back and upgrading again; `apig.retainOnDelete` also arrived with that change, and the fields
+  now match the RLinf chart one for one.
 
   The gateway's public `*.volceapi.com` name is assigned by APIG and is **not exposed anywhere in
   Kubernetes** — not in the CRD status, not on the Ingress. Read it from the APIG console. For
@@ -67,11 +75,12 @@ For a throwaway install that protection is only a billed leftover and an EIP out
 ### Deploying with the CLI instead
 
 There are no per-environment values files in this repo on purpose — an environment's file wants
-to hold its password, and that is not a thing to commit. Generate one at deploy time:
+to hold its password, and that is not a thing to commit (nor, since the `existingSecret` change,
+a thing the charts will read). Generate one at deploy time:
 
 ```bash
 cat charts/lerobot-agent-console/values.yaml > /tmp/values-activate.yaml   # start from the defaults
-# then append the environment's overrides + credentials, e.g. auth.user/auth.password, apig.*
+# then append the environment's overrides, e.g. auth.existingSecret, image.tag, apig.*
 helm upgrade --install <release> charts/lerobot-agent-console \
   -f /tmp/values-activate.yaml --reset-values
 ```
@@ -186,21 +195,51 @@ helm template lerobot-agent-console charts/lerobot-agent-console | kubectl apply
 Both charts reference Secrets by name and never create them:
 
 ```bash
-kubectl create secret generic lerobot-console-auth --from-literal=user=<u> --from-literal=password=<p>
-kubectl create secret generic livekit-auth --from-literal=keys='<api_key>: <api_secret>'
+kubectl create secret generic <console-secret> --from-literal=username=<u> --from-literal=password=<p>
+kubectl create secret generic <livekit-secret> --from-literal=keys='<api_key>: <api_secret>'
 ```
 
-`livekit` has **no credential fallback on purpose** — that SFU is on a public CLB, so a key
-committed here would be readable by anyone who can read the repo. A missing Secret holds the pod
-in `CreateContainerConfigError`, which is the intended failure.
+Neither chart has a credential fallback, on purpose: one hands out a root shell on a GPU node,
+the other signs access tokens for an SFU on a public CLB. Point `auth.existingSecret` at the
+Secret's name; it must be in the same namespace as the release. Rendering fails without it, which
+is a better failure than starting.
+
+```bash
+helm upgrade --install <release> charts/lerobot-agent-console \
+  --set image.tag=<sha> --set auth.existingSecret=lerobot-console-auth
+```
+
+`auth.usernameKey` / `auth.passwordKey` exist for adopting a Secret that already uses other key
+names, without rebuilding it around a live password. Ours needed that once — `lerobot-console-auth`
+predates the chart and stored the name under `user` — but it now carries `username` as well, so
+the defaults apply and nothing overrides them. The old `user` key is still there because the
+running release references it; drop it once every release is on a chart ≥ 0.4.
 
 ## Publishing to the OCI registry
 
 ```bash
-helm registry login iaas-us-cn-beijing.cr.volces.com -u <account>@<account-id>
-helm package charts/lerobot-agent-console
-helm push lerobot-agent-console-<version>.tgz oci://iaas-us-cn-beijing.cr.volces.com/physicalai
+export HELM_REGISTRY_HOST=ai-containers-cn-beijing.cr.volces.com
+export HELM_REGISTRY_NAMESPACE=physicalai
+export HELM_REGISTRY_USERNAME=<account>@<account-id> HELM_REGISTRY_PASSWORD=<password>
+
+DRY_RUN=1 bash scripts/publish_charts.sh          # package + gate only, touches no registry
+bash scripts/publish_charts.sh                    # push every chart
+bash scripts/publish_charts.sh livekit            # or just one
 ```
+
+Adapted from RLinf's `docker/publish_charts.sh`, so the same script works on a CI runner with no
+helm, no root and no package manager: it unpacks a static helm into a temp dir, and logs in
+through a throwaway `--registry-config` so the robot account is not left behind for the next job.
+
+Before packaging, each chart is rendered with placeholder values. That gate is `helm template`,
+not `helm lint`: on helm v4.2.3 a template that calls `fail` — which is how both charts refuse a
+missing `auth.existingSecret` — lints as `level=INFO` and still reports "0 chart(s) failed",
+exit 0. Placeholder values live in a `case` block in the script; a chart added without an entry
+there stops the run rather than being published unrendered.
+
+The push refuses a version already in the registry (`ALLOW_OVERWRITE=1` to override). That is the
+same rule `scripts/check-chart-version.sh` enforces against git, asked of the registry instead, so
+it still holds in a shallow CI clone where no base ref resolves.
 
 The chart is named after the product, so it lands in the **same repo as the image**
 (`physicalai/lerobot-agent-console`). They coexist: image tags are 40-char commit SHAs, chart
@@ -215,3 +254,8 @@ even when you are logged in. A read probe returning **404 rather than 401** mean
 `k8s/apig-ingress*.yaml` and `k8s/apig-instance-test.yaml` stay raw. They create Volcengine
 `APIGInstance` CRDs that own **provisioned gateways with public domains**; a stray
 `helm uninstall` would delete the gateway and the domain with it. They change roughly never.
+
+That reason is now weaker than it was: `apig.retainOnDelete=true` renders
+`helm.sh/resource-policy: keep`, which survives `helm uninstall`. It has to be set BEFORE the
+uninstall, though — Helm reads the annotation from the manifest stored in the release, not from
+the live object — so a gateway that is already live and unannotated is still safer outside Helm.
