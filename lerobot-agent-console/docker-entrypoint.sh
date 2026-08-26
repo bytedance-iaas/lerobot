@@ -167,4 +167,14 @@ elif command -v hermes >/dev/null 2>&1 && ! hermes skills list 2>/dev/null | gre
   bash /opt/agent-console/scripts/install_skill.sh || echo "WARN: skill unavailable; chat still works without it"
 fi
 
+# Written by the image build: either TIRITH_BIN=<baked-in path>, or TIRITH_ENABLED=0 when the
+# build could not fetch it. Exported here rather than as a Dockerfile ENV because which of the
+# two applies is only known after the fetch has been attempted. Without it, hermes downloads
+# tirith on first use — onto the PVC, so it happens once per fresh volume, and it happens in the
+# middle of the first terminal command the agent runs.
+if [ -f /etc/console-tirith.env ]; then
+  set -a; . /etc/console-tirith.env; set +a
+  echo "==> tirith: ${TIRITH_BIN:-disabled (TIRITH_ENABLED=${TIRITH_ENABLED:-1})}"
+fi
+
 exec "$@"
