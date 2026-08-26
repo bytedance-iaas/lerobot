@@ -12,7 +12,6 @@
 # gzip too.
 #   docker buildx build \
 #     --build-arg BASE_IMAGE=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot:<lerobot-tag> \
-#     --build-arg CONSOLE_COMMIT=$(git rev-parse HEAD) \
 #     --output type=image,name=<registry>/lerobot-agent-console:<tag>,push=true,compression=gzip,oci-mediatypes=true \
 #     .
 # ⚠️ iaas-us, NOT ai-containers. The base images live in one registry and the images built from
@@ -269,16 +268,16 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh scripts/install_skill.sh
 # The console shell + agent operate from CONSOLE_WORKDIR (the lerobot checkout in the
 # base image is at /lerobot). Do NOT set LEROBOT_HOME — that is lerobot's own reserved
 # cache var and lerobot 0.6.x HARD-ERRORS if it's set; server.py reads CONSOLE_WORKDIR.
-# LEROBOT_IMAGE / CONSOLE_COMMIT are surfaced by the UI's "更新说明" button so you can see
-# exactly which versions are deployed (LEROBOT_IMAGE's tag = the lerobot commit; pass
-# --build-arg CONSOLE_COMMIT=$(git rev-parse HEAD) to fill in this console's commit).
+# LEROBOT_IMAGE records which base image this was built from — provenance for anyone inside the
+# container (`env | grep LEROBOT_IMAGE`), nothing reads it programmatically. CONSOLE_COMMIT is
+# gone with the version banner it fed: the pipeline never passed the build-arg, so it was always
+# "unknown" on screen. The deployed console's commit is its image tag, which the pipeline sets
+# from ${SCM_COMMIT_ID} and `kubectl get pod -o jsonpath='{.spec.containers[0].image}'` shows.
 ARG BASE_IMAGE
-ARG CONSOLE_COMMIT=""
 ENV PORT=8080 \
     CONSOLE_WORKDIR=/lerobot \
     HERMES_CHAT_SKILL=robot_sft \
-    LEROBOT_IMAGE=${BASE_IMAGE} \
-    CONSOLE_COMMIT=${CONSOLE_COMMIT}
+    LEROBOT_IMAGE=${BASE_IMAGE}
 
 # Auto-activate the lerobot uv venv in interactive login shells. The console terminal spawns
 # `bash -l`, whose /etc/profile hardcodes PATH and drops /lerobot/.venv/bin — so `python`

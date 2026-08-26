@@ -320,10 +320,6 @@ body {
 .q-purple { color: var(--purple); border-color: #ddd4ff; }
 .q-green { color: var(--ink-2); }
 .q:hover { filter: brightness(.97); }
-.md-ver { font-size: 12px; color: var(--muted); background: #f6f7f9; border: 1px solid var(--line);
-  border-radius: var(--radius); padding: 7px 12px; margin: -4px 0 18px; }
-.md-ver code { background: #fff; }
-
 /* tool-call lines + permission prompts (ACP streaming) */
 .tool-ava { background: #eef0f4 !important; color: #6b7180 !important; }
 .tool-bubble { background: #0b0f17; color: #9fb3d1; font-family: ui-monospace, Menlo, monospace;
