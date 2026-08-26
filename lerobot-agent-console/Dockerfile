@@ -174,35 +174,28 @@ RUN /opt/hermes/.venv/bin/python scripts/patch_acp_approval_timeout.py
 # a fresh PVC grew 220 KB -> 897 MB during startup. disabled_toolsets cannot prevent it —
 # availability is computed for every toolset and filtered afterwards.
 ENV HERMES_NO_DEP_INSTALL=1
-# Same class of failure, different code path. Before running ANY terminal command, hermes runs a
-# `tirith` safety check, and downloads the binary from GitHub releases when it is missing. The
-# download lands in $HERMES_HOME/bin — which is the PVC — so it survived pod restarts and nobody
-# ever saw it. Deleting the PVCs on 2026-08-26 gave a release a blank disk, and the first terminal
-# command froze for ~7 minutes with no explanation: the command was trivial, but the shell never
-# started. acp_stderr.log, twice in a row, the line immediately before each hang:
-#     tools.tirith_security: tirith not found — downloading latest release for x86_64-...
-# The downloader's 10s timeout does not save it — urlopen's timeout is between bytes, not total,
-# so a connection that trickles never trips it.
+# Same class of failure, different code path — and this one is switched off for good.
 #
-# So fetch it HERE, where the build host has network and a stall costs a build rather than an
-# operator's afternoon. hermes' own installer does it (SHA-256 verified) rather than this file
-# re-deriving release URLs that would drift. If the fetch fails, the image is still valid — but it
-# says so, and disables the check rather than leaving the download to happen at the worst moment.
-RUN set -eu; \
-    if HERMES_HOME=/tmp/tirith /opt/hermes/.venv/bin/python -c "\
-import sys;\
-from tools import tirith_security as t;\
-p, msg = t._install_tirith();\
-print('tirith:', p or msg);\
-sys.exit(0 if p else 1)" && [ -x /tmp/tirith/bin/tirith ]; then \
-        install -m 0755 /tmp/tirith/bin/tirith /usr/local/bin/tirith; \
-        echo "TIRITH_BIN=/usr/local/bin/tirith" > /etc/console-tirith.env; \
-        echo "==> tirith baked in: $(/usr/local/bin/tirith --version 2>&1 | head -1)"; \
-    else \
-        echo "TIRITH_ENABLED=0" > /etc/console-tirith.env; \
-        echo "==> WARNING: tirith fetch failed at build time; check DISABLED in this image"; \
-    fi; \
-    rm -rf /tmp/tirith
+# Before running ANY terminal command hermes runs a `tirith` safety check, downloading the
+# binary from GitHub releases when missing. The download target is $HERMES_HOME/bin, which is
+# the PVC, so it happened once per volume and nobody had seen it in a long time. A blank PVC on
+# 2026-08-26 brought it back: the first terminal command froze for ~7 minutes — trivial command,
+# shell never started, tool call never returned. The downloader's 10s timeout is between bytes,
+# not total, so a trickling connection never trips it, and from China it trickles.
+#
+# Fetching it at build time was tried and rejected on evidence. The build host is in China too
+# and could not pull the 39 MB asset either. More decisively: once the binary DID finish
+# downloading on the running pod, it immediately started blocking the agent's own work —
+#     [HIGH] Nested executable body could not be resolved
+#     [HIGH] nested command analysis was incomplete
+#     script execution via -e/-c flag: cd /lerobot && python -c "...
+# on a plain `python -c`, which is the shape of nearly every command robot_sft issues. The check
+# was not protecting this console from anything; it is a root shell by design, and hermes has
+# its own approval flow. It was turning routine work into approval prompts, when it was not
+# freezing it outright.
+#
+# server.py hands hermes dict(os.environ), so this reaches it.
+ENV TIRITH_ENABLED=0
 RUN /opt/hermes/.venv/bin/python scripts/patch_acp_no_dep_install.py
 # NOTE: the old `patch_acp_autosave.py` (a 10s `save_session` daemon) is DELETED, not applied.
 # It resurrected deleted sessions: `save_session -> _persist` first "ensures the session record
