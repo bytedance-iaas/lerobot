@@ -225,22 +225,12 @@
     tabs.set(id, { tabEl, paneEl: pane, kind: "doc" });
     // The welcome/release-notes doc also gets a live deployed-version banner (fetched
     // server-side, so it's correct regardless of any stale browser cache).
-    const wantVer = id === "welcome";
-    Promise.all([
-      fetch(url).then((r) => r.text()).catch(() => "# " + label + "\n\n(无法加载)"),
-      wantVer
-        ? fetch("/api/version", { cache: "no-store" }).then((r) => r.json()).catch(() => ({}))
-        : Promise.resolve(null),
-    ]).then(([md, ver]) => {
-      let banner = "";
-      if (ver) {
-        const short = (s) => (s || "unknown").slice(0, 12);
-        banner =
-          '<div class="md-ver">当前部署版本 · lerobot <code>' + short(ver.lerobot) +
-          '</code> · console <code>' + short(ver.console) + "</code></div>";
-      }
-      doc.innerHTML = banner + renderMD(md);
-    });
+    fetch(url)
+      .then((r) => r.text())
+      .catch(() => "# " + label + "\n\n(无法加载)")
+      .then((md) => {
+        doc.innerHTML = renderMD(md);
+      });
     activate(id);
     return id;
   }
