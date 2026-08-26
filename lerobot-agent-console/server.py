@@ -45,6 +45,7 @@ import shutil
 import signal
 import struct
 import termios
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -355,6 +356,41 @@ async def handle_volcano_key(request: web.Request) -> web.Response:
 # --------------------------------------------------------------------------- #
 # Terminal (PTY) websocket — the "ssh console"                                #
 # --------------------------------------------------------------------------- #
+async def _reap(pid: int, timeout: float = 5.0) -> None:
+    """Collect a PTY child, escalating to SIGKILL if it will not go.
+
+    The old code called waitpid(WNOHANG) on the line after os.kill(SIGHUP) — at that instant
+    the shell has not exited yet, so it collected nothing, and nothing ever looked at that pid
+    again. Every closed terminal session therefore left a zombie: 48 of them on the dev console
+    after 26 hours, one per session. Individually harmless, but each holds a PID slot for the
+    life of the pod, and a pod that runs for weeks is the point of this console.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            done, _ = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if done:
+            return
+        if time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(0.1)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    for _ in range(20):
+        try:
+            done, _ = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if done:
+            return
+        await asyncio.sleep(0.1)
+    log.warning("term child pid=%s survived SIGKILL — leaked", pid)
+
+
 def _set_winsize(fd: int, rows: int, cols: int) -> None:
     try:
         fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
@@ -412,10 +448,7 @@ async def handle_term(request: web.Request) -> web.WebSocketResponse:
             os.close(master_fd)
         except OSError:
             pass
-        try:
-            os.waitpid(pid, os.WNOHANG)
-        except ChildProcessError:
-            pass
+        await _reap(pid)
         if not ws.closed:
             await ws.close()
 
