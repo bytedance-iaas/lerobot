@@ -80,6 +80,26 @@ auth:
   usernameKey: username
   passwordKey: password
 
+# async_inference's policy_server: a gRPC port on the Service and, when APIG is on, a route to
+# it — so validating a checkpoint on a real arm works without a deployment change first.
+#
+# ⚠️ This route does NOT sit behind the console's login. The console refuses to start without
+# credentials (server.py); policy_server calls add_insecure_port() and checks nothing — no token,
+# no TLS, no peer identity. While the gateway is up, anyone who knows the domain can drive
+# inference on the GPU. Set enabled=false on deployments where that matters.
+#
+# Both ends are h2c-only (robot_client uses grpc.insecure_channel, policy_server
+# add_insecure_port), so clients must use APIG's http:// domain; the https:// one fails at the
+# TLS handshake.
+#
+# pathPrefix is the gRPC service's fully-qualified name, from src/lerobot/transport/services.proto:
+# `package transport` + `service AsyncInference`. gRPC puts /<package>.<Service>/<Method> in the
+# HTTP/2 path, so this prefix matches every method on it.
+inference:
+  enabled: true
+  port: 18980
+  pathPrefix: /transport.AsyncInference
+
 env:
   # An ORDERED LIST, not a map: Helm's `range` sorts map keys, and reordering container env
   # changes the pod-template hash — which would restart both consoles on the first upgrade for
