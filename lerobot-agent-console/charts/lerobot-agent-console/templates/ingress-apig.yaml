@@ -23,16 +23,16 @@ spec:
     - host: {{ include "console.apig.host" . | quote }}
       http:
         paths:
-          {{- if .Values.inference.enabled }}
+          {{- if (.Values.inference | default dict).enabled }}
           {{/* Listed BEFORE "/" deliberately: both are Prefix rules, and a gateway that
                evaluates them in order would otherwise swallow this one in the catch-all. */}}
-          - path: {{ .Values.inference.pathPrefix }}
+          - path: {{ (.Values.inference | default dict).pathPrefix | default "/transport.AsyncInference" }}
             pathType: Prefix
             backend:
               service:
                 name: {{ include "console.name" . }}
                 port:
-                  number: {{ .Values.inference.port }}
+                  number: {{ (.Values.inference | default dict).port | default 18980 }}
           {{- end }}
           - path: /
             pathType: Prefix
