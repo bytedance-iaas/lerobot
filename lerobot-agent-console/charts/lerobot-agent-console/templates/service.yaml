@@ -11,3 +11,6 @@ spec:
   selector: {{- include "console.selectorLabels" . | nindent 4 }}
   ports:
     - { name: http, port: 8080, targetPort: 8080, protocol: TCP }
+    {{- if .Values.inference.enabled }}
+    - { name: grpc, port: {{ .Values.inference.port }}, targetPort: {{ .Values.inference.port }}, protocol: TCP }
+    {{- end }}

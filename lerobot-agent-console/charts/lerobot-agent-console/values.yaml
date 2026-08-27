@@ -80,6 +80,27 @@ auth:
   usernameKey: username
   passwordKey: password
 
+# async_inference 的 policy_server: a gRPC port on the Service, and — when APIG is on — a route
+# to it. OFF by default, and that is a security decision rather than a conservative one.
+#
+# The console itself sits behind HTTP basic auth (server.py refuses to start without credentials).
+# policy_server does not: it calls add_insecure_port() and checks nothing — no token, no TLS, no
+# peer identity. A route to it on the gateway therefore does not sit behind the console's login;
+# it is an unauthenticated endpoint on a public domain that will happily run inference on a GPU
+# for whoever finds it. Turn it on for a validation session, turn it off after.
+#
+# Plaintext is not a choice either: robot_client uses grpc.insecure_channel and policy_server
+# add_insecure_port, so BOTH ends are h2c-only. Clients must use APIG's http:// domain — the
+# https:// one fails at the TLS handshake.
+#
+# pathPrefix is the gRPC service's fully-qualified name, from src/lerobot/transport/services.proto:
+# `package transport` + `service AsyncInference` -> /transport.AsyncInference. gRPC puts
+# /<package>.<Service>/<Method> in the HTTP/2 path, so this prefix matches every method on it.
+inference:
+  enabled: false
+  port: 18980
+  pathPrefix: /transport.AsyncInference
+
 env:
   # An ORDERED LIST, not a map: Helm's `range` sorts map keys, and reordering container env
   # changes the pod-template hash — which would restart both consoles on the first upgrade for
