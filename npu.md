@@ -82,24 +82,36 @@ first.
 HF_ENDPOINT=https://hf-mirror.com ASCEND_RT_VISIBLE_DEVICES=15 \
 lerobot-train \
   --policy.type=act --policy.device=npu --policy.push_to_hub=false \
-  --dataset.repo_id=lerobot/pusht --dataset.video_backend=pyav \
+  --dataset.repo_id=lerobot/pusht \
   --batch_size=2 --steps=5 --num_workers=0 \
   --save_checkpoint=false --wandb.enable=false \
   --output_dir=/tmp/act-smoke
 ```
 
-Four of these are load-bearing:
+Three of these are load-bearing:
 
 | Flag | Without it |
 |---|---|
 | `--policy.device=npu` | defaults to cuda; `torch.cuda.is_available()` is False, so it falls back to CPU |
-| `--dataset.video_backend=pyav` | defaults to torchcodec, which cannot load without ffmpeg's `libavutil.so.56`: `RuntimeError: Could not load libtorchcodec` |
 | `--policy.push_to_hub=false` | `ValueError: 'repo_id' argument missing` |
 | `HF_ENDPOINT` | huggingface.co is unreachable from CN hosts (HTTP 000); the mirror answers 200 |
 
-> The torchcodec message **"Falling back to 'pyav' as a default decoder"** is printed while
-> loading the library and does not change the decoder used at read time. The backend must be
-> selected explicitly, or decoding still goes through torchcodec and raises.
+### The video backend needs no flag (since 627c0ce77)
+
+`get_safe_default_video_backend` used to accept `find_spec("torchcodec")` as proof the decoder
+worked, so it selected torchcodec here and training died in the data loader minutes later. It now
+imports it and falls back on failure, naming the real error:
+
+```
+WARNING lerobot.utils.import_utils: 'torchcodec' cannot be loaded
+  (RuntimeError: Could not load libtorchcodec. Likely causes:), falling back to 'pyav'
+```
+
+Verified on this host: ACT trains to completion with no `--dataset.video_backend` flag.
+
+> Do not read torchcodec's **own** "Falling back to 'pyav' as a default decoder" line as proof
+> the fallback happened. It prints that while loading its libraries, the wording is nearly
+> identical to LeRobot's, and before the fix the run went on using torchcodec anyway.
 
 ### Installing ffmpeg does not fix torchcodec here — don't bother
 
