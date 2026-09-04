@@ -19,6 +19,20 @@ import logging
 import torch
 
 
+def _npu_available() -> bool:
+    """True when torch_npu is installed and an Ascend device is visible.
+
+    torch has no `npu` attribute until `torch_npu` is imported — it is an out-of-tree backend
+    that registers itself on import. Importing it here rather than at module top keeps this file
+    usable on machines without Ascend, where the import raises.
+    """
+    try:
+        import torch_npu  # noqa: F401
+    except ImportError:
+        return False
+    return torch.npu.is_available()
+
+
 def auto_select_torch_device() -> torch.device:
     """Tries to select automatically a torch device."""
     if torch.cuda.is_available():
@@ -30,6 +44,9 @@ def auto_select_torch_device() -> torch.device:
     elif torch.xpu.is_available():
         logging.info("Intel XPU backend detected, using xpu.")
         return torch.device("xpu")
+    elif _npu_available():
+        logging.info("Ascend NPU backend detected, using npu.")
+        return torch.device("npu")
     else:
         logging.warning("No accelerated backend detected. Using default cpu, this will be slow.")
         return torch.device("cpu")
@@ -94,13 +111,19 @@ def is_torch_device_available(try_device: str) -> bool:
         return torch.backends.mps.is_available()
     elif try_device == "xpu":
         return torch.xpu.is_available()
+    elif try_device.startswith("npu"):
+        return _npu_available()
     elif try_device == "cpu":
         return True
     else:
-        raise ValueError(f"Unknown device {try_device}. Supported devices are: cuda, mps, xpu or cpu.")
+        raise ValueError(
+            f"Unknown device {try_device}. Supported devices are: cuda, mps, xpu, npu or cpu."
+        )
 
 
 def is_amp_available(device: str):
+    if device.startswith("npu"):
+        return _npu_available()
     if device in ["cuda", "xpu", "cpu"]:
         return True
     elif device == "mps":
