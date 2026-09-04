@@ -101,6 +101,29 @@ Four of these are load-bearing:
 > loading the library and does not change the decoder used at read time. The backend must be
 > selected explicitly, or decoding still goes through torchcodec and raises.
 
+### Installing ffmpeg does not fix torchcodec here — don't bother
+
+The first error names ffmpeg (`libavutil.so.56: cannot open shared object file`), so installing
+it is the obvious move. It was tried: `apt-get install -y ffmpeg` on Ubuntu 22.04 gives ffmpeg
+4.4.2 and `libavutil.so.56`, which is what torchcodec's `core4` variant wants. The remaining
+errors then are:
+
+```
+libavutil.so.57 / .58 / .59 / .60: cannot open      # core5..core8 want ffmpeg 5/6/7/8
+libtorchcodec_core4.so: undefined symbol: torch_dtype_float4_e2m1fn_x2
+```
+
+The second one is the wall. That symbol comes from **torch**, not ffmpeg: torchcodec 0.11.1 was
+built against a different torch than the `2.10.0+cpu` this image ships. Fixing it means finding a
+torchcodec built for exactly this torch, and redoing that search on every image bump — while the
+torch itself cannot be changed without breaking torch_npu.
+
+**pyav does not have this problem, for the reason it looked redundant:** it bundles its own
+ffmpeg inside the wheel (`site-packages/av.libs/libavcodec-*.so.61`, ffmpeg 7.x, name-mangled)
+and links no torch symbols at all. It sits out the ABI negotiation entirely. torchcodec is
+faster, but it couples ffmpeg's ABI to torch's, which is the wrong trade when a vendor image
+pins torch.
+
 ---
 
 ## Why `--policy.device=npu` needed a code change
