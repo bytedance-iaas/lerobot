@@ -70,14 +70,29 @@ def is_package_available(
 
 
 def get_safe_default_video_backend():
+    """Pick a decoder that will actually work, not merely one that is installed.
+
+    `find_spec` only proves the package is on disk. torchcodec additionally dlopen()s native
+    libraries at import time, against both ffmpeg and torch, and either can fail on a machine
+    where torch is pinned by a vendor image: an Ascend host with torch 2.10.0+cpu raises
+    `undefined symbol: torch_dtype_float4_e2m1fn_x2` from libtorchcodec_core4.so while the
+    package imports fine by `find_spec`'s standard.
+
+    A presence check therefore selected torchcodec and training died later, inside the data
+    loader, with a decode error that named none of this. Import it here instead — the cost is
+    paid once at config time, and the answer is the one that matters.
+    """
     logger = logging.getLogger(__name__)
-    if importlib.util.find_spec("torchcodec"):
-        return "torchcodec"
-    else:
+    try:
+        importlib.import_module("torchcodec.decoders")
+    except Exception as e:  # ImportError, OSError from dlopen, and anything else it raises
         logger.warning(
-            "'torchcodec' is not available in your platform, falling back to 'pyav' as a default decoder"
+            "'torchcodec' cannot be loaded (%s: %s), falling back to 'pyav' as a default decoder",
+            type(e).__name__,
+            str(e).splitlines()[0][:200] if str(e) else "",
         )
         return "pyav"
+    return "torchcodec"
 
 
 _require_package_cache: dict[str, bool] = {}
