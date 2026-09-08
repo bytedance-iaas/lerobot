@@ -481,6 +481,18 @@ the one that reports the error is usually not the one that is wrong.
   …) and make_policy dies with "Feature mismatch". `eval_watcher.py` passes it automatically.
   Runs HF-offline by default — by eval time everything is cached, and reaching the Hub from this
   pod only times out (measured 8m35s vs 2m0s). `--online` opts back in.
+  **`--revision main`** is needed for datasets that carry no `v3.0` tag (the default revision is
+  `CODEBASE_VERSION`); without it you get a `RevisionNotFoundError` that huggingface_hub 1.27
+  then mangles into `TypeError: HfHubHTTPError.__init__() missing 'response'`.
+  Two things it now handles that it did not before: it overrides `device_processor` with the
+  requested `--device` (checkpoints ship a pinned device — `pi0_base` ships `"cuda"`, which
+  makes the step fail to instantiate anywhere without CUDA, exactly as `lerobot_train.py` avoids),
+  and it moves the batch to the device **after** the preprocessor rather than before (the
+  tokenizer step mints fresh CPU tensors that a pre-move misses, giving
+  "indices is on cpu, other tensors on <dev>:0"). It also falls back to
+  `predict_action_chunk` when `select_action` raises `NotImplementedError` — GR00T N1.7 with
+  native relative actions cannot be decoded one step at a time, and lerobot's own
+  `lerobot_eval.py` hits the same wall.
 - `scripts/eval_watcher.py` — periodic offline eval: scores each new checkpoint on the
   held-out episodes (separate GPU when available), saving metrics to
   `eval/eval_results.jsonl` and plots under `eval/artifacts/ckpt-N/<group>/`.
