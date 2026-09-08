@@ -46,6 +46,9 @@ def main() -> None:
                     help="a checkpoint's pretrained_model/ dir (or any pretrained policy dir)")
     ap.add_argument("--dataset-repo-id", required=True)
     ap.add_argument("--dataset-root", default=None)
+    ap.add_argument("--revision", default=None,
+                    help="dataset git revision (branch/tag/sha). Datasets without the v3.0 tag "
+                         "need --revision main, else RevisionNotFoundError.")
     ap.add_argument("--episodes", type=int, nargs="+", required=True,
                     help="held-out episode ids to replay")
     ap.add_argument("--device", default="cuda")
@@ -121,8 +124,10 @@ def main() -> None:
         item_iter = _tos_items()
         n_frames = "streaming"
     else:
-        ds_meta = LeRobotDatasetMetadata(args.dataset_repo_id, root=args.dataset_root)
-        dataset = LeRobotDataset(args.dataset_repo_id, root=args.dataset_root, episodes=eval_eps)
+        ds_meta = LeRobotDatasetMetadata(args.dataset_repo_id, root=args.dataset_root,
+                                         revision=args.revision)
+        dataset = LeRobotDataset(args.dataset_repo_id, root=args.dataset_root, episodes=eval_eps,
+                                 revision=args.revision)
         item_iter = (dataset[i] for i in range(len(dataset)))
         n_frames = dataset.num_frames
 
@@ -130,12 +135,14 @@ def main() -> None:
     # and the preprocessor's rename step remaps each incoming batch.
     policy = make_policy(cfg, ds_meta=ds_meta, rename_map=rename_map)
     policy.eval()
-    _pp_kwargs = {}
+    # The checkpoint's policy_preprocessor.json pins a device (pi0_base ships "cuda"), and
+    # instantiating device_processor with it explodes on a machine that has no CUDA. lerobot_train.py
+    # overrides it the same way (see its preprocessor_overrides) -- offline_eval did not.
+    _pp_overrides = {"device_processor": {"device": device}}
     if rename_map:
-        _pp_kwargs["preprocessor_overrides"] = {
-            "rename_observations_processor": {"rename_map": rename_map}}
+        _pp_overrides["rename_observations_processor"] = {"rename_map": rename_map}
     preprocessor, postprocessor = make_pre_post_processors(
-        cfg, pretrained_path=args.model_path, **_pp_kwargs)
+        cfg, pretrained_path=args.model_path, preprocessor_overrides=_pp_overrides)
 
     print(f"[offline_eval] model={args.model_path} device={device} "
           f"episodes={eval_eps} frames={n_frames}")
@@ -161,11 +168,27 @@ def main() -> None:
                 if k == "action" or not (k.startswith("observation.") or k == "task"):
                     continue
                 if isinstance(v, torch.Tensor):
-                    batch[k] = v.unsqueeze(0).to(device)
+                    batch[k] = v.unsqueeze(0)
                 else:
                     batch[k] = [v]           # e.g. the task string
+            # Move AFTER preprocessing, not before: the tokenizer step creates fresh CPU tensors
+            # (input_ids / attention_mask) that a pre-move would miss, and the model then sees a
+            # mix of cpu and npu tensors ("indices is on cpu, other tensors on npu:0").
             batch = preprocessor(batch)
-            action = postprocessor(policy.select_action(batch))
+            batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+                     for k, v in batch.items()}
+            # Chunk fallback: GR00T N1.7 with native relative actions cannot be decoded one
+            # step at a time -- both GrootPolicy.select_action (modeling_groot.py:512) and the
+            # GrootN17ActionDecodeStep postprocessor (processor_groot.py:2342) raise
+            # NotImplementedError, because decoding a relative action needs the whole chunk while
+            # the matching PackInputs state is still cached. Predict the full chunk and take its
+            # first step, which is what select_action would have returned anyway.
+            try:
+                action = postprocessor(policy.select_action(batch))
+            except NotImplementedError:
+                chunk = policy.predict_action_chunk(batch)   # (B, horizon, action_dim)
+                out = postprocessor(chunk)
+                action = out[:, 0] if out.ndim == 3 else out
             pred = action.squeeze(0).detach().float().cpu()
             gt = gt.detach().float().cpu()
             n = min(pred.numel(), gt.numel())  # guard vs shape drift between policy/dataset
