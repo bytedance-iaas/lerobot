@@ -31,6 +31,7 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.device_utils import auto_select_torch_device, is_amp_available, is_torch_device_available
 from lerobot.utils.hub import HubMixin
 
+from . import parser
 from .types import FeatureType, PolicyFeature
 
 T = TypeVar("T", bound="PreTrainedConfig")
@@ -225,4 +226,4 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
 
         cli_overrides = policy_kwargs.pop("cli_overrides", [])
         with draccus.config_type("json"):
-            return draccus.parse(orig_config.__class__, config_file, args=cli_overrides)
+            return parser.parse(orig_config.__class__, config_file, args=cli_overrides)

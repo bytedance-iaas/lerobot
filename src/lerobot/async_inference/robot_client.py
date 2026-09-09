@@ -43,12 +43,12 @@ from pprint import pformat
 from queue import Queue
 from typing import Any
 
-import draccus
 import grpc
 import torch
 
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
+from lerobot.configs.parser import draccus_wrap
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
@@ -481,7 +481,7 @@ class RobotClient:
         return _captured_observation, _performed_action
 
 
-@draccus.wrap()
+@draccus_wrap()
 def async_client(cfg: RobotClientConfig):
     logging.info(pformat(asdict(cfg)))
 
