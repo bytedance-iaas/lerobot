@@ -43,8 +43,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 
-import draccus
-
+from lerobot.configs.parser import draccus_wrap
 from lerobot.utils.import_utils import _can_available
 
 MOTOR_NAMES = {
@@ -335,7 +334,7 @@ def run_speed(cfg: CANSetupConfig):
         speed_test(cfg, interface)
 
 
-@draccus.wrap()
+@draccus_wrap()
 def setup_can(cfg: CANSetupConfig):
     if not _can_available:
         print("Error: python-can not installed. Install with: pip install python-can")

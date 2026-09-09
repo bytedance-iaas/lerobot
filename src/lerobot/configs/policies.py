@@ -32,6 +32,7 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.device_utils import auto_select_torch_device, is_amp_available, is_torch_device_available
 from lerobot.utils.hub import HubMixin
 
+from . import parser
 from .types import FeatureType, PolicyFeature
 
 T = TypeVar("T", bound="PreTrainedConfig")
@@ -237,7 +238,7 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
 
         cli_overrides = policy_kwargs.pop("cli_overrides", [])
         with draccus.config_type("json"):
-            config = draccus.parse(config_cls, config_file, args=cli_overrides)
+            config = parser.parse(config_cls, config_file, args=cli_overrides)
 
         # The serialized config.json does not carry the source path, so parsing
         # yields pretrained_path=None. Backfill it: downstream code (e.g.

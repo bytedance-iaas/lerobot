@@ -26,8 +26,7 @@ lerobot-setup-motors \
 
 from dataclasses import dataclass
 
-import draccus
-
+from lerobot.configs.parser import draccus_wrap
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
@@ -75,7 +74,7 @@ class SetupConfig:
         raise ValueError("Choose either a teleop or a robot.")
 
 
-@draccus.wrap()
+@draccus_wrap()
 def setup_motors(cfg: SetupConfig) -> None:
     device: Robot | Teleoperator
     if isinstance(cfg.device, RobotConfig):
