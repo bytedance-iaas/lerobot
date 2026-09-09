@@ -38,8 +38,15 @@ spec:
           ports:
             - { name: http, containerPort: 8080 }
           env:
-            {{- range .Values.env }}
-            - { name: {{ .name }}, value: {{ .value | quote }} }
+            {{- /* Passed through VERBATIM, so every field of a Kubernetes EnvVar works — not just
+                 `value`. The old template rendered a fixed `{name, value}` pair, which turned a
+                 `valueFrom` entry into `value: ""`: the pod came up, the variable was empty, and
+                 nothing anywhere said so. An empty string is not the same as unset, so code
+                 reading it never took its own fallback either. `with` guards the empty list:
+                 `toYaml` on `[]` emits a literal `[]`, which would collide with the two hardcoded
+                 entries below. */}}
+            {{- with .Values.env }}
+            {{- toYaml . | nindent 12 }}
             {{- end }}
             {{/* Single-user HTTP Basic login. There is no fallback pair: with either var
                  missing the server exits 2 (server.py _require_auth_credentials), and a Secret
