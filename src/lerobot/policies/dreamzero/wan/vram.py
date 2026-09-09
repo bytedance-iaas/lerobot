@@ -16,6 +16,7 @@
 
 # Ported from NVIDIA DreamZero: groot/vla/model/dreamzero/modules/vram_management.py
 
+from lerobot.utils.device_utils import accelerator_module
 import torch, copy
 from contextlib import contextmanager
 
@@ -82,8 +83,13 @@ class AutoTorchModule(torch.nn.Module):
         super().__init__()
         
     def check_free_vram(self):
-        gpu_mem_state = torch.cuda.mem_get_info(self.computation_device)
-        used_memory = (gpu_mem_state[1] - gpu_mem_state[0]) / (1024 ** 3)
+        # torch.npu mirrors mem_get_info; on a backend that does not expose it there is no
+        # budget to check, so report "under limit" rather than refusing to run.
+        accel = accelerator_module(self.computation_device)
+        if accel is None or not hasattr(accel, "mem_get_info"):
+            return True
+        mem_state = accel.mem_get_info(self.computation_device)
+        used_memory = (mem_state[1] - mem_state[0]) / (1024 ** 3)
         return used_memory < self.vram_limit
 
     def offload(self):
