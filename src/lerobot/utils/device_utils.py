@@ -148,3 +148,18 @@ def vision_preprocess_device(device: str | torch.device) -> torch.device:
     """
     dev = device if isinstance(device, torch.device) else torch.device(device)
     return torch.device("cpu") if dev.type == "npu" else dev
+
+
+def accelerator_module(device: str | torch.device):
+    """The ``torch.<backend>`` module for ``device`` (``torch.cuda``, ``torch.npu``, ...).
+
+    Returns None on CPU, and for any backend torch does not expose a module for. Code that
+    reaches for ``torch.cuda.empty_cache`` / ``Event`` / ``mem_get_info`` can go through this
+    instead of hardcoding CUDA -- the NPU equivalents live under ``torch.npu`` with the same
+    names, but only exist once torch_npu has been imported, so this looks the module up by
+    name rather than importing anything.
+    """
+    dev = device if isinstance(device, torch.device) else torch.device(device)
+    if dev.type == "cpu":
+        return None
+    return getattr(torch, dev.type, None)

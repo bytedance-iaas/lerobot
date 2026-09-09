@@ -234,7 +234,9 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         alphas = np.linspace(1, 1 / num_train_timesteps,
                              num_train_timesteps)[::-1].copy()
         sigmas = 1.0 - alphas
-        sigmas = torch.from_numpy(sigmas).to(dtype=torch.float32, device='cuda')
+        # No device here: the sibling scheduler above builds its sigmas on CPU too, and
+        # pinning 'cuda' makes the scheduler unconstructible on other backends.
+        sigmas = torch.from_numpy(sigmas).to(dtype=torch.float32)
 
         if not use_dynamic_shifting:
             # when use_dynamic_shifting is True, we apply the timestep shifting on the fly based on the image resolution

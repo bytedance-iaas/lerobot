@@ -29,6 +29,7 @@ import os
 
 from einops import rearrange
 from peft import LoraConfig, get_peft_model
+from lerobot.utils.device_utils import accelerator_module
 import torch
 from torch import nn
 import torch.distributed as dist
@@ -475,7 +476,7 @@ class WANPolicyHead(ActionHead):
                 onload_dtype=dtype,
                 onload_device="cpu",
                 computation_dtype=self.dtype,
-                computation_device='cuda',
+                computation_device=self._device,
             ),
         )
 
@@ -512,8 +513,10 @@ class WANPolicyHead(ActionHead):
                 else:
                     print("togpu")
                     model.to(self._device)
-        # fresh the cuda cache
-        torch.cuda.empty_cache()
+        # fresh the accelerator cache
+        _accel = accelerator_module(self._device)
+        if _accel is not None and hasattr(_accel, "empty_cache"):
+            _accel.empty_cache()
 
     def _create_kv_caches(
         self,
@@ -1007,17 +1010,35 @@ class WANPolicyHead(ActionHead):
     def lazy_joint_video_action(self, backbone_output: BatchFeature, action_input: BatchFeature, latent_video: torch.Tensor | None = None) -> BatchFeature:
         start_time = time.perf_counter()
 
-        # Tracking time taken on GPU for various operations.
-        start_text_encoder_event = torch.cuda.Event(enable_timing=True)
-        end_text_encoder_event = torch.cuda.Event(enable_timing=True)
-        start_image_encoder_event = torch.cuda.Event(enable_timing=True)
-        end_image_encoder_event = torch.cuda.Event(enable_timing=True)
-        start_vae_event = torch.cuda.Event(enable_timing=True)
-        end_vae_event = torch.cuda.Event(enable_timing=True)
-        start_kv_event = torch.cuda.Event(enable_timing=True)
-        end_kv_event = torch.cuda.Event(enable_timing=True)
-        start_diffusion_events = [torch.cuda.Event(enable_timing=True) for _ in range(self.num_inference_steps)]
-        end_diffusion_events = [torch.cuda.Event(enable_timing=True) for _ in range(self.num_inference_steps)]
+        # Tracking time taken on the accelerator for various operations. torch.npu exposes the
+        # same Event API as torch.cuda; on CPU there is nothing to time, so fall back to a stub
+        # so the instrumentation never dictates which backends can run the model.
+        _accel = accelerator_module(self._device)
+        _EventCls = getattr(_accel, "Event", None) if _accel is not None else None
+
+        class _NoopEvent:
+            def record(self, *a, **k):
+                pass
+
+            def synchronize(self, *a, **k):
+                pass
+
+            def elapsed_time(self, *a, **k):
+                return 0.0
+
+        def _event():
+            return _EventCls(enable_timing=True) if _EventCls is not None else _NoopEvent()
+
+        start_text_encoder_event = _event()
+        end_text_encoder_event = _event()
+        start_image_encoder_event = _event()
+        end_image_encoder_event = _event()
+        start_vae_event = _event()
+        end_vae_event = _event()
+        start_kv_event = _event()
+        end_kv_event = _event()
+        start_diffusion_events = [_event() for _ in range(self.num_inference_steps)]
+        end_diffusion_events = [_event() for _ in range(self.num_inference_steps)]
 
         self.set_frozen_modules_to_eval_mode()
         data = action_input 
@@ -1135,8 +1156,8 @@ class WANPolicyHead(ActionHead):
 
         end_vae_event.record()
 
-        noise_obs = self.generate_noise((image.shape[0], image.shape[1], self.num_frame_per_block, image.shape[3], image.shape[4]), seed=self.seed, device='cuda', dtype=torch.bfloat16)
-        noise_action = self.generate_noise((image.shape[0], self.action_horizon, self.model.action_dim), seed=self.seed, device='cuda', dtype=torch.bfloat16)
+        noise_obs = self.generate_noise((image.shape[0], image.shape[1], self.num_frame_per_block, image.shape[3], image.shape[4]), seed=self.seed, device=self._device, dtype=torch.bfloat16)
+        noise_action = self.generate_noise((image.shape[0], self.action_horizon, self.model.action_dim), seed=self.seed, device=self._device, dtype=torch.bfloat16)
         batch_size, num_channels, num_frames, height, width = noise_obs.shape
         ######### Generate video #########
         # DiT patch_embedding uses stride (1,2,2), so tokens per frame = (H//2)*(W//2)
@@ -1255,8 +1276,8 @@ class WANPolicyHead(ActionHead):
             if self.ip_rank == 0:
                 print(f"Decoupled inference: video sigmas {sigma_max:.3f} -> {sample_scheduler.sigmas[-1].item():.3f}")
 
-        start_diffusion_events = [torch.cuda.Event(enable_timing=True) for _ in sample_scheduler.timesteps]
-        end_diffusion_events = [torch.cuda.Event(enable_timing=True) for _ in sample_scheduler.timesteps]
+        start_diffusion_events = [_event() for _ in sample_scheduler.timesteps]
+        end_diffusion_events = [_event() for _ in sample_scheduler.timesteps]
         prev_predictions = [] 
         self.skip_countdown = 0
         dit_compute_steps = 0
@@ -1346,9 +1367,12 @@ class WANPolicyHead(ActionHead):
             output = torch.cat([image, output], dim=1)
         self.current_start_frame += self.num_frame_per_block
 
-        # Do torch.cuda.synchronize() to ensure all operations are completed before timing.
-        # This isn't expected to affect inference performance since it's at the end of an inference step.
-        torch.cuda.synchronize()
+        # Ensure all operations are completed before timing. torch.npu mirrors synchronize();
+        # on CPU there is nothing asynchronous to wait for. This isn't expected to affect
+        # inference performance since it's at the end of an inference step.
+        _sync_accel = accelerator_module(self._device)
+        if _sync_accel is not None and hasattr(_sync_accel, "synchronize"):
+            _sync_accel.synchronize()
 
         total_time = time.perf_counter() - start_time
         text_encoder_time = start_text_encoder_event.elapsed_time(end_text_encoder_event) / 1000
