@@ -43,10 +43,10 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import draccus
 import numpy as np
 import torch
 
+from lerobot.configs.parser import draccus_wrap
 from lerobot.policies.dreamzero import gear_checkpoint
 from lerobot.policies.dreamzero.configuration_dreamzero import DreamZeroConfig
 
@@ -66,7 +66,7 @@ class ComputeStatisticsConfig:
     action_column: str = "action"
 
     # Concat layout, in order, as ``name:dim`` pairs. Must match the order the columns are
-    # concatenated in — a wrong order silently mis-slices every vector.
+    # concatenated in — a wrong order silently mis-slices every vector.  # spellchecker:disable-line
     state_layout: str = "joint_position:7,gripper_position:1"
     action_layout: str = "joint_position:7,gripper_position:1"
 
@@ -151,7 +151,7 @@ def _quantiles(values: np.ndarray, layout: list[tuple[str, int]], lo: float, hi:
     return out
 
 
-@draccus.wrap()
+@draccus_wrap()
 def main(cfg: ComputeStatisticsConfig):
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s", force=True)
     from lerobot.datasets.lerobot_dataset import LeRobotDataset

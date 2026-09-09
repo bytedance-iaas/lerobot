@@ -31,10 +31,9 @@ import logging
 from dataclasses import asdict, dataclass
 from pprint import pformat
 
-import draccus
-
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
+from lerobot.configs.parser import draccus_wrap
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
@@ -83,7 +82,7 @@ class CalibrateConfig:
         self.device = self.robot if self.robot else self.teleop
 
 
-@draccus.wrap()
+@draccus_wrap()
 def calibrate(cfg: CalibrateConfig):
     init_logging()
     logging.info(pformat(asdict(cfg)))

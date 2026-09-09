@@ -38,9 +38,9 @@ lerobot-find-joint-limits \
 import time
 from dataclasses import dataclass
 
-import draccus
 import numpy as np
 
+from lerobot.configs.parser import draccus_wrap
 from lerobot.model import RobotKinematics
 from lerobot.robots import (  # noqa: F401
     RobotConfig,
@@ -91,7 +91,7 @@ class FindJointLimitsConfig:
     control_loop_fps: int = 30
 
 
-@draccus.wrap()
+@draccus_wrap()
 def find_joint_and_ee_bounds(cfg: FindJointLimitsConfig):
     teleop = make_teleoperator_from_config(cfg.teleop)
     robot = make_robot_from_config(cfg.robot)

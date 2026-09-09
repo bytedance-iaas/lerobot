@@ -32,10 +32,10 @@ from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 
-import draccus
 from torchvision.transforms import ToPILImage
 
 from lerobot.configs import DatasetConfig
+from lerobot.configs.parser import draccus_wrap
 from lerobot.datasets import LeRobotDataset
 from lerobot.transforms import (
     ImageTransforms,
@@ -104,7 +104,7 @@ def save_each_transform(cfg: ImageTransformsConfig, original_frame, output_dir, 
         print(f"    {output_dir_single}")
 
 
-@draccus.wrap()
+@draccus_wrap()
 def visualize_image_transforms(cfg: DatasetConfig, output_dir: Path = OUTPUT_DIR, n_examples: int = 5):
     dataset = LeRobotDataset(
         repo_id=cfg.repo_id,

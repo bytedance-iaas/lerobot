@@ -349,4 +349,4 @@ class TrainPipelineConfig(HubMixin):
                     config_file = f.name
 
         with draccus.config_type("json"):
-            return draccus.parse(cls, config_file, args=cli_args)
+            return parser.parse(cls, config_file, args=cli_args)

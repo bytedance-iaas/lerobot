@@ -32,6 +32,7 @@ from lerobot.optim.schedulers import LRSchedulerConfig
 from lerobot.utils.device_utils import auto_select_torch_device, is_torch_device_available
 from lerobot.utils.hub import HubMixin
 
+from . import parser
 from .types import PolicyFeature
 
 T = TypeVar("T", bound="RewardModelConfig")
@@ -163,4 +164,4 @@ class RewardModelConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
 
         cli_overrides = reward_kwargs.pop("cli_overrides", [])
         with draccus.config_type("json"):
-            return draccus.parse(orig_config.__class__, config_file, args=cli_overrides)
+            return parser.parse(orig_config.__class__, config_file, args=cli_overrides)
