@@ -320,13 +320,72 @@ class FlexAttnFunc(nn.Module):
         super().__init__()
         self.is_cross = is_cross
 
+    @staticmethod
+    def _is_npu(device) -> bool:
+        """True on Ascend NPU, which needs the SDPA backend rather than flex-attention.
+
+        flex-attention refuses npu tensors outright ("FlexAttention is only supported on
+        CUDA, CPU or HPU devices"), and its whole point is codegen -- torch.compile lowering
+        mask_mod into a fused kernel -- which on NPU produces a kernel whose memory-layout
+        assumptions do not hold ("expected size 3==3, stride 3==1 at dim=2"). So NPU takes
+        plain SDPA instead; materialising the mask is a consequence of that choice, not the
+        choice itself. CUDA keeps the flex path untouched.
+        """
+        # Do not build a torch.device here: "npu" is only a registered device type once
+        # torch_npu has been imported, so torch.device("npu") raises on a plain CUDA/CPU box.
+        dev_type = device.type if isinstance(device, torch.device) else str(device).split(":")[0]
+        return dev_type == "npu"
+
     @classmethod
-    def _ensure_compiled(cls):
+    def _ensure_compiled(cls, device=None):
+        # The dense path must not import or compile flex-attention at all.
+        if device is not None and cls._is_npu(device):
+            return
         if cls.flex_attn is None:
             from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
             cls.flex_attn = torch.compile(flex_attention, dynamic=True)
             cls.compiled_create_block_mask = torch.compile(create_block_mask)
+
+    @staticmethod
+    @torch.no_grad()
+    def _dense_self_mask(seq_ids, frame_ids, noise_ids, window_size):
+        """Vectorised twin of ``_get_mask_mod``; returns [S, S] with True = attend.
+
+        Verified elementwise-identical to the flex ``mask_mod`` across padded, packed,
+        window=0 and single-frame cases.
+        """
+        s_q, s_k = seq_ids[:, None], seq_ids[None, :]
+        f_q, f_k = frame_ids[:, None], frame_ids[None, :]
+        n_q, n_k = noise_ids[:, None], noise_ids[None, :]
+        seq_ok = (s_q == s_k) & (s_q >= 0) & (s_k >= 0)
+        c2c = (n_q == 1) & (n_k == 1) & (f_k <= f_q)
+        n2c = (n_q == 0) & (n_k == 1) & (f_k < f_q)
+        n2n = (n_q == 0) & (n_k == 0) & (f_k == f_q)
+        window = (f_q - f_k).abs() <= window_size
+        return (c2c | n2c | n2n) & seq_ok & window
+
+    @staticmethod
+    @torch.no_grad()
+    def _dense_cross_mask(seq_ids, text_seq_ids):
+        """Vectorised twin of ``_get_cross_mask_mod``; returns [S, S_text]."""
+        s_q, t_k = seq_ids[:, None], text_seq_ids[None, :]
+        return (s_q == t_k) & (s_q >= 0) & (t_k >= 0)
+
+    @staticmethod
+    def _revive_dead_rows(keep):
+        """Let fully-masked query rows attend to everything.
+
+        ``init_mask`` pads seq/frame/noise ids with -1, so padding queries match nothing and
+        their whole row is masked. Softmax over an all-masked row is NaN (and Ascend's fused
+        attention rejects such rows outright). These rows are padding whose output is dropped
+        downstream, so any finite value will do.
+        """
+        dead = ~keep.any(dim=-1)
+        if dead.any():
+            keep = keep.clone()
+            keep[dead] = True
+        return keep
 
     def forward(self, query, key, value, dtype=torch.bfloat16):
         self._ensure_compiled()
@@ -349,6 +408,15 @@ class FlexAttnFunc(nn.Module):
 
         block_mask = FlexAttnFunc.cross_attention_mask if self.is_cross else FlexAttnFunc.attention_mask
 
+        # Dispatch on the device, not on whether a mask exists: inference never calls
+        # init_mask, so the mask is None there and a mask-shaped test would silently send
+        # npu tensors into flex-attention. A dense [Sq, Skv] bool broadcasts over batch and
+        # heads, so the one matrix init_mask built (if any) is all SDPA needs.
+        if FlexAttnFunc._is_npu(q_varlen.device):
+            attn_mask = block_mask if isinstance(block_mask, torch.Tensor) else None
+            x_out = F.scaled_dot_product_attention(q_varlen, k_varlen, v_varlen, attn_mask=attn_mask)
+            return rearrange(x_out, "b n s d -> b s n d")
+
         x_out = FlexAttnFunc.flex_attn(
             q_varlen,
             k_varlen,
@@ -370,8 +438,9 @@ class FlexAttnFunc(nn.Module):
     @staticmethod
     @torch.no_grad()
     def init_mask(latent_shape, action_shape, padded_length, chunk_size, window_size, patch_size, device):
-        FlexAttnFunc._ensure_compiled()
-        torch._inductor.config.realize_opcount_threshold = 100
+        FlexAttnFunc._ensure_compiled(device)
+        if not FlexAttnFunc._is_npu(device):
+            torch._inductor.config.realize_opcount_threshold = 100
         b, _, l_f, l_h, l_w = latent_shape
         _, _, a_f, a_h, a_w = action_shape
 
@@ -406,18 +475,27 @@ class FlexAttnFunc(nn.Module):
         frame_ids = F.pad(frame_ids, (0, padded_length), value=-1)
         noise_ids = F.pad(noise_ids, (0, padded_length), value=-1)
 
-        mask_mod = FlexAttnFunc._get_mask_mod(
-            seq_ids.long().to(device), frame_ids.long().to(device), noise_ids.long().to(device), window_size
-        )
+        seq_ids = seq_ids.long().to(device)
+        frame_ids = frame_ids.long().to(device)
+        noise_ids = noise_ids.long().to(device)
+        text_seq_ids = torch.arange(b)[:, None].expand(-1, 512).flatten().long().to(device)
+
+        if FlexAttnFunc._is_npu(device):
+            FlexAttnFunc.attention_mask = FlexAttnFunc._revive_dead_rows(
+                FlexAttnFunc._dense_self_mask(seq_ids, frame_ids, noise_ids, window_size)
+            )
+            FlexAttnFunc.cross_attention_mask = FlexAttnFunc._revive_dead_rows(
+                FlexAttnFunc._dense_cross_mask(seq_ids, text_seq_ids)
+            )
+            return
+
+        mask_mod = FlexAttnFunc._get_mask_mod(seq_ids, frame_ids, noise_ids, window_size)
         block_mask = FlexAttnFunc.compiled_create_block_mask(
             mask_mod, 1, 1, len(seq_ids), len(seq_ids), device=device, _compile=True
         )
         FlexAttnFunc.attention_mask = block_mask
 
-        text_seq_ids = torch.arange(b)[:, None].expand(-1, 512).flatten()
-        mask_mod_cross = FlexAttnFunc._get_cross_mask_mod(
-            seq_ids.long().to(device), text_seq_ids.long().to(device)
-        )
+        mask_mod_cross = FlexAttnFunc._get_cross_mask_mod(seq_ids, text_seq_ids)
         block_mask_cross = FlexAttnFunc.compiled_create_block_mask(
             mask_mod_cross, 1, 1, len(seq_ids), len(text_seq_ids), device=device, _compile=True
         )
