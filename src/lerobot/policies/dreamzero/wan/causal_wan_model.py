@@ -36,6 +36,7 @@ from torch.nn.attention.flex_attention import create_block_mask, create_mask
 from torch.nn.attention.flex_attention import BlockMask
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
+from lerobot.utils.device_utils import rope_dtypes
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
@@ -181,9 +182,17 @@ def causal_rope_action_apply_polar(
     B, seq_len, n, _ = x.shape
 
     # precompute multipliers
+    real_dtype, complex_dtype = rope_dtypes(x.device)
     x = torch.view_as_complex(
-        x.to(torch.float64).reshape(B, seq_len, n, -1, 2)
+        x.to(real_dtype).reshape(B, seq_len, n, -1, 2)
     )
+    # Cast every complex operand together: the cat below would otherwise still run on
+    # complex128, which CANN's cat does not implement.
+    freqs = freqs.to(complex_dtype)
+    if freqs_action is not None:
+        freqs_action = freqs_action.to(complex_dtype)
+    if freqs_state is not None:
+        freqs_state = freqs_state.to(complex_dtype)
 
     if action_register_length is not None:
         assert action_register_length == (num_action_per_block + num_state_per_block)
@@ -2219,12 +2228,15 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         start_frame: int,
     ):
         device = self.patch_embedding.weight.device
-        if any(freq.device != device for freq in self.freqs):
-            self.freqs = [freq.to(device) for freq in self.freqs]
-        if self.freqs_action.device != device:
-            self.freqs_action = self.freqs_action.to(device)
-        if self.freqs_state.device != device:
-            self.freqs_state = self.freqs_state.to(device)
+        # Cast alongside the device move, not just on the way into rope: the cat below runs on
+        # these tensors directly, and CANN's cat has no complex128 kernel.
+        _, complex_dtype = rope_dtypes(device)
+        if any(freq.device != device or freq.dtype != complex_dtype for freq in self.freqs):
+            self.freqs = [freq.to(device=device, dtype=complex_dtype) for freq in self.freqs]
+        if self.freqs_action.device != device or self.freqs_action.dtype != complex_dtype:
+            self.freqs_action = self.freqs_action.to(device=device, dtype=complex_dtype)
+        if self.freqs_state.device != device or self.freqs_state.dtype != complex_dtype:
+            self.freqs_state = self.freqs_state.to(device=device, dtype=complex_dtype)
 
         f, h, w = grid_size.tolist()
         freqs = torch.cat(

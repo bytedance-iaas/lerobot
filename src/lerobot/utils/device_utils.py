@@ -163,3 +163,20 @@ def accelerator_module(device: str | torch.device):
     if dev.type == "cpu":
         return None
     return getattr(torch, dev.type, None)
+
+
+def rope_dtypes(device: str | torch.device) -> tuple[torch.dtype, torch.dtype]:
+    """Real/complex dtypes for a complex-valued rotary embedding on ``device``.
+
+    CANN implements polar/cat/mul for DT_FLOAT only ("not implemented for DT_COMPLEX128"),
+    so NPU runs the rotation in single precision; every other backend keeps float64/complex128.
+    Measured on the Wan rotary embedding: max relative error 1.0e-07 against the float64 path,
+    just under float32's eps of 1.2e-07. It is that small because the angles are still computed
+    in float64 at construction time and only the resulting unit-modulus values are rounded, the
+    activations arrive as float32 anyway, and these rope_apply functions return float32. Much
+    longer sequences would stress the angle computation instead, which this does not touch.
+    """
+    dev = device if isinstance(device, torch.device) else torch.device(device)
+    if dev.type == "npu":
+        return torch.float32, torch.complex64
+    return torch.float64, torch.complex128
