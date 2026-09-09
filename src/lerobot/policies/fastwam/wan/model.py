@@ -30,8 +30,26 @@ def rope_params(max_seq_len, dim, theta=10000):
 
 
 @torch.amp.autocast("cuda", enabled=False)
+def _rope_dtypes(device: torch.device) -> tuple[torch.dtype, torch.dtype]:
+    """Real/complex dtypes to run the rotary embedding in on ``device``.
+
+    CANN implements polar and cat for DT_FLOAT only ("Tensor input not implemented for
+    DT_DOUBLE, should be in dtype support list [DT_FLOAT]"), which surfaces as
+    ``aclnnCat``/``aclnnPolar`` error 161002 on the complex128 tensors this rotary embedding
+    builds. complex64 is fully supported, so NPU runs the rotation in single precision --
+    which is what most rotary implementations use anyway, and rope_apply already returns
+    float32. Other backends keep the reference float64/complex128 path untouched.
+    """
+    if device.type == "npu":
+        return torch.float32, torch.complex64
+    return torch.float64, torch.complex128
+
+
 def rope_apply(x, grid_sizes, freqs):
     n, c = x.size(2), x.size(3) // 2
+
+    real_dtype, complex_dtype = _rope_dtypes(x.device)
+    freqs = freqs.to(complex_dtype)
 
     # split freqs
     freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
@@ -42,7 +60,7 @@ def rope_apply(x, grid_sizes, freqs):
         seq_len = f * h * w
 
         # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(seq_len, n, -1, 2))
+        x_i = torch.view_as_complex(x[i, :seq_len].to(real_dtype).reshape(seq_len, n, -1, 2))
         freqs_i = torch.cat(
             [
                 freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
