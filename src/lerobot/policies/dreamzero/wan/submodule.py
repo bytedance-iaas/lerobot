@@ -25,6 +25,9 @@ import os
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from einops import repeat
+
+from lerobot.utils.device_utils import rope_dtypes
+
 from .attention import flash_attention
 
 __all__ = ['WanModel']
@@ -83,12 +86,13 @@ def rope_apply_polar(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
     B, seq_len, n, _ = x.shape
 
     # precompute multipliers
+    real_dtype, complex_dtype = rope_dtypes(x.device)
     x = torch.view_as_complex(
-        x.to(torch.float64).reshape(B, seq_len, n, -1, 2)
+        x.to(real_dtype).reshape(B, seq_len, n, -1, 2)
     )
 
     # apply rotary embedding
-    freqs = freqs.unsqueeze(0)
+    freqs = freqs.to(complex_dtype).unsqueeze(0)
     x = torch.view_as_real(x * freqs).flatten(3)
     return x
 
