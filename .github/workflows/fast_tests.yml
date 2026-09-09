@@ -28,6 +28,7 @@ on:
     paths:
       - "src/**"
       - "tests/**"
+      - "lerobot-agent-console/charts/**"
       - ".github/workflows/**"
       - "pyproject.toml"
       - "uv.lock"
@@ -38,6 +39,7 @@ on:
     paths:
       - "src/**"
       - "tests/**"
+      - "lerobot-agent-console/charts/**"
       - ".github/workflows/**"
       - "pyproject.toml"
       - "uv.lock"
@@ -73,6 +75,21 @@ jobs:
         with:
           persist-credentials: false
           lfs: true
+
+      # tests/charts renders the console chart with `helm template`; without helm on PATH those
+      # tests skip, which is indistinguishable from them passing. Installed from the pinned
+      # release tarball rather than a marketplace action so it is pinned the same way the actions
+      # above are.
+      - name: Install helm
+        env:
+          HELM_VERSION: v3.19.0
+          HELM_SHA256: a7f81ce08007091b86d8bd696eb4d86b8d0f2e1b9f6c714be62f82f96a594496
+        run: |
+          curl -fsSLO "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  helm-${HELM_VERSION}-linux-amd64.tar.gz" | sha256sum -c -
+          tar -xzf "helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          sudo install -m 0755 linux-amd64/helm /usr/local/bin/helm
+          helm version --short
 
       # NOTE(Steven): Mount to `/mnt` to avoid the limited storage on `/home`. Consider cleaning default SDKs or using self-hosted runners for more space.
       # (As of 2024-06-10, the runner's `/home` has only 6.2 GB free—8% of its 72 GB total.)
