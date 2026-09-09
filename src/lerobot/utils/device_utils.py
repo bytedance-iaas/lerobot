@@ -130,3 +130,21 @@ def is_amp_available(device: str):
         return False
     else:
         raise ValueError(f"Unknown device '{device}.")
+
+
+def vision_preprocess_device(device: str | torch.device) -> torch.device:
+    """Where to run Hugging Face image preprocessing for a model living on ``device``.
+
+    The Qwen2/3-VL image processors patchify with a ten-dimensional view → permute → reshape.
+    CANN caps tensors at eight dimensions ("The self tensor cannot be larger than 8
+    dimensions"), and the reshape of a permuted view materialises a copy, so on NPU that
+    surfaces as ``aclnnInplaceCopy failed, error code is 161002`` -- an error that names the
+    copy rather than the rank that caused it. Keeping the vision preprocessing on the host
+    sidesteps it; the processor's outputs are moved to the device by the pipeline's device
+    step anyway.
+
+    Every other backend keeps preprocessing on-device, which is the point of the
+    torchvision-backed fast processors: it avoids a device→host→device roundtrip per step.
+    """
+    dev = device if isinstance(device, torch.device) else torch.device(device)
+    return torch.device("cpu") if dev.type == "npu" else dev

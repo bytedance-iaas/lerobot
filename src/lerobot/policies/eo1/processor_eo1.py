@@ -41,6 +41,7 @@ from lerobot.utils.constants import (
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
+from lerobot.utils.device_utils import vision_preprocess_device
 from lerobot.utils.import_utils import _transformers_available, require_package
 
 from .configuration_eo1 import EO1Config
@@ -110,8 +111,12 @@ class EO1ConversationTemplateStep(ComplementaryDataProcessorStep):
 
         # LeRobot visual observations reach in processor as float32 tensors in [0, 1].
         # Convert to uint8 in [0, 255] to meet the input requirement of Qwen2.5-VL-3B-Instruct.
+        # vision_preprocess_device keeps the patchify on the host on NPU, where the image
+        # processor's 10-D reshape exceeds CANN's 8-dimension cap; a no-op elsewhere.
+        vis_dev = vision_preprocess_device(next(iter(observation.values())).device)
         images = {
-            key: observation[key].clamp(0, 1).mul(255.0).round().to(torch.uint8) for key in self._image_keys
+            key: observation[key].clamp(0, 1).mul(255.0).round().to(torch.uint8).to(vis_dev)
+            for key in self._image_keys
         }
         messages = []
         for i in range(len(tasks)):

@@ -17,6 +17,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
+from lerobot.utils.device_utils import vision_preprocess_device
 import torch
 
 from lerobot.utils.import_utils import _transformers_available
@@ -107,7 +108,10 @@ class Qwen3VLInterface(torch.nn.Module):
             processor_kwargs={
                 "padding": True,
                 "return_tensors": "pt",
-                "device": self.model.device,
+                # On NPU the processor's 10-D patchify exceeds CANN's 8-dimension cap
+                # (surfacing as aclnnInplaceCopy 161002), so preprocessing runs on the host
+                # there; on every other backend this stays on-device as intended.
+                "device": vision_preprocess_device(self.model.device),
                 "do_rescale": False,
             },
         )
