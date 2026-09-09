@@ -36,9 +36,24 @@ def _rope_dtypes(device: torch.device) -> tuple[torch.dtype, torch.dtype]:
     CANN implements polar and cat for DT_FLOAT only ("Tensor input not implemented for
     DT_DOUBLE, should be in dtype support list [DT_FLOAT]"), which surfaces as
     ``aclnnCat``/``aclnnPolar`` error 161002 on the complex128 tensors this rotary embedding
-    builds. complex64 is fully supported, so NPU runs the rotation in single precision --
-    which is what most rotary implementations use anyway, and rope_apply already returns
-    float32. Other backends keep the reference float64/complex128 path untouched.
+    builds. complex64 is fully supported, so NPU runs the rotation in single precision.
+    Other backends keep the reference float64/complex128 path untouched.
+
+    On the precision this gives up: measured against the float64 path, max relative error is
+    1.0e-07, just under float32's eps of 1.2e-07 -- the two differ by less than float32 can
+    represent. Three things make the loss that small:
+
+    * ``rope_apply`` ends in ``.float()``, so float64 never reached the output to begin with.
+    * The angles stay in float64. ``rope_params`` runs at construction time on CPU and stores
+      the result as a buffer; only those already-computed unit-modulus values are rounded
+      here (phase error 4.2e-08 rad). Downcasting the *angle* computation would be a very
+      different trade -- ``position * inv_freq`` loses relative precision as positions grow.
+    * ``x`` arrives as float32, so ``.to(torch.float64)`` added no information; upcasting and
+      downcasting it was pure cost.
+
+    That measurement is for the current geometry (max_seq_len 1024, theta 10000). Much longer
+    sequences would stress the angle computation -- which lives in ``rope_params``, still
+    float64, and would need re-measuring rather than assuming this result carries over.
     """
     if device.type == "npu":
         return torch.float32, torch.complex64
