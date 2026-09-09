@@ -34,6 +34,8 @@ except ModuleNotFoundError:
 
 import warnings
 
+from .npu_attention import npu_fusion_attention, npu_fusion_attention_available
+
 
 __all__ = [
     'flash_attention',
@@ -113,10 +115,24 @@ def flash_attention(
     """
     half_dtypes = (torch.float16, torch.bfloat16)
     assert dtype in half_dtypes
-    assert q.device.type == 'cuda' and q.size(-1) <= 256
 
-    # Use PyTorch SDPA on pre-Ampere GPUs (FlashAttention requires Ampere or newer)
+    # Fall back whenever the FlashAttention kernels are unusable: the flash_attn package
+    # is absent, the GPU is pre-Ampere, or the accelerator is not CUDA at all. This must
+    # come *before* the CUDA assertion below -- that assertion guards the flash kernels
+    # only, and running it first made this fallback unreachable on every non-CUDA device.
     if not _gpu_supports_flash_attention():
+        # Ascend NPU has a fused attention op; prefer it over generic SDPA.
+        if npu_fusion_attention_available(q.device):
+            return npu_fusion_attention(
+                q, k, v,
+                q_lens=q_lens,
+                k_lens=k_lens,
+                dropout_p=dropout_p,
+                softmax_scale=softmax_scale,
+                q_scale=q_scale,
+                causal=causal,
+                dtype=dtype,
+            )
         return _sdpa_attention_fallback(
             q, k, v,
             q_lens=q_lens,
@@ -127,6 +143,8 @@ def flash_attention(
             causal=causal,
             dtype=dtype,
         )
+
+    assert q.device.type == 'cuda' and q.size(-1) <= 256
 
     # params
     b, lq, lk, out_dtype = q.size(0), q.size(1), k.size(1), q.dtype
