@@ -101,9 +101,20 @@ inference:
   pathPrefix: /transport.AsyncInference
 
 env:
-  # An ORDERED LIST, not a map: Helm's `range` sorts map keys, and reordering container env
-  # changes the pod-template hash — which would restart both consoles on the first upgrade for
-  # no reason. Keep this in the same order as the running StatefulSets.
+  # An ORDERED LIST, not a map: a map's keys would be sorted, and reordering container env changes
+  # the pod-template hash — which would restart both consoles on the first upgrade for no reason.
+  # Keep this in the same order as the running StatefulSets.
+  #
+  # Entries go into the pod spec verbatim, so this takes a full Kubernetes EnvVar, not only
+  # name/value. To read one out of a Secret or ConfigMap instead of writing it here:
+  #   - name: HF_TOKEN
+  #     valueFrom: { secretKeyRef: { name: hf-token, key: token } }
+  #   - name: LOG_LEVEL
+  #     valueFrom: { configMapKeyRef: { name: console-config, key: log_level } }
+  # (the same shape the chart itself uses for CONSOLE_USER — see templates/statefulset.yaml).
+  #
+  # ⚠️ QUOTE every `value`. Kubernetes requires a string there, and nothing here coerces one, so
+  #    an unquoted `value: 8080` is rejected by the API server rather than silently stringified.
   - { name: PORT, value: "8080" }
   - { name: CONSOLE_WORKDIR, value: /lerobot }        # the lerobot checkout in the image
   - { name: CONSOLE_SHELL, value: /bin/bash }

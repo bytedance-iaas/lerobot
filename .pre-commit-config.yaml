@@ -34,6 +34,9 @@ repos:
       - id: check-merge-conflict
       - id: check-case-conflict
       - id: check-yaml
+        # Helm templates are Go templates and only become YAML once rendered, so a YAML parser
+        # cannot read them. `helm lint` and tests/charts check those instead.
+        exclude: ^lerobot-agent-console/charts/[^/]+/templates/
       - id: check-toml
       - id: end-of-file-fixer
       - id: trailing-whitespace
