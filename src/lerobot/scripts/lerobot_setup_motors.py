@@ -26,8 +26,7 @@ lerobot-setup-motors \
 
 from dataclasses import dataclass
 
-import draccus
-
+from lerobot.configs.parser import draccus_wrap
 from lerobot.robots import (  # noqa: F401
     RobotConfig,
     bi_rebot_b601_follower,
@@ -78,7 +77,7 @@ class SetupConfig:
         self.device = self.robot if self.robot else self.teleop
 
 
-@draccus.wrap()
+@draccus_wrap()
 def setup_motors(cfg: SetupConfig):
     if cfg.device.type not in COMPATIBLE_DEVICES:
         raise NotImplementedError

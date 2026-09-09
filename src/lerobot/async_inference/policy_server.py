@@ -34,10 +34,10 @@ from pprint import pformat
 from queue import Empty, Queue
 from typing import Any
 
-import draccus
 import grpc
 import torch
 
+from lerobot.configs.parser import draccus_wrap
 from lerobot.policies import get_policy_class, make_pre_post_processors
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.transport import (
@@ -410,7 +410,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.logger.info("Server stopping...")
 
 
-@draccus.wrap()
+@draccus_wrap()
 def serve(cfg: PolicyServerConfig):
     """Start the PolicyServer with the given configuration.
 

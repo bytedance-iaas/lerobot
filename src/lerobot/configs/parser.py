@@ -15,9 +15,10 @@ import importlib
 import inspect
 import json
 import pkgutil
+import re
 import sys
 import tempfile
-from argparse import ArgumentError
+from argparse import Action, ArgumentError
 from collections.abc import Callable, Iterable, Sequence
 from functools import wraps
 from pathlib import Path
@@ -27,6 +28,8 @@ from typing import Any, TypeVar, cast
 
 import draccus
 import yaml  # type: ignore[import-untyped]
+from draccus.argparsing import ArgumentParser as DraccusArgumentParser
+from draccus.help_formatter import SimpleHelpFormatter
 
 from lerobot.utils.utils import has_method
 
@@ -270,6 +273,82 @@ def extract_path_fields_from_config(config_path: str, path_fields: list[str]) ->
     return tmp.name
 
 
+# argparse expands `%(default)s` and friends by running `help_string % params` on EVERY help
+# string it prints. draccus hands it the comment sitting next to each config field verbatim
+# (draccus/wrappers/docstring.py), so a literal percent in ordinary prose is read as a conversion
+# specifier: `~84% of updates` in configuration_dreamzero.py made `%` + ` ` + `o` an octal
+# conversion and took down `--help` for lerobot-train, lerobot-eval and lerobot-rollout with
+# "TypeError: %o format: an integer is required, not dict".
+#
+# Escaping each offending comment as `%%` would fix the crash and then wait for the next person
+# to write a percentage, and it puts argparse's escaping rules into prose that is mostly read in
+# the source. Escape at the formatter instead, so config comments can just be English.
+_ARGPARSE_PLACEHOLDER = re.compile(r"%\([^)]*\)[-#0 +]*\d*(?:\.\d+)?[a-zA-Z]")
+
+
+def _escape_literal_percents(help_string: str) -> str:
+    """Escape every `%` in `help_string` except argparse's own `%(name)s` placeholders."""
+    out: list[str] = []
+    last = 0
+    for match in _ARGPARSE_PLACEHOLDER.finditer(help_string):
+        out.append(help_string[last : match.start()].replace("%", "%%"))
+        out.append(match.group(0))
+        last = match.end()
+    out.append(help_string[last:].replace("%", "%%"))
+    return "".join(out)
+
+
+class SafeHelpFormatter(SimpleHelpFormatter):
+    """draccus's formatter, minus the crash on a literal `%` in a field comment."""
+
+    def _get_help_string(self, action: Action) -> str | None:
+        # super() is what appends "(default: %(default)s)", so escape after it, not before.
+        help_string = super()._get_help_string(action)
+        return help_string if help_string is None else _escape_literal_percents(help_string)
+
+
+def parse[T](
+    config_class: type[T],
+    config_path: Path | str | None = None,
+    args: Sequence[str] | None = None,
+) -> T:
+    """`draccus.parse` with a `%`-safe help formatter.
+
+    `draccus.parse` and `draccus.wrap` do not forward `formatter_class`; only the underlying
+    `draccus.argparsing.ArgumentParser` accepts it, so build that directly.
+    """
+    parser = DraccusArgumentParser(
+        config_class=config_class,
+        config_path=config_path,
+        formatter_class=SafeHelpFormatter,
+    )
+    return parser.parse_args(args)
+
+
+def draccus_wrap(config_path: Path | None = None) -> Callable[[F], F]:
+    """Drop-in for `draccus.wrap()` that renders `--help` through `SafeHelpFormatter`.
+
+    For entry points that want plain draccus behaviour. `wrap()` below is the one to use when the
+    script also needs plugin loading and `.path` handling.
+    """
+
+    def wrapper_outer(fn: F) -> F:
+        @wraps(fn)
+        def wrapper_inner(*args: Any, **kwargs: Any) -> Any:
+            argspec = inspect.getfullargspec(fn)
+            argtype = argspec.annotations[argspec.args[0]]
+            if len(args) > 0 and type(args[0]) is argtype:
+                cfg = args[0]
+                args = args[1:]
+            else:
+                cfg = parse(config_class=argtype, config_path=config_path)
+            return fn(cfg, *args, **kwargs)
+
+        return cast(F, wrapper_inner)
+
+    return cast(Callable[[F], F], wrapper_outer)
+
+
 def wrap(config_path: Path | None = None) -> Callable[[F], F]:
     """
     HACK: Similar to draccus.wrap but does three additional things:
@@ -312,7 +391,7 @@ def wrap(config_path: Path | None = None) -> Callable[[F], F]:
                 else:
                     if config_path_cli:
                         cli_args = filter_arg("config_path", cli_args)
-                    cfg = draccus.parse(
+                    cfg = parse(
                         config_class=argtype,
                         config_path=config_path_cli or config_path,
                         args=cli_args,

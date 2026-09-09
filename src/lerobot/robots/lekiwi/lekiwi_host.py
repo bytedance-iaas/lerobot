@@ -21,8 +21,9 @@ import time
 from dataclasses import dataclass, field
 
 import cv2
-import draccus
 import zmq
+
+from lerobot.configs.parser import draccus_wrap
 
 from .config_lekiwi import LeKiwiConfig, LeKiwiHostConfig
 from .lekiwi import LeKiwi
@@ -57,7 +58,7 @@ class LeKiwiHost:
         self.zmq_context.term()
 
 
-@draccus.wrap()
+@draccus_wrap()
 def main(cfg: LeKiwiServerConfig):
     logging.info("Configuring LeKiwi")
     robot = LeKiwi(cfg.robot)
