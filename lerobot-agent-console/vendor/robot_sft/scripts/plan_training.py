@@ -135,6 +135,10 @@ def read_meta_counts(repo_id: str, root: str | None) -> tuple[int | None, int | 
                 so["key"] = os.environ["TOS_ACCESS_KEY"]
             if os.environ.get("TOS_SECRET_KEY"):
                 so["secret"] = os.environ["TOS_SECRET_KEY"]
+            # STS 临时凭证还需要 session token;tosfs 管它叫 session_token。
+            # 少了它,TOS 会用 AKTP… 开头的临时 AK 去做长期凭证校验并 403。
+            if os.environ.get("TOS_SESSION_TOKEN"):
+                so["session_token"] = os.environ["TOS_SESSION_TOKEN"]
         with fsspec.open(f"{repo_id.rstrip('/')}/meta/info.json", "r", **so) as f:
             info = json.load(f)
     if info is None:
