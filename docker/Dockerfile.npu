@@ -1,0 +1,119 @@
+# Copyright 2025 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# lerobot on Ascend NPU (Atlas 800 / 950PR, CANN 9.1).
+#
+#   docker build -f docker/Dockerfile.npu -t lerobot-npu .
+#
+#   docker run -it --rm \
+#     --device /dev/davinci0 --device /dev/davinci_manager \
+#     --device /dev/devmm_svm --device /dev/hisi_hdc \
+#     -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro \
+#     -v /usr/local/dcmi:/usr/local/dcmi:ro \
+#     -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro \
+#     -e ASCEND_RT_VISIBLE_DEVICES=0 \
+#     lerobot-npu
+#
+# Pick the cards per run with ASCEND_RT_VISIBLE_DEVICES; it is deliberately not baked in.
+# The HF endpoint is likewise not set here — which mirror to use is per-site knowledge, and
+# hardcoding it into the image makes the image lie about where weights come from.
+
+# The Ascend vLLM image is the only widely published base that ships CANN, a matching
+# torch_npu and a CPU-built torch in one place. We use it purely as a CANN+torch_npu base;
+# nothing here depends on vLLM. In CN, pull it through a mirror:
+#   docker pull m.daocloud.io/quay.io/ascend/vllm-ascend:v0.23.0-a5
+ARG BASE_IMAGE=quay.io/ascend/vllm-ascend:v0.23.0-a5
+FROM ${BASE_IMAGE}
+
+# Extras to install. The default covers the policies that have been exercised on NPU; add
+# your own with --build-arg. Deliberately excluded:
+#   - `all`      : drags in hardware/webrtc stacks that no NPU trainer needs.
+#   - `hilserl`  : pulls placo (real-robot kinematics). SAC in simulation does not use it;
+#                  gym-hil is installed directly below instead.
+ARG LEROBOT_EXTRAS=dataset,training,transformers-dep,peft,diffusion,pi,smolvla,groot,eo1,evo1,xvla,wallx,molmoact2,multi_task_dit,lingbot_va,vla_jepa,fastwam,dreamzero,pusht
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    # MuJoCo has to render the camera observations offscreen. EGL is not an option on an
+    # Ascend host: an EGL device is a DRM render node (/dev/dri/renderD*) backed by a
+    # graphics driver, and an NPU box exposes only /dev/davinci*, so EGL enumerates zero
+    # devices even with libEGL installed. OSMesa rasterises on the CPU and needs no device.
+    MUJOCO_GL=osmesa \
+    PYOPENGL_PLATFORM=osmesa \
+    # HCCL defaults to port 16666 and fails with "EI0020: reuse port" when anything else on
+    # the host already holds it. Giving it a private range makes multi-card runs reproducible.
+    HCCL_NPU_SOCKET_PORT_RANGE=25000-25200
+
+# libosmesa6 is the renderer chosen above; libegl1/libgl1/libopengl0 are still needed
+# because PyOpenGL resolves them at import time regardless of the platform in use.
+# ffmpeg is for dataset video encoding (PyAV ships its own decode libs inside the wheel).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libosmesa6 libegl1 libgl1 libopengl0 libglib2.0-0 \
+        ffmpeg git curl build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Aliyun mirror: pulling from pypi.org inside CN turns a 3-minute build into a 40-minute one.
+ENV PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
+    PIP_TRUSTED_HOST=mirrors.aliyun.com \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Freeze the base image's torch stack into a pip constraint before installing anything.
+# lerobot asks for `torch>=2.7,<2.12`, which the CPU build already satisfies -- but any
+# extra that nudges the resolver is one CUDA wheel away from replacing it, and torch_npu
+# then refuses to load against the mismatched ABI. The constraint makes that impossible
+# rather than merely unlikely. Generated, not hardcoded, so it stays correct when
+# BASE_IMAGE is bumped.
+#
+# This is also why the install below uses pip and not `uv sync`: `[tool.uv.sources]` in
+# pyproject.toml points torchvision at the pytorch-cu128 index on Linux. pip ignores that
+# table entirely; uv would honour it and pull a CUDA torchvision.
+RUN for p in torch torchvision torchaudio torch-npu; do \
+        v=$(python3 -c "import importlib.metadata as m; print(m.version('$p'))" 2>/dev/null) \
+          && echo "$p==$v" >> /etc/pip-torch-constraints.txt; \
+    done && cat /etc/pip-torch-constraints.txt
+ENV PIP_CONSTRAINT=/etc/pip-torch-constraints.txt
+
+WORKDIR /lerobot
+COPY . .
+
+RUN pip install --no-cache-dir -e ".[${LEROBOT_EXTRAS}]"
+
+# The SAC / HIL-SERL simulator, installed on its own rather than via the `hilserl` extra so
+# that placo (real-robot kinematics, unused in simulation) stays out. This single line is
+# what pulls MuJoCo in; gym-pusht arrives with the `pusht` extra above and needs only pymunk.
+# gym-hil is classic MuJoCo, not MuJoCo Warp, so the physics runs on the CPU while the
+# policy runs on the NPU — that split is what makes closed-loop RL possible on a machine
+# with no graphics hardware at all.
+RUN pip install --no-cache-dir 'gym-hil>=0.1.14,<0.2.0'
+
+# Remove torchcodec, pulled in by the [dataset] extra. Its native libraries are built
+# against a different torch than the base image ships, so the dlopen fails. That failure is
+# not contained: lerobot catches it and falls back to PyAV, but glibc is left with a
+# half-initialised link map and every later pthread_create aborts the process with
+#   Inconsistency detected by ld.so: dl-tls.c: _dl_allocate_tls_init: Assertion `listp != NULL'
+# which kills open-loop eval long after the original warning scrolled past. Uninstalling
+# turns the probe in get_safe_default_video_backend() into a clean ModuleNotFoundError, so
+# PyAV is selected without the process ever reaching dlopen. Enlarging the static TLS
+# surplus via GLIBC_TUNABLES does not help — the surplus is not what ran out.
+RUN pip uninstall -y torchcodec
+
+# Fail the build, not the first training run, if any of the above silently regressed.
+RUN python3 -c "\
+import importlib.util as u, torch, torch_npu;\
+assert not torch.version.cuda, f'expected a CPU torch build, got CUDA {torch.version.cuda}';\
+assert u.find_spec('torchcodec') is None, 'torchcodec is back; see the note above';\
+assert u.find_spec('av') is not None, 'PyAV missing: no video decoder left';\
+assert all(u.find_spec(m) for m in ('gym_hil','gym_pusht','mujoco')), 'sim stack incomplete';\
+import lerobot; print('torch', torch.__version__, '| torch_npu', torch_npu.__version__, '| lerobot', lerobot.__version__)"
+
+CMD ["/bin/bash"]
