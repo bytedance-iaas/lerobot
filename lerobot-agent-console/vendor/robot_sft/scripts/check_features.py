@@ -76,6 +76,10 @@ def _load_json_fsspec(url: str):
                 so["key"] = os.environ["TOS_ACCESS_KEY"]
             if os.environ.get("TOS_SECRET_KEY"):
                 so["secret"] = os.environ["TOS_SECRET_KEY"]
+            # STS 临时凭证还需要 session token;tosfs 管它叫 session_token。
+            # 少了它,TOS 会用 AKTP… 开头的临时 AK 去做长期凭证校验并 403。
+            if os.environ.get("TOS_SESSION_TOKEN"):
+                so["session_token"] = os.environ["TOS_SESSION_TOKEN"]
         with fsspec.open(url, "r", **so) as f:
             return json.load(f)
     except Exception:
