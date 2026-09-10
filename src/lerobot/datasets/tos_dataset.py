@@ -30,8 +30,9 @@ per-provider code:
    range-read it (frame-accurate — verified bit-exact vs the non-streaming reader).
 
 Everything else — shuffle buffer, sharding, delta-timestamp windows, per-item construction — is
-inherited from the parent. Credentials come from ``TOS_ACCESS_KEY`` / ``TOS_SECRET_KEY`` (plus
-optional ``TOS_ENDPOINT`` / ``TOS_REGION``); pass ``storage_options`` to override. Install
+inherited from the parent. Credentials come from ``TOS_ACCESS_KEY`` / ``TOS_SECRET_KEY`` (plus optional
+``TOS_SESSION_TOKEN`` for STS temporary credentials, and ``TOS_ENDPOINT`` / ``TOS_REGION``);
+pass ``storage_options`` to override. Install
 ``tosfs`` for the ``tos://`` protocol. It's an ``IterableDataset`` (buffer-shuffled, no random
 index) — iterate it, don't index ``ds[i]``.
 
@@ -57,7 +58,8 @@ from .streaming_dataset import StreamingLeRobotDataset
 
 def _tos_env_storage_options() -> dict:
     """TOS fsspec ``storage_options`` from the environment (never hardcode secrets):
-    ``TOS_ACCESS_KEY`` / ``TOS_SECRET_KEY`` (+ optional ``TOS_ENDPOINT`` / ``TOS_REGION``)."""
+    ``TOS_ACCESS_KEY`` / ``TOS_SECRET_KEY``, plus optional ``TOS_SESSION_TOKEN`` (STS temporary
+    credentials), ``TOS_ENDPOINT`` and ``TOS_REGION``."""
     opts: dict = {
         "endpoint": os.environ.get("TOS_ENDPOINT", "https://tos-cn-beijing.volces.com"),
         "region": os.environ.get("TOS_REGION", "cn-beijing"),
@@ -66,6 +68,10 @@ def _tos_env_storage_options() -> dict:
         opts["key"] = os.environ["TOS_ACCESS_KEY"]
     if os.environ.get("TOS_SECRET_KEY"):
         opts["secret"] = os.environ["TOS_SECRET_KEY"]
+    # STS 临时凭证还需要 session token;tosfs 管它叫 session_token。
+    # 少了它,TOS 会用 AKTP… 开头的临时 AK 去做长期凭证校验并 403。
+    if os.environ.get("TOS_SESSION_TOKEN"):
+        opts["session_token"] = os.environ["TOS_SESSION_TOKEN"]
     return opts
 
 
@@ -104,7 +110,8 @@ class StreamingTOSRobotDataset(StreamingLeRobotDataset):
         if self._protocol == "tos" and (not so.get("key") or not so.get("secret")):
             raise ValueError(
                 "TOS credentials not found: set TOS_ACCESS_KEY and TOS_SECRET_KEY in the environment "
-                "(optionally TOS_ENDPOINT / TOS_REGION), or pass storage_options={'key':…, 'secret':…}."
+                "(plus TOS_SESSION_TOKEN if these are STS temporary credentials; optionally "
+                "TOS_ENDPOINT / TOS_REGION), or pass storage_options={'key':…, 'secret':…}."
             )
         self.storage_options = dict(so)
         # instance-cached by fsspec, so this is the same object load_dataset/fsspec.open resolve.
