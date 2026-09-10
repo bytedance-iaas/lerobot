@@ -1,7 +1,17 @@
 nameOverride: ""
 
 image:
-  repository: docker.m.daocloud.io/livekit/livekit-server   # daocloud mirror (CN)
+  # Our own registry, not the daocloud mirror it used to be. A public mirror is outside our
+  # control: it can rate-limit, retag, or drop an image, and a pod restart then fails to pull
+  # something that worked yesterday. This is a byte-identical copy — same manifest digest
+  # (sha256:3497163e15c48fef6e7830c78716f9e9d5edc28abf7aa90b61c86e93bbc306b1), both
+  # linux/amd64 and linux/arm64 — so nothing about the running server changes.
+  # No imagePullSecrets: the VKE nodes already authenticate to this registry, which is how the
+  # console chart pulls from it without one.
+  # Re-mirror a new version with:
+  #   oras cp docker.m.daocloud.io/livekit/livekit-server:<tag> \
+  #           ai-containers-cn-beijing.cr.volces.com/physicalai/livekit-server:<tag>
+  repository: ai-containers-cn-beijing.cr.volces.com/physicalai/livekit-server
   # Pin a version. `latest` means a restart can silently move a PUBLIC SFU to a new server
   # build — including across a breaking change — at a moment nobody chose. This is the version
   # the running deployment resolved `latest` to, so pinning it changes nothing today.
