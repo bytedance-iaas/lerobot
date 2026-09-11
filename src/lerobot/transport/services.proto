@@ -44,6 +44,22 @@ service AsyncInference {
   rpc Ready(Empty) returns (Empty);
 }
 
+// RemoteEnv: the evaluation loop runs where the policy is (e.g. an Ascend NPU host)
+// while the simulator runs where the GPU and the GL stack are. The client is a
+// gym.vector.VectorEnv proxy, so lerobot_eval's reset/step loop is unchanged.
+//
+// Payloads are pickled, like the rest of this file. That assumes a trusted network -- the
+// simulator host is normally a GPU box in the same cluster. If it is ever published
+// through a gateway, the gateway must authenticate every call.
+service RemoteEnv {
+  rpc Ready(Empty) returns (Empty);
+  // Build the envs described by the spec; replies with the suite/task handles and spaces.
+  rpc Make(EnvSpec) returns (stream Chunk);
+  rpc Reset(EnvCall) returns (stream Chunk);
+  rpc Step(EnvCall) returns (stream Chunk);
+  rpc Close(Empty) returns (Empty);
+}
+
 enum TransferState {
     TRANSFER_UNKNOWN = 0;
     TRANSFER_BEGIN = 1;
@@ -82,6 +98,24 @@ message Actions {
 message PolicySetup {
   // sent by Robot to remote server, to init Policy
   bytes data = 1;
+}
+
+// ---- RemoteEnv messages -------------------------------------------------------------
+message EnvSpec {
+  // Pickled: the EnvConfig fields plus n_envs / use_async_envs.
+  bytes spec = 1;
+}
+
+message EnvCall {
+  string suite = 1;
+  int32 task_id = 2;
+  // Pickled: the action batch for Step, the seed/options for Reset.
+  bytes payload = 3;
+}
+
+message Chunk {
+  TransferState transfer_state = 1;
+  bytes data = 2;
 }
 
 message Empty {}
