@@ -269,6 +269,11 @@ class RemoteEnvStub(object):
                 request_serializer=services__pb2.EnvCall.SerializeToString,
                 response_deserializer=services__pb2.Chunk.FromString,
                 _registered_method=True)
+        self.Call = channel.unary_stream(
+                '/transport.RemoteEnv/Call',
+                request_serializer=lerobot_dot_transport_dot_services__pb2.EnvCall.SerializeToString,
+                response_deserializer=lerobot_dot_transport_dot_services__pb2.Chunk.FromString,
+                _registered_method=True)
         self.Close = channel.unary_unary(
                 '/transport.RemoteEnv/Close',
                 request_serializer=services__pb2.Empty.SerializeToString,
@@ -311,6 +316,13 @@ class RemoteEnvServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def Call(self, request, context):
+        """VectorEnv.call() plus the few attributes eval reads off the env (metadata, ...).
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def Close(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -339,6 +351,11 @@ def add_RemoteEnvServicer_to_server(servicer, server):
                     servicer.Step,
                     request_deserializer=services__pb2.EnvCall.FromString,
                     response_serializer=services__pb2.Chunk.SerializeToString,
+            ),
+            'Call': grpc.unary_stream_rpc_method_handler(
+                    servicer.Call,
+                    request_deserializer=lerobot_dot_transport_dot_services__pb2.EnvCall.FromString,
+                    response_serializer=lerobot_dot_transport_dot_services__pb2.Chunk.SerializeToString,
             ),
             'Close': grpc.unary_unary_rpc_method_handler(
                     servicer.Close,
@@ -461,6 +478,33 @@ class RemoteEnv(object):
             '/transport.RemoteEnv/Step',
             services__pb2.EnvCall.SerializeToString,
             services__pb2.Chunk.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Call(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/transport.RemoteEnv/Call',
+            lerobot_dot_transport_dot_services__pb2.EnvCall.SerializeToString,
+            lerobot_dot_transport_dot_services__pb2.Chunk.FromString,
             options,
             channel_credentials,
             insecure,

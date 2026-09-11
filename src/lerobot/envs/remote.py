@@ -40,7 +40,6 @@ from typing import Any
 import numpy as np
 
 from lerobot.envs.configs import EnvConfig
-from lerobot.transport.utils import bytes_to_python_object, python_object_to_bytes
 
 # ---------------------------------------------------------------------------------------
 # Config
@@ -67,6 +66,33 @@ class RemoteEnvConfig(EnvConfig):
     episode_length: int = 400
     features: dict = field(default_factory=dict)
     features_map: dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        """Adopt the real env config's features without building anything.
+
+        make_policy() derives the policy's input/output features from the env config, and
+        it does that before any env exists. Those features are static metadata declared on
+        the concrete EnvConfig class, so instantiating that class locally is enough -- no
+        round trip, and no need for the env's runtime dependencies on this side. The result
+        is that --env.type=remote --env.remote='{"type": "pusht"}' presents the policy with
+        exactly what --env.type=pusht would.
+        """
+        if not self.remote or "type" not in self.remote:
+            return  # validated in make_remote_envs, which produces the actionable message
+        spec = {k: v for k, v in self.remote.items() if k != "type"}
+        try:
+            inner = EnvConfig.get_choice_class(self.remote["type"])(**spec)
+        except Exception as e:  # noqa: BLE001
+            raise ValueError(
+                f"cannot build the local view of env.remote {self.remote['type']!r}: {e}. "
+                "The client needs the env type registered (it is, if it appears in "
+                "--env.type's choices), not the env's runtime dependencies."
+            ) from e
+        self.features = inner.features
+        self.features_map = inner.features_map
+        self.task = inner.task
+        self.fps = inner.fps
+        self.episode_length = inner.episode_length
 
     @property
     def gym_kwargs(self) -> dict:
@@ -113,7 +139,11 @@ class RemoteVectorEnv:
         self.action_space = handle["action_space"]
 
     def _call(self, rpc, payload: dict | None):
+        # Imported here, not at module scope: lerobot.transport pulls in protobuf, which
+        # lives behind the optional grpcio-dep extra. Registering this env type must not
+        # make that extra mandatory for everyone who imports lerobot.envs.
         from lerobot.transport import services_pb2
+        from lerobot.transport.utils import bytes_to_python_object, python_object_to_bytes
 
         req = services_pb2.EnvCall(
             suite=self._suite,
@@ -130,6 +160,33 @@ class RemoteVectorEnv:
         out = self._call(self._stub.Step, {"action": np.asarray(action)})
         return out["obs"], out["reward"], out["terminated"], out["truncated"], out["info"]
 
+    def call(self, name: str, *args, **kwargs):
+        """Mirror of VectorEnv.call(): returns one value per sub-env.
+
+        rollout() probes optional attributes by calling them and catching AttributeError /
+        NotImplementedError -- `task_description`, then `task`, then giving up. gRPC turns
+        any server-side exception into _InactiveRpcError, which those handlers would not
+        catch, so the server reports the condition as NOT_FOUND and we raise the original
+        type again here. Without this the first probe aborts the whole eval.
+        """
+        import grpc
+
+        try:
+            out = self._call(self._stub.Call, {"kind": "call", "name": name, "args": args, "kwargs": kwargs})
+        except grpc.RpcError as e:
+            if e.code() is grpc.StatusCode.NOT_FOUND:
+                detail = e.details() or ""
+                if detail.startswith("NotImplementedError"):
+                    raise NotImplementedError(detail) from None
+                raise AttributeError(detail) from None
+            raise
+        return out["result"]
+
+    @property
+    def unwrapped(self):
+        """rollout() reads env.unwrapped.metadata for the render fps, nothing else."""
+        return _RemoteUnwrapped(self)
+
     def close(self):
         from lerobot.transport import services_pb2
 
@@ -141,12 +198,32 @@ class RemoteVectorEnv:
         return f"RemoteVectorEnv(suite={self._suite!r}, task_id={self._task_id}, num_envs={self.num_envs})"
 
 
+class _RemoteUnwrapped:
+    """Just enough of `env.unwrapped` for eval: the metadata dict, fetched once."""
+
+    def __init__(self, env: RemoteVectorEnv):
+        self._env = env
+        self._metadata = None
+
+    @property
+    def metadata(self) -> dict:
+        if self._metadata is None:
+            self._metadata = self._env._call(self._env._stub.Call, {"kind": "attr", "name": "metadata"})[
+                "result"
+            ]
+        return self._metadata
+
+
 def make_remote_envs(cfg: RemoteEnvConfig) -> dict[str, dict[int, RemoteVectorEnv]]:
     """Ask the server to build ``cfg.remote`` and return proxies in ``make_env``'s shape."""
     import grpc
 
     from lerobot.transport import services_pb2, services_pb2_grpc
-    from lerobot.transport.utils import grpc_channel_options
+    from lerobot.transport.utils import (
+        bytes_to_python_object,
+        grpc_channel_options,
+        python_object_to_bytes,
+    )
 
     if not cfg.target:
         raise ValueError("env.target is required, e.g. --env.target=host:18990")

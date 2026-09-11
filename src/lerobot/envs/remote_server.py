@@ -132,6 +132,43 @@ class RemoteEnvService(services_pb2_grpc.RemoteEnvServicer):
             }
         )
 
+    def Call(self, request, context):  # noqa: N802
+        """VectorEnv.call(), plus the handful of attributes eval reads off the env.
+
+        rollout() does not stop at reset/step: it asks for `_max_episode_steps` and
+        `task_description` through call(), and reads `unwrapped.metadata` for the render
+        fps. One generic RPC covers all of them and keeps each to a single round trip.
+        """
+        req = bytes_to_python_object(request.payload)
+        env = self._get(request, context)
+        kind, name = req["kind"], req["name"]
+        if kind == "call":
+            try:
+                result = list(env.call(name, *req.get("args", ()), **req.get("kwargs", {})))
+            except (AttributeError, NotImplementedError) as e:
+                # rollout() probes for optional attributes (task_description, then task)
+                # and relies on catching these two. gRPC would flatten them into a generic
+                # UNKNOWN, so name the condition in the status code and let the client
+                # raise the original type again.
+                context.abort(grpc.StatusCode.NOT_FOUND, f"{type(e).__name__}: {e}")
+        elif kind == "attr":
+            # Only whole attributes that are safe to ship: metadata is a plain dict, the
+            # rest are numbers. Deliberately not a generic getattr chain -- that would be
+            # an arbitrary-read primitive on the simulator host.
+            allowed = {
+                "metadata": lambda e: dict(getattr(e.unwrapped, "metadata", {}) or {}),
+                "num_envs": lambda e: int(e.num_envs),
+            }
+            if name not in allowed:
+                context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    f"attribute {name!r} is not exposed (have {sorted(allowed)})",
+                )
+            result = allowed[name](env)
+        else:
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"unknown kind {kind!r}")
+        yield from self._reply({"result": result})
+
     def Close(self, request, context):  # noqa: N802
         with self._lock:
             self.close_all()
@@ -178,7 +215,10 @@ def main() -> None:
     p.add_argument("--max-workers", type=int, default=MAX_WORKERS)
     p.add_argument("--log-level", default="INFO")
     a = p.parse_args()
-    logging.basicConfig(level=a.log_level, format="%(asctime)s %(levelname)s %(message)s")
+    # force=True: importing lerobot installs root handlers, and basicConfig is a no-op once
+    # any exist -- without this the server starts, serves, and logs nothing at all, which
+    # reads exactly like a server that failed to start.
+    logging.basicConfig(level=a.log_level, format="%(asctime)s %(levelname)s %(message)s", force=True)
     serve(a.port, a.max_workers)
 
 
