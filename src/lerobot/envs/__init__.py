@@ -20,6 +20,10 @@
 
 from .configs import AlohaEnv, EnvConfig, HILSerlRobotEnvConfig, HubEnvConfig, PushtEnv
 from .factory import make_env, make_env_config, make_env_pre_post_processors
+
+# Imported for its side effect: the @EnvConfig.register_subclass("remote") decorator only
+# runs on import, and without it --env.type=remote is not a valid choice.
+from .remote import RemoteEnvConfig
 from .utils import check_env_attributes_and_types, close_envs, env_to_policy_features, preprocess_observation
 
 __all__ = [
@@ -28,6 +32,7 @@ __all__ = [
     "HILSerlRobotEnvConfig",
     "HubEnvConfig",
     "PushtEnv",
+    "RemoteEnvConfig",
     "check_env_attributes_and_types",
     "close_envs",
     "env_to_policy_features",
