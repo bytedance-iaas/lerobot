@@ -3,9 +3,9 @@
 import grpc
 import warnings
 
-from lerobot.transport import services_pb2 as lerobot_dot_transport_dot_services__pb2
+import services_pb2 as services__pb2
 
-GRPC_GENERATED_VERSION = '1.73.1'
+GRPC_GENERATED_VERSION = '1.74.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -18,7 +18,7 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + f' but the generated code in lerobot/transport/services_pb2_grpc.py depends on'
+        + f' but the generated code in services_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
@@ -38,23 +38,23 @@ class LearnerServiceStub(object):
         """
         self.StreamParameters = channel.unary_stream(
                 '/transport.LearnerService/StreamParameters',
-                request_serializer=lerobot_dot_transport_dot_services__pb2.Empty.SerializeToString,
-                response_deserializer=lerobot_dot_transport_dot_services__pb2.Parameters.FromString,
+                request_serializer=services__pb2.Empty.SerializeToString,
+                response_deserializer=services__pb2.Parameters.FromString,
                 _registered_method=True)
         self.SendTransitions = channel.stream_unary(
                 '/transport.LearnerService/SendTransitions',
-                request_serializer=lerobot_dot_transport_dot_services__pb2.Transition.SerializeToString,
-                response_deserializer=lerobot_dot_transport_dot_services__pb2.Empty.FromString,
+                request_serializer=services__pb2.Transition.SerializeToString,
+                response_deserializer=services__pb2.Empty.FromString,
                 _registered_method=True)
         self.SendInteractions = channel.stream_unary(
                 '/transport.LearnerService/SendInteractions',
-                request_serializer=lerobot_dot_transport_dot_services__pb2.InteractionMessage.SerializeToString,
-                response_deserializer=lerobot_dot_transport_dot_services__pb2.Empty.FromString,
+                request_serializer=services__pb2.InteractionMessage.SerializeToString,
+                response_deserializer=services__pb2.Empty.FromString,
                 _registered_method=True)
         self.Ready = channel.unary_unary(
                 '/transport.LearnerService/Ready',
-                request_serializer=lerobot_dot_transport_dot_services__pb2.Empty.SerializeToString,
-                response_deserializer=lerobot_dot_transport_dot_services__pb2.Empty.FromString,
+                request_serializer=services__pb2.Empty.SerializeToString,
+                response_deserializer=services__pb2.Empty.FromString,
                 _registered_method=True)
 
 
@@ -93,23 +93,23 @@ def add_LearnerServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
             'StreamParameters': grpc.unary_stream_rpc_method_handler(
                     servicer.StreamParameters,
-                    request_deserializer=lerobot_dot_transport_dot_services__pb2.Empty.FromString,
-                    response_serializer=lerobot_dot_transport_dot_services__pb2.Parameters.SerializeToString,
+                    request_deserializer=services__pb2.Empty.FromString,
+                    response_serializer=services__pb2.Parameters.SerializeToString,
             ),
             'SendTransitions': grpc.stream_unary_rpc_method_handler(
                     servicer.SendTransitions,
-                    request_deserializer=lerobot_dot_transport_dot_services__pb2.Transition.FromString,
-                    response_serializer=lerobot_dot_transport_dot_services__pb2.Empty.SerializeToString,
+                    request_deserializer=services__pb2.Transition.FromString,
+                    response_serializer=services__pb2.Empty.SerializeToString,
             ),
             'SendInteractions': grpc.stream_unary_rpc_method_handler(
                     servicer.SendInteractions,
-                    request_deserializer=lerobot_dot_transport_dot_services__pb2.InteractionMessage.FromString,
-                    response_serializer=lerobot_dot_transport_dot_services__pb2.Empty.SerializeToString,
+                    request_deserializer=services__pb2.InteractionMessage.FromString,
+                    response_serializer=services__pb2.Empty.SerializeToString,
             ),
             'Ready': grpc.unary_unary_rpc_method_handler(
                     servicer.Ready,
-                    request_deserializer=lerobot_dot_transport_dot_services__pb2.Empty.FromString,
-                    response_serializer=lerobot_dot_transport_dot_services__pb2.Empty.SerializeToString,
+                    request_deserializer=services__pb2.Empty.FromString,
+                    response_serializer=services__pb2.Empty.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -139,8 +139,8 @@ class LearnerService(object):
             request,
             target,
             '/transport.LearnerService/StreamParameters',
-            lerobot_dot_transport_dot_services__pb2.Empty.SerializeToString,
-            lerobot_dot_transport_dot_services__pb2.Parameters.FromString,
+            services__pb2.Empty.SerializeToString,
+            services__pb2.Parameters.FromString,
             options,
             channel_credentials,
             insecure,
@@ -166,8 +166,8 @@ class LearnerService(object):
             request_iterator,
             target,
             '/transport.LearnerService/SendTransitions',
-            lerobot_dot_transport_dot_services__pb2.Transition.SerializeToString,
-            lerobot_dot_transport_dot_services__pb2.Empty.FromString,
+            services__pb2.Transition.SerializeToString,
+            services__pb2.Empty.FromString,
             options,
             channel_credentials,
             insecure,
@@ -193,8 +193,8 @@ class LearnerService(object):
             request_iterator,
             target,
             '/transport.LearnerService/SendInteractions',
-            lerobot_dot_transport_dot_services__pb2.InteractionMessage.SerializeToString,
-            lerobot_dot_transport_dot_services__pb2.Empty.FromString,
+            services__pb2.InteractionMessage.SerializeToString,
+            services__pb2.Empty.FromString,
             options,
             channel_credentials,
             insecure,
@@ -220,8 +220,274 @@ class LearnerService(object):
             request,
             target,
             '/transport.LearnerService/Ready',
-            lerobot_dot_transport_dot_services__pb2.Empty.SerializeToString,
-            lerobot_dot_transport_dot_services__pb2.Empty.FromString,
+            services__pb2.Empty.SerializeToString,
+            services__pb2.Empty.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+
+class RemoteEnvStub(object):
+    """RemoteEnv: the evaluation loop runs where the policy is (e.g. an Ascend NPU host)
+    while the simulator runs where the GPU and the GL stack are. The client is a
+    gym.vector.VectorEnv proxy, so lerobot_eval's reset/step loop is unchanged.
+
+    Payloads are pickled, like the rest of this file. That assumes a trusted network -- the
+    simulator host is normally a GPU box in the same cluster. If it is ever published
+    through a gateway, the gateway must authenticate every call.
+    """
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.Ready = channel.unary_unary(
+                '/transport.RemoteEnv/Ready',
+                request_serializer=services__pb2.Empty.SerializeToString,
+                response_deserializer=services__pb2.Empty.FromString,
+                _registered_method=True)
+        self.Make = channel.unary_stream(
+                '/transport.RemoteEnv/Make',
+                request_serializer=services__pb2.EnvSpec.SerializeToString,
+                response_deserializer=services__pb2.Chunk.FromString,
+                _registered_method=True)
+        self.Reset = channel.unary_stream(
+                '/transport.RemoteEnv/Reset',
+                request_serializer=services__pb2.EnvCall.SerializeToString,
+                response_deserializer=services__pb2.Chunk.FromString,
+                _registered_method=True)
+        self.Step = channel.unary_stream(
+                '/transport.RemoteEnv/Step',
+                request_serializer=services__pb2.EnvCall.SerializeToString,
+                response_deserializer=services__pb2.Chunk.FromString,
+                _registered_method=True)
+        self.Close = channel.unary_unary(
+                '/transport.RemoteEnv/Close',
+                request_serializer=services__pb2.Empty.SerializeToString,
+                response_deserializer=services__pb2.Empty.FromString,
+                _registered_method=True)
+
+
+class RemoteEnvServicer(object):
+    """RemoteEnv: the evaluation loop runs where the policy is (e.g. an Ascend NPU host)
+    while the simulator runs where the GPU and the GL stack are. The client is a
+    gym.vector.VectorEnv proxy, so lerobot_eval's reset/step loop is unchanged.
+
+    Payloads are pickled, like the rest of this file. That assumes a trusted network -- the
+    simulator host is normally a GPU box in the same cluster. If it is ever published
+    through a gateway, the gateway must authenticate every call.
+    """
+
+    def Ready(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Make(self, request, context):
+        """Build the envs described by the spec; replies with the suite/task handles and spaces.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Reset(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Step(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Close(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+
+def add_RemoteEnvServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'Ready': grpc.unary_unary_rpc_method_handler(
+                    servicer.Ready,
+                    request_deserializer=services__pb2.Empty.FromString,
+                    response_serializer=services__pb2.Empty.SerializeToString,
+            ),
+            'Make': grpc.unary_stream_rpc_method_handler(
+                    servicer.Make,
+                    request_deserializer=services__pb2.EnvSpec.FromString,
+                    response_serializer=services__pb2.Chunk.SerializeToString,
+            ),
+            'Reset': grpc.unary_stream_rpc_method_handler(
+                    servicer.Reset,
+                    request_deserializer=services__pb2.EnvCall.FromString,
+                    response_serializer=services__pb2.Chunk.SerializeToString,
+            ),
+            'Step': grpc.unary_stream_rpc_method_handler(
+                    servicer.Step,
+                    request_deserializer=services__pb2.EnvCall.FromString,
+                    response_serializer=services__pb2.Chunk.SerializeToString,
+            ),
+            'Close': grpc.unary_unary_rpc_method_handler(
+                    servicer.Close,
+                    request_deserializer=services__pb2.Empty.FromString,
+                    response_serializer=services__pb2.Empty.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'transport.RemoteEnv', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('transport.RemoteEnv', rpc_method_handlers)
+
+
+ # This class is part of an EXPERIMENTAL API.
+class RemoteEnv(object):
+    """RemoteEnv: the evaluation loop runs where the policy is (e.g. an Ascend NPU host)
+    while the simulator runs where the GPU and the GL stack are. The client is a
+    gym.vector.VectorEnv proxy, so lerobot_eval's reset/step loop is unchanged.
+
+    Payloads are pickled, like the rest of this file. That assumes a trusted network -- the
+    simulator host is normally a GPU box in the same cluster. If it is ever published
+    through a gateway, the gateway must authenticate every call.
+    """
+
+    @staticmethod
+    def Ready(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/transport.RemoteEnv/Ready',
+            services__pb2.Empty.SerializeToString,
+            services__pb2.Empty.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Make(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/transport.RemoteEnv/Make',
+            services__pb2.EnvSpec.SerializeToString,
+            services__pb2.Chunk.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Reset(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/transport.RemoteEnv/Reset',
+            services__pb2.EnvCall.SerializeToString,
+            services__pb2.Chunk.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Step(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/transport.RemoteEnv/Step',
+            services__pb2.EnvCall.SerializeToString,
+            services__pb2.Chunk.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Close(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/transport.RemoteEnv/Close',
+            services__pb2.Empty.SerializeToString,
+            services__pb2.Empty.FromString,
             options,
             channel_credentials,
             insecure,
