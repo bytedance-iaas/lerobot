@@ -843,8 +843,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             )
             return suffix_out
 
-        suffix_out = self._apply_checkpoint(
-            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+        # The decoder layers inside forward_func are already checkpointed one by one
+        # (see PaliGemmaWithExpertModel.forward), so wrapping the whole stack a second
+        # time only buys a third forward pass per step at no memory saving.
+        suffix_out = forward_func(
+            prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
         )
 
         suffix_out = suffix_out[:, -self.config.chunk_size :]
