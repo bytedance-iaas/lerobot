@@ -23,6 +23,11 @@ from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
 
 import torch
 import torch.nn.functional as F  # noqa: N812
+
+try:  # optional: Ascend NPU fused kernels
+    import torch_npu
+except ImportError:
+    torch_npu = None
 from torch import Tensor, nn
 
 from lerobot.utils.import_utils import _transformers_available, require_package
@@ -278,14 +283,34 @@ def compute_layer_complete(inputs_embeds, attention_mask, position_ids, adarms_c
     paligemma_layer = layers[0]
     scaling = paligemma_layer.self_attn.scaling
     # Attention computation
-    att_output, _ = modeling_gemma.eager_attention_forward(
-        paligemma_layer.self_attn,
-        query_states,
-        key_states,
-        value_states,
-        attention_mask,
-        scaling,
-    )
+    if torch_npu is not None and query_states.device.type == "npu":
+        # npu_fusion_attention handles grouped-query attention natively, so the single
+        # key/value head is not expanded to 8 here. Its atten_mask marks the positions
+        # to drop, which is the inverse of the additive mask the eager path adds in.
+        atten_mask = (
+            (attention_mask < -1e30)
+            .expand(batch_size, 1, query_states.shape[2], attention_mask.shape[-1])
+            .contiguous()
+        )
+        att_output = torch_npu.npu_fusion_attention(
+            query_states,
+            key_states,
+            value_states,
+            head_num=query_states.shape[1],
+            input_layout="BNSD",
+            atten_mask=atten_mask,
+            scale=scaling,
+            keep_prob=1.0,
+        )[0].transpose(1, 2)
+    else:
+        att_output, _ = modeling_gemma.eager_attention_forward(
+            paligemma_layer.self_attn,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            scaling,
+        )
     # Get head_dim from the current layer, not from the model
     head_dim = paligemma_layer.self_attn.head_dim
     att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)
@@ -818,8 +843,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             )
             return suffix_out
 
-        suffix_out = self._apply_checkpoint(
-            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+        # The decoder layers inside forward_func are already checkpointed one by one
+        # (see PaliGemmaWithExpertModel.forward), so wrapping the whole stack a second
+        # time only buys a third forward pass per step at no memory saving.
+        suffix_out = forward_func(
+            prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
         )
 
         suffix_out = suffix_out[:, -self.config.chunk_size :]
