@@ -24,6 +24,11 @@ from typing import TYPE_CHECKING, Any, Unpack, cast
 
 import torch
 import torch.nn.functional as F  # noqa: N812
+
+try:  # optional: Ascend NPU fused kernels
+    import torch_npu
+except ImportError:
+    torch_npu = None
 from torch import Tensor, nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
@@ -176,7 +181,7 @@ def _no_grad_if(enabled: bool):
 def _joint_attention(
     self_attn, query_states, key_states, value_states, attention_mask, scaling, fp32_attention
 ):
-    """Joint-layer attention: eager by default, FP32 SDPA on the math backend when requested."""
+    """Joint-layer attention: eager by default, Ascend fused on NPU, FP32 SDPA when requested."""
     if fp32_attention:
         # Large Q/K activations at low flow timesteps destabilize BF16 eager scores
         # and can amplify reduced-precision SDPA backward as well. Run attention in
@@ -193,6 +198,27 @@ def _joint_attention(
                 scaling,
             )
         return att_output.to(attention_dtype)
+    if torch_npu is not None and query_states.device.type == "npu" and attention_mask is not None:
+        # npu_fusion_attention handles grouped-query attention natively, so the single key/value
+        # head is not expanded here. Its atten_mask marks the positions to DROP, the inverse of
+        # the additive mask the eager path adds in.
+        atten_mask = (
+            (attention_mask < -1e30)
+            .expand(
+                query_states.shape[0], 1, query_states.shape[2], attention_mask.shape[-1]
+            )
+            .contiguous()
+        )
+        return torch_npu.npu_fusion_attention(
+            query_states,
+            key_states,
+            value_states,
+            head_num=query_states.shape[1],
+            input_layout="BNSD",
+            atten_mask=atten_mask,
+            scale=scaling,
+            keep_prob=1.0,
+        )[0].transpose(1, 2)
     att_output, _ = modeling_gemma.eager_attention_forward(
         self_attn,
         query_states,
