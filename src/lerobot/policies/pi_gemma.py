@@ -19,6 +19,11 @@ from typing import TYPE_CHECKING
 import torch
 from torch import nn
 
+try:  # optional: Ascend NPU fused kernels
+    import torch_npu
+except ImportError:
+    torch_npu = None
+
 from lerobot.utils.import_utils import _transformers_available
 
 if TYPE_CHECKING or _transformers_available:
@@ -114,12 +119,16 @@ class PiGemmaRMSNorm(nn.Module):
         cond: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         dtype = x.dtype
-        normed = self._norm(x)
         if cond is None or self.dense is None:
-            normed = normed * (1.0 + self.weight.float())
+            if torch_npu is not None and x.device.type == "npu":
+                # npu_rms_norm folds square-mean, rsqrt and the gamma multiply into one kernel.
+                gamma = (1.0 + self.weight.float()).to(dtype)
+                return torch_npu.npu_rms_norm(x, gamma, epsilon=self.eps)[0], None
+            normed = self._norm(x) * (1.0 + self.weight.float())
             return normed.type_as(x), None
         if cond.shape[-1] != self.cond_dim:
             raise ValueError(f"Expected cond dim {self.cond_dim}, got {cond.shape[-1]}")
+        normed = self._norm(x)
         modulation = self.dense(cond)
         if len(x.shape) == 3:
             modulation = modulation.unsqueeze(1)
