@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import abc
+import logging
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -23,6 +24,7 @@ import draccus
 import torch
 from safetensors.torch import load_file, save_file
 
+from lerobot.optim.npu_fused_adamw import NpuFusedAdamW, is_npu_fused_adamw_available
 from lerobot.utils.constants import (
     OPTIMIZER_PARAM_GROUPS,
     OPTIMIZER_STATE,
@@ -104,10 +106,22 @@ class AdamWConfig(OptimizerConfig):
     eps: float = 1e-8
     weight_decay: float = 1e-2
     grad_clip_norm: float = 10.0
+    # Opt-in: route the update through Ascend's fused npu_apply_adam_w kernel.
+    # Off by default because it is not bit-identical to torch.optim.AdamW.
+    use_npu_fused: bool = False
 
     def build(self, params: OptimizerParams) -> torch.optim.Optimizer:
         kwargs = asdict(self)
         kwargs.pop("grad_clip_norm")
+        use_npu_fused = kwargs.pop("use_npu_fused")
+        if use_npu_fused and is_npu_fused_adamw_available():
+            logging.info("Using NpuFusedAdamW (Ascend fused npu_apply_adam_w)")
+            return NpuFusedAdamW(params, **kwargs)
+        if use_npu_fused:
+            logging.warning(
+                "use_npu_fused was requested but npu_apply_adam_w is unavailable; "
+                "falling back to torch.optim.AdamW"
+            )
         return torch.optim.AdamW(params, **kwargs)
 
 
