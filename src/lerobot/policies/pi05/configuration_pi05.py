@@ -79,6 +79,7 @@ class PI05Config(PreTrainedConfig):
 
     # Training settings
     gradient_checkpointing: bool = False  # Enable gradient checkpointing for memory optimization
+    npu_fused_geglu: bool = False  # Fuse Gemma GELU(tanh) and gating, including backward, on NPU
     compile_model: bool = False  # Whether to use torch.compile for model optimization
     compile_mode: str = "max-autotune"  # Torch compile mode
     device: str | None = None  # Device to use for the model (None = auto-detect)

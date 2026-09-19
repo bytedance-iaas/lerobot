@@ -461,6 +461,14 @@ class PaliGemmaWithExpertModel(
         # Runs AFTER to_bfloat16_for_selected_params so weights are copied in their final dtype.
         configure_vlm_mlp_fp8(self.paligemma.model.language_model.layers, config)
 
+        if getattr(config, "npu_fused_geglu", False):
+            if self.vlm_mlp_fp8_enable:
+                raise ValueError("npu_fused_geglu cannot be combined with vlm_mlp_fp8_enable")
+            from .npu_geglu import configure_npu_geglu
+
+            configure_npu_geglu(self.paligemma.model.language_model.layers)
+            configure_npu_geglu(self.gemma_expert.model.layers)
+
     def to_bfloat16_for_selected_params(self, precision: Literal["bfloat16", "float32"] = "bfloat16"):
         if precision == "bfloat16":
             self.to(dtype=torch.bfloat16)
