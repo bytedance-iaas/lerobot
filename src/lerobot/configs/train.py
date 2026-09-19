@@ -173,6 +173,8 @@ class TrainPipelineConfig(HubMixin):
     # Model-artifact format inside checkpoints; non-default values require a sharded run.
     checkpoint_format: CheckpointFormat = CheckpointFormat.SAFETENSORS
     use_policy_training_preset: bool = True
+    # Opt-in foreach scaling for single-NPU gradients; other paths use Accelerator.
+    npu_fused_grad_clip: bool = False
     optimizer: OptimizerConfig | None = None
     scheduler: LRSchedulerConfig | None = None
     # Process topology: dp_replicate / dp_shard (HSDP) and context-parallel degree placeholders.

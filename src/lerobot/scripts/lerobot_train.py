@@ -81,6 +81,7 @@ from lerobot.envs import EnvConfig, close_envs, make_env, make_env_pre_post_proc
 from lerobot.jobs import submit_to_hf
 from lerobot.optim.ema import EMA
 from lerobot.optim.factory import make_optimizer_and_scheduler
+from lerobot.optim.grad_clip import clip_grad_norm_npu_
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
 from lerobot.policies.factory import ProcessorConfigKwargs
 from lerobot.processor import ImageAugmentationProcessorStep
@@ -189,6 +190,7 @@ def update_policy(
     lock: AbstractContextManager[Any] | None = None,
     sample_weighter: SampleWeighter | None = None,
     ema: EMA | None = None,
+    npu_fused_grad_clip: bool = False,
 ) -> tuple[MetricsTracker, dict | None]:
     """
     Performs a single training step to update the policy's weights.
@@ -219,6 +221,8 @@ def update_policy(
             per-sample loss weighting. Defaults to None.
         ema (EMA | None, optional): The EMA of the policy weights, stepped after every applied
             optimizer update. Defaults to None.
+        npu_fused_grad_clip (bool, optional): Use the opt-in single-NPU foreach scaling path
+            instead of accelerate's clipping. Defaults to False.
 
     Returns:
         tuple[MetricsTracker, dict | None]: The updated MetricsTracker with new statistics for this
@@ -274,7 +278,10 @@ def update_policy(
         # an exact match with the prepared model's parameters for a globally correct norm.
         grad_norm = None
         if accelerator.sync_gradients and grad_clip_norm > 0:
-            grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+            if npu_fused_grad_clip:
+                grad_norm = clip_grad_norm_npu_(accelerator, policy.parameters(), grad_clip_norm)
+            else:
+                grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
 
         # Optimizer step (a no-op on non-final micro-batches under gradient accumulation).
         # Under fp16 the scaler runs it and skips it whenever a gradient overflowed.
@@ -871,6 +878,7 @@ def train(cfg: TrainPipelineConfig) -> None:
             lr_scheduler=lr_scheduler,
             sample_weighter=sample_weighter,
             ema=ema,
+            npu_fused_grad_clip=cfg.npu_fused_grad_clip,
         )
         train_tracker.step_s = time.perf_counter() - step_start
 
