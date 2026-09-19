@@ -54,6 +54,7 @@ from lerobot.datasets.factory import make_train_eval_datasets
 from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
 from lerobot.jobs import submit_to_hf
 from lerobot.optim.factory import make_optimizer_and_scheduler
+from lerobot.optim.grad_clip import clip_grad_norm_npu_
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
 from lerobot.rewards import make_reward_pre_post_processors
 from lerobot.utils.collate import lerobot_collate_fn
@@ -81,6 +82,7 @@ def update_policy(
     lr_scheduler=None,
     lock=None,
     sample_weighter=None,
+    npu_fused_grad_clip: bool = False,
 ) -> tuple[MetricsTracker, dict | None]:
     """
     Performs a single training step to update the policy's weights.
@@ -98,6 +100,7 @@ def update_policy(
         lr_scheduler: An optional learning rate scheduler.
         lock: An optional lock for thread-safe optimizer updates.
         sample_weighter: Optional SampleWeighter instance for per-sample loss weighting.
+        npu_fused_grad_clip: Enable the opt-in single-NPU foreach scaling path.
 
     Returns:
         A tuple containing:
@@ -145,7 +148,10 @@ def update_policy(
 
     # Clip gradients if specified
     if grad_clip_norm > 0:
-        grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+        if npu_fused_grad_clip:
+            grad_norm = clip_grad_norm_npu_(accelerator, policy.parameters(), grad_clip_norm)
+        else:
+            grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
     else:
         grad_norm = torch.nn.utils.clip_grad_norm_(
             policy.parameters(), float("inf"), error_if_nonfinite=False
@@ -588,6 +594,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             accelerator=accelerator,
             lr_scheduler=lr_scheduler,
             sample_weighter=sample_weighter,
+            npu_fused_grad_clip=cfg.npu_fused_grad_clip,
         )
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
