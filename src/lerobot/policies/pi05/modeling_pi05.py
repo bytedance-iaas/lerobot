@@ -89,6 +89,7 @@ from ..pretrained import PreTrainedPolicy, RTCActionSelectKwargs, T
 from ..rtc.modeling_rtc import RTCProcessor
 from .configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
 from .memory import encode_video_with_mem, sample_observation_history
+from .rope import RotaryCache, apply_rotary_pos_emb_npu, cached_rotary_embeddings
 
 
 def _prepare_trained_rtc_prefix(
@@ -248,6 +249,8 @@ def compute_layer_complete(
     suppress_prefix_grads: bool = False,
     attention_fn: JointAttentionFn | None = None,
     norm_backend=None,
+    rotary_cache: RotaryCache | None = None,
+    npu_fused_rope: bool = False,
 ):
     """Run one joint PaliGemma + action-expert layer.
 
@@ -259,6 +262,8 @@ def compute_layer_complete(
             ``"vlm"`` / ``"action"`` for the two query groups under knowledge insulation.
         norm_backend: Optional fused-norm kernels exposing ``input_norm(norm, x, cond)`` and
             ``residual_norm(norm, residual, out, gate, cond)``.
+        rotary_cache: Precomputed cos/sin reused across layers instead of recomputing per layer.
+        npu_fused_rope: Apply the rotary embedding with the Ascend fused kernel.
     """
     query_states = []
     key_states = []
@@ -286,17 +291,23 @@ def compute_layer_complete(
     query_states = torch.cat(query_states, dim=2)
     key_states = torch.cat(key_states, dim=2)
     value_states = torch.cat(value_states, dim=2)
-    dummy_tensor = torch.zeros(
-        query_states.shape[0],
-        query_states.shape[2],
-        query_states.shape[-1],
-        device=query_states.device,
-        dtype=query_states.dtype,
-    )
-    cos, sin = rotary_emb(dummy_tensor, position_ids)
-    query_states, key_states = modeling_gemma.apply_rotary_pos_emb(
-        query_states, key_states, cos, sin, unsqueeze_dim=1
-    )
+    if rotary_cache is not None:
+        cos, sin = cached_rotary_embeddings(rotary_emb, query_states, position_ids, rotary_cache)
+    else:
+        dummy_tensor = torch.zeros(
+            query_states.shape[0],
+            query_states.shape[2],
+            query_states.shape[-1],
+            device=query_states.device,
+            dtype=query_states.dtype,
+        )
+        cos, sin = rotary_emb(dummy_tensor, position_ids)
+    if npu_fused_rope:
+        query_states, key_states = apply_rotary_pos_emb_npu(query_states, key_states, cos, sin)
+    else:
+        query_states, key_states = modeling_gemma.apply_rotary_pos_emb(
+            query_states, key_states, cos, sin, unsqueeze_dim=1
+        )
     batch_size = query_states.shape[0]
     paligemma_layer = layers[0]
     scaling = paligemma_layer.self_attn.scaling
@@ -429,6 +440,8 @@ class PaliGemmaWithExpertModel(
         super().__init__()
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
+        self.reuse_rope_embeddings = getattr(config, "reuse_rope_embeddings", False)
+        self.npu_fused_rope = getattr(config, "npu_fused_rope", False)
 
         # VLM MLP FP8 (Transformer Engine). Recipe is built once here; the swap happens after
         # the model is materialized in its final dtype (see below). All no-ops unless enabled.
@@ -629,6 +642,9 @@ class PaliGemmaWithExpertModel(
             paligemma_layers = self.paligemma.model.language_model.layers
             gemma_expert_layers = self.gemma_expert.model.layers
             rotary_emb = self.paligemma.model.language_model.rotary_emb
+            # A new cache per forward prevents stale positions across batches and
+            # stays attached to the correct forward during checkpoint recomputation.
+            rotary_cache = {} if self.reuse_rope_embeddings else None
 
             # Check if gradient checkpointing is enabled for any of the models
             use_gradient_checkpointing = (
@@ -660,6 +676,8 @@ class PaliGemmaWithExpertModel(
                             suppress_prefix_grads=suppress_prefix_grads,
                             attention_fn=attention_fn,
                             norm_backend=norm_backend,
+                            rotary_cache=rotary_cache,
+                            npu_fused_rope=self.npu_fused_rope,
                         )
                     else:
                         inputs_embeds = compute_layer_complete(
@@ -674,6 +692,8 @@ class PaliGemmaWithExpertModel(
                             suppress_prefix_grads=suppress_prefix_grads,
                             attention_fn=attention_fn,
                             norm_backend=norm_backend,
+                            rotary_cache=rotary_cache,
+                            npu_fused_rope=self.npu_fused_rope,
                         )
 
             # final norm
