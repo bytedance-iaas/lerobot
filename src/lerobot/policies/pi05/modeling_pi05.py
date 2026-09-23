@@ -251,6 +251,7 @@ def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
 def compute_layer_complete(
     inputs_embeds, attention_mask, position_ids, adarms_cond, layers, rotary_emb,
     rotary_cache: RotaryCache | None = None, npu_fused_rope: bool = False,
+    npu_fused_attention: bool = True,
 ):
     query_states = []
     key_states = []
@@ -293,7 +294,7 @@ def compute_layer_complete(
     paligemma_layer = layers[0]
     scaling = paligemma_layer.self_attn.scaling
     # Attention computation
-    if torch_npu is not None and query_states.device.type == "npu":
+    if torch_npu is not None and query_states.device.type == "npu" and npu_fused_attention:
         # npu_fusion_attention handles grouped-query attention natively, so the single
         # key/value head is not expanded to 8 here. Its atten_mask marks the positions
         # to drop, which is the inverse of the additive mask the eager path adds in.
@@ -417,6 +418,8 @@ class PaliGemmaWithExpertModel(
         self.train_expert_only = train_expert_only
         self.reuse_rope_embeddings = getattr(config, "reuse_rope_embeddings", False)
         self.npu_fused_rope = getattr(config, "npu_fused_rope", False)
+        self.npu_fused_attention = getattr(config, "npu_fused_attention", True)
+        npu_fused_rms_norm = getattr(config, "npu_fused_rms_norm", True)
 
         # VLM MLP FP8 (Transformer Engine). Recipe is built once here; the swap happens after
         # the model is materialized in its final dtype (see below). All no-ops unless enabled.
@@ -442,6 +445,7 @@ class PaliGemmaWithExpertModel(
         vlm_config_hf.text_config.vocab_size = 257152
         vlm_config_hf.text_config.use_adarms = use_adarms[0]
         vlm_config_hf.text_config.adarms_cond_dim = vlm_config.width if use_adarms[0] else None
+        vlm_config_hf.text_config.npu_fused_rms_norm = npu_fused_rms_norm
         vlm_config_hf.vision_config.image_size = image_size
         vlm_config_hf.vision_config.intermediate_size = 4304
         vlm_config_hf.vision_config.projection_dim = 2048
@@ -460,6 +464,7 @@ class PaliGemmaWithExpertModel(
             dtype="float32",
             use_adarms=use_adarms[1],
             adarms_cond_dim=action_expert_config.width if use_adarms[1] else None,
+            npu_fused_rms_norm=npu_fused_rms_norm,
         )
 
         self.paligemma = PaliGemmaForConditionalGenerationWithPiGemma(config=vlm_config_hf)
@@ -610,6 +615,7 @@ class PaliGemmaWithExpertModel(
                             rotary_emb=rotary_emb,
                             rotary_cache=rotary_cache,
                             npu_fused_rope=self.npu_fused_rope,
+                            npu_fused_attention=self.npu_fused_attention,
                         )
                     else:
                         inputs_embeds = compute_layer_complete(
@@ -621,6 +627,7 @@ class PaliGemmaWithExpertModel(
                             rotary_emb=rotary_emb,
                             rotary_cache=rotary_cache,
                             npu_fused_rope=self.npu_fused_rope,
+                            npu_fused_attention=self.npu_fused_attention,
                         )
 
             # final norm
