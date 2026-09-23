@@ -80,11 +80,6 @@ class PI05Config(PreTrainedConfig):
     # Training settings
     gradient_checkpointing: bool = False  # Enable gradient checkpointing for memory optimization
     npu_fused_geglu: bool = False  # Fuse Gemma GELU(tanh) and gating, including backward, on NPU
-    # These two default to True because they were unconditional before the flags existed;
-    # setting them False restores the eager path. On a 16-card run they measured as a net
-    # loss (fused attention about -3%, fused RMSNorm about -1.4%): each one makes the step's
-    # compute cheaper but raises host-side pressure, which starves the dataloader workers.
-    # Single-card runs are unaffected, their dataloading is under 1% of step time.
     npu_fused_rms_norm: bool = True  # Fold RMSNorm into torch_npu.npu_rms_norm on NPU
     npu_fused_attention: bool = True  # Use torch_npu.npu_fusion_attention instead of eager attention
     reuse_rope_embeddings: bool = False  # Reuse cos/sin across layers of one joint forward
