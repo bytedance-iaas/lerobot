@@ -180,7 +180,15 @@ def _no_grad_if(enabled: bool):
 
 
 def _joint_attention(
-    self_attn, query_states, key_states, value_states, attention_mask, scaling, fp32_attention
+    self_attn,
+    query_states,
+    key_states,
+    value_states,
+    attention_mask,
+    scaling,
+    fp32_attention,
+    *,
+    npu_fused_attention: bool = True,
 ):
     """Joint-layer attention: eager by default, Ascend fused on NPU, FP32 SDPA when requested."""
     if fp32_attention:
@@ -199,7 +207,12 @@ def _joint_attention(
                 scaling,
             )
         return att_output.to(attention_dtype)
-    if torch_npu is not None and query_states.device.type == "npu" and attention_mask is not None:
+    if (
+        npu_fused_attention
+        and torch_npu is not None
+        and query_states.device.type == "npu"
+        and attention_mask is not None
+    ):
         # npu_fusion_attention handles grouped-query attention natively, so the single key/value
         # head is not expanded here. Its atten_mask marks the positions to DROP, the inverse of
         # the additive mask the eager path adds in.
@@ -251,6 +264,7 @@ def compute_layer_complete(
     norm_backend=None,
     rotary_cache: RotaryCache | None = None,
     npu_fused_rope: bool = False,
+    npu_fused_attention: bool = True,
 ):
     """Run one joint PaliGemma + action-expert layer.
 
@@ -264,6 +278,7 @@ def compute_layer_complete(
             ``residual_norm(norm, residual, out, gate, cond)``.
         rotary_cache: Precomputed cos/sin reused across layers instead of recomputing per layer.
         npu_fused_rope: Apply the rotary embedding with the Ascend fused kernel.
+        npu_fused_attention: Allow the Ascend fused attention kernel (NPU only).
     """
     query_states = []
     key_states = []
@@ -315,7 +330,10 @@ def compute_layer_complete(
     def attend(query, key, value, mask, part):
         if attention_fn is not None:
             return attention_fn(paligemma_layer.self_attn, query, key, value, mask, scaling, part)
-        return _joint_attention(paligemma_layer.self_attn, query, key, value, mask, scaling, fp32_attention)
+        return _joint_attention(
+            paligemma_layer.self_attn, query, key, value, mask, scaling, fp32_attention,
+            npu_fused_attention=npu_fused_attention,
+        )
 
     if knowledge_insulation:
         # Detach VLM K/V only on the path the action queries use (pi0.5 knowledge insulation).
@@ -442,6 +460,8 @@ class PaliGemmaWithExpertModel(
         self.train_expert_only = train_expert_only
         self.reuse_rope_embeddings = getattr(config, "reuse_rope_embeddings", False)
         self.npu_fused_rope = getattr(config, "npu_fused_rope", False)
+        self.npu_fused_attention = getattr(config, "npu_fused_attention", True)
+        npu_fused_rms_norm = getattr(config, "npu_fused_rms_norm", True)
 
         # VLM MLP FP8 (Transformer Engine). Recipe is built once here; the swap happens after
         # the model is materialized in its final dtype (see below). All no-ops unless enabled.
@@ -467,6 +487,7 @@ class PaliGemmaWithExpertModel(
         vlm_config_hf.text_config.vocab_size = 257152
         vlm_config_hf.text_config.use_adarms = use_adarms[0]
         vlm_config_hf.text_config.adarms_cond_dim = vlm_config.width if use_adarms[0] else None
+        vlm_config_hf.text_config.npu_fused_rms_norm = npu_fused_rms_norm
         vlm_config_hf.vision_config.image_size = image_size
         vlm_config_hf.vision_config.intermediate_size = 4304
         vlm_config_hf.vision_config.projection_dim = 2048
@@ -485,6 +506,7 @@ class PaliGemmaWithExpertModel(
             dtype="float32",
             use_adarms=use_adarms[1],
             adarms_cond_dim=action_expert_config.width if use_adarms[1] else None,
+            npu_fused_rms_norm=npu_fused_rms_norm,
         )
 
         self.paligemma = PaliGemmaForConditionalGenerationWithPiGemma(config=vlm_config_hf)
@@ -678,6 +700,7 @@ class PaliGemmaWithExpertModel(
                             norm_backend=norm_backend,
                             rotary_cache=rotary_cache,
                             npu_fused_rope=self.npu_fused_rope,
+                            npu_fused_attention=self.npu_fused_attention,
                         )
                     else:
                         inputs_embeds = compute_layer_complete(
@@ -694,6 +717,7 @@ class PaliGemmaWithExpertModel(
                             norm_backend=norm_backend,
                             rotary_cache=rotary_cache,
                             npu_fused_rope=self.npu_fused_rope,
+                            npu_fused_attention=self.npu_fused_attention,
                         )
 
             # final norm

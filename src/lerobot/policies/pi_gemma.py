@@ -100,11 +100,18 @@ class PiGemmaRMSNorm(nn.Module):
     own flow timestep (arXiv 2512.05964); it adds no parameters.
     """
 
-    def __init__(self, dim: int, eps: float = 1e-6, cond_dim: int | None = None):
+    def __init__(
+        self,
+        dim: int,
+        eps: float = 1e-6,
+        cond_dim: int | None = None,
+        use_npu_fused: bool = True,
+    ):
         super().__init__()
         self.eps = eps
         self.dim = dim
         self.cond_dim = cond_dim
+        self.use_npu_fused = use_npu_fused
         if cond_dim is not None:
             self.dense = nn.Linear(cond_dim, dim * 3, bias=True)
             nn.init.zeros_(self.dense.weight)
@@ -126,7 +133,7 @@ class PiGemmaRMSNorm(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         dtype = x.dtype
         if cond is None or self.dense is None:
-            if torch_npu is not None and x.device.type == "npu":
+            if torch_npu is not None and x.device.type == "npu" and self.use_npu_fused:
                 # npu_rms_norm folds square-mean, rsqrt and the gamma multiply into one kernel.
                 gamma = (1.0 + self.weight.float()).to(dtype)
                 return torch_npu.npu_rms_norm(x, gamma, epsilon=self.eps)[0], None
@@ -170,11 +177,18 @@ def _get_pi_gemma_decoder_layer_base():
             cond_dim = (
                 getattr(config, "adarms_cond_dim", None) if getattr(config, "use_adarms", False) else None
             )
+            use_npu_fused = getattr(config, "npu_fused_rms_norm", True)
             self.input_layernorm = PiGemmaRMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps, cond_dim=cond_dim
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                cond_dim=cond_dim,
+                use_npu_fused=use_npu_fused,
             )
             self.post_attention_layernorm = PiGemmaRMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps, cond_dim=cond_dim
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                cond_dim=cond_dim,
+                use_npu_fused=use_npu_fused,
             )
 
         def forward(
@@ -238,7 +252,10 @@ class PiGemmaModel(GemmaModel):
             [pi_gemma_decoder_layer_base(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm: PiGemmaRMSNorm = PiGemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, cond_dim=cond_dim
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            cond_dim=cond_dim,
+            use_npu_fused=getattr(config, "npu_fused_rms_norm", True),
         )
 
     def forward(
