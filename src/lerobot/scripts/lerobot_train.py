@@ -545,6 +545,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         # true straggler instead of rank 0's view.
         "update_s": AverageMeter("updt_s", ":.3f", reduction="max"),
         "dataloading_s": AverageMeter("data_s", ":.3f", reduction="max"),
+        "step_s": AverageMeter("step_s", ":.3f", reduction="max"),
         # Derived from the post-reduce max step time; set once per log window on the main rank.
         "samples_per_s": AverageMeter("smp/s", ":.0f"),
     }
@@ -596,6 +597,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             sample_weighter=sample_weighter,
             npu_fused_grad_clip=cfg.npu_fused_grad_clip,
         )
+        train_tracker.step_s = time.perf_counter() - start_time
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
         # increment `step` here.
@@ -612,9 +614,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             # Collective reduce must run on every rank, before the main-process gate below.
             train_tracker.reduce_across_ranks()
             if is_main_process:
-                # Cluster-wide throughput, derived from the already-reduced (max) step time so it
-                # reflects the slowest rank — which is what actually gates the next iteration.
-                step_time = train_tracker.update_s.avg + train_tracker.dataloading_s.avg
+                # Cluster-wide throughput from the slowest rank's whole-step wall time, which
+                # is what actually gates the next iteration. Deliberately NOT update_s + data_s:
+                # see the step_s comment where the meter is declared.
+                step_time = train_tracker.step_s.avg
                 if step_time > 0:
                     train_tracker.samples_per_s = effective_batch_size / step_time
                 logging.info(train_tracker)
