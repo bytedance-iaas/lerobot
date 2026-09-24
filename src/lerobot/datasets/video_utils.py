@@ -104,6 +104,17 @@ def decode_video_frames(
         raise ValueError(f"Unsupported video backend: {backend}")
 
 
+_PYAV_DECODER_THREADS = int(os.environ.get("LEROBOT_PYAV_THREADS", "1"))
+
+
+def _pyav_video_stream(container):
+    """Pick the video stream and cap its decoder thread count."""
+    stream = container.streams.video[0]
+    if _PYAV_DECODER_THREADS:
+        stream.thread_count = _PYAV_DECODER_THREADS
+    return stream
+
+
 def decode_video_frames_pyav(
     video_path: Path | str,
     timestamps: list[float],
@@ -152,7 +163,7 @@ def decode_video_frames_pyav(
     # before `first_ts`, so we can then decode forward until we cover `last_ts`. See:
     # https://pyav.basswood-io.com/docs/stable/api/container.html#av.container.InputContainer.seek
     with av.open(video_path) as container:
-        stream = container.streams.video[0]
+        stream = _pyav_video_stream(container)
         # Seek to the nearest keyframe at or before `first_ts` with a 1 frame margin
         container.seek(
             round(first_ts / stream.time_base) - 1,

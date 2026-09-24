@@ -116,6 +116,11 @@ class TrainPipelineConfig(HubMixin):
     use_policy_training_preset: bool = True
     # Opt-in foreach scaling for single-NPU gradients; other paths use Accelerator.
     npu_fused_grad_clip: bool = False
+    # DDP reducer settings.
+    ddp_bucket_cap_mb: int = 200
+    ddp_gradient_as_bucket_view: bool = True
+    ddp_find_unused_parameters: bool = True
+    ddp_static_graph: bool = False
     optimizer: OptimizerConfig | None = None
     scheduler: LRSchedulerConfig | None = None
     eval: EvalConfig = field(default_factory=EvalConfig)
