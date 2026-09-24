@@ -822,7 +822,11 @@ def train(cfg: TrainPipelineConfig) -> None:
         "dataloading_s": AverageMeter("data_s", ":.3f", reduction="max"),
         "preprocessing_s": AverageMeter("prep_s", ":.3f", reduction="max"),
         "update_s": AverageMeter("updt_s", ":.3f", reduction="max"),
+        # step_s is the whole-step wall time and the ONLY correct throughput basis. Deliberately
+        # not update_s + data_s: that double-counts the prefetch the dataloader already hides
+        # behind the update, and overstates samples/s.
         "step_s": AverageMeter("step_s", ":.3f", reduction="max"),
+        # Derived from the post-reduce max step time; set once per log window on the main rank.
         "samples_per_s": AverageMeter("smp/s", ":.0f"),
     }
     if accelerator.scaler is not None:
@@ -897,6 +901,8 @@ def train(cfg: TrainPipelineConfig) -> None:
             # Collective reduce must run on every rank, before the main-process gate below.
             train_tracker.reduce_across_ranks()
             if is_main_process():
+                # Cluster-wide throughput from the slowest rank's whole-step wall time, which is
+                # what actually gates the next iteration.
                 if train_tracker.step_s.avg > 0:
                     train_tracker.samples_per_s = samples_per_step / train_tracker.step_s.avg
                 logging.info(train_tracker)
