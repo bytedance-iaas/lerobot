@@ -211,9 +211,14 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     # Create Accelerator if not provided
     # It will automatically detect if running in distributed mode or single-process mode
     # We set step_scheduler_with_optimizer=False to prevent accelerate from adjusting the lr_scheduler steps based on the num_processes
-    # We set find_unused_parameters=True to handle models with conditional computation
     if accelerator is None:
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        _find_unused = cfg.ddp_find_unused_parameters and not cfg.ddp_static_graph
+        ddp_kwargs = DistributedDataParallelKwargs(
+            find_unused_parameters=_find_unused,
+            static_graph=cfg.ddp_static_graph,
+            bucket_cap_mb=cfg.ddp_bucket_cap_mb,
+            gradient_as_bucket_view=cfg.ddp_gradient_as_bucket_view,
+        )
         # Accelerate auto-detects the device based on the available hardware and ignores the policy.device setting.
         # Force the device to be CPU when the active config's device is set to CPU (works for both policy and reward model training).
         force_cpu = cfg.trainable_config.device == "cpu"
@@ -344,6 +349,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             },
             "rename_observations_processor": {"rename_map": cfg.rename_map},
         }
+        _tok_max = getattr(active_cfg, "tokenizer_max_length", None)
+        if _tok_max is not None:
+            preprocessor_overrides["tokenizer_processor"] = {"max_length": int(_tok_max)}
         postprocessor_overrides = {
             "unnormalizer_processor": {
                 "stats": dataset.meta.stats,
