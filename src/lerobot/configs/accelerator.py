@@ -146,6 +146,10 @@ class DDPConfig:
     find_unused_parameters: bool = True
     gradient_as_bucket_view: bool = False
     static_graph: bool = False
+    # Gradient bucket size for the reducer. None keeps torch's 25 MB default. There is no
+    # portable best value -- it is worth ~2.6 MFU points on pi05/950PR at 200, and nothing or
+    # worse elsewhere, so it has to be measured per model.
+    bucket_cap_mb: int | None = None
 
     def build_kwargs_handler(self) -> "DistributedDataParallelKwargs":
         """Build the DDP kwargs handler for `Accelerator(kwargs_handlers=[...])`.
@@ -156,11 +160,16 @@ class DDPConfig:
         """
         from accelerate.utils import DistributedDataParallelKwargs
 
-        return DistributedDataParallelKwargs(
-            find_unused_parameters=self.find_unused_parameters,
-            gradient_as_bucket_view=self.gradient_as_bucket_view,
-            static_graph=self.static_graph,
-        )
+        kwargs: dict = {
+            # static_graph already tells the reducer the parameter set is fixed, so the unused-parameter
+            # search is both redundant and rejected by torch when combined with it.
+            "find_unused_parameters": self.find_unused_parameters and not self.static_graph,
+            "gradient_as_bucket_view": self.gradient_as_bucket_view,
+            "static_graph": self.static_graph,
+        }
+        if self.bucket_cap_mb is not None:
+            kwargs["bucket_cap_mb"] = self.bucket_cap_mb
+        return DistributedDataParallelKwargs(**kwargs)
 
 
 @dataclass

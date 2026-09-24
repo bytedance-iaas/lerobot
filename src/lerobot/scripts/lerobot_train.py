@@ -684,6 +684,9 @@ def train(cfg: TrainPipelineConfig) -> None:
             },
             "rename_observations_processor": {"rename_map": cfg.rename_map},
         }
+        _tok_max = getattr(active_cfg, "tokenizer_max_length", None)
+        if _tok_max is not None:
+            preprocessor_overrides["tokenizer_processor"] = {"max_length": int(_tok_max)}
         postprocessor_overrides = {
             "unnormalizer_processor": {
                 "features": policy.config.output_features,
