@@ -30,6 +30,7 @@ torchrun --nproc-per-node=8 $(which lerobot-train) \
 
 import dataclasses
 import logging
+import os
 import sys
 import time
 from collections.abc import Iterator
@@ -177,6 +178,61 @@ def _preprocess_dataset_batch(
             batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
     batch = rename_batch_keys(batch, rename_map)
     return preprocessor(batch)
+
+class _NullProfiler:
+    """Stand-in used when profiling is off, so the loop needs no conditional."""
+
+    def start(self) -> None:
+        pass
+
+    def step(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+
+def _make_profiler(rank: int):
+    """Ascend profiler when LEROBOT_PROF=1, else a no-op stand-in.
+
+    Writes ASCEND_PROFILER_OUTPUT/step_trace_time.csv, whose Computing /
+    Communication / Overlapped / Free columns show how much of the gradient
+    all-reduce is hidden behind compute. Profiler level Level1 is the lowest
+    that emits the HCCL data those columns are derived from.
+
+    Env: LEROBOT_PROF_DIR, LEROBOT_PROF_{SKIP,WAIT,WARMUP,ACTIVE},
+    LEROBOT_PROF_RANKS ("0", "0,8" or "all"), LEROBOT_PROF_SHAPES.
+    """
+    if os.environ.get("LEROBOT_PROF", "0") != "1":
+        return _NullProfiler()
+
+    wanted = os.environ.get("LEROBOT_PROF_RANKS", "0")
+    if wanted != "all" and rank not in {int(r) for r in wanted.split(",") if r.strip()}:
+        return _NullProfiler()
+
+    import torch_npu
+
+    prof_dir = os.environ.get("LEROBOT_PROF_DIR", "./prof")
+    experimental_config = torch_npu.profiler._ExperimentalConfig(
+        profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+    )
+    logging.info(f"NPU profiler enabled on rank {rank}, writing to {prof_dir}")
+    return torch_npu.profiler.profile(
+        activities=[
+            torch_npu.profiler.ProfilerActivity.CPU,
+            torch_npu.profiler.ProfilerActivity.NPU,
+        ],
+        schedule=torch_npu.profiler.schedule(
+            skip_first=int(os.environ.get("LEROBOT_PROF_SKIP", "60")),
+            wait=int(os.environ.get("LEROBOT_PROF_WAIT", "0")),
+            warmup=int(os.environ.get("LEROBOT_PROF_WARMUP", "1")),
+            active=int(os.environ.get("LEROBOT_PROF_ACTIVE", "4")),
+            repeat=1,
+        ),
+        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(prof_dir),
+        record_shapes=os.environ.get("LEROBOT_PROF_SHAPES", "0") == "1",
+        experimental_config=experimental_config,
+    )
 
 
 def update_policy(
@@ -862,6 +918,9 @@ def train(cfg: TrainPipelineConfig) -> None:
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
         )
 
+    profiler = _make_profiler(accelerator.process_index)
+    profiler.start()
+
     for _ in range(step, cfg.steps):
         step_start = time.perf_counter()
         batch = next(dl_iter)
@@ -894,6 +953,7 @@ def train(cfg: TrainPipelineConfig) -> None:
         if is_main_process():
             progbar.update(1)
         train_tracker.step()
+        profiler.step()
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0
         is_saving_step = should_save_checkpoint(step, cfg.save_freq, cfg.steps)
         is_env_eval_step = cfg.env_eval_freq > 0 and step % cfg.env_eval_freq == 0
@@ -1036,6 +1096,8 @@ def train(cfg: TrainPipelineConfig) -> None:
                     trackio_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
 
             accelerator.wait_for_everyone()
+
+    profiler.stop()
 
     if is_main_process():
         progbar.close()
