@@ -33,13 +33,22 @@ from lerobot.policies.groot.modeling_groot import GrootPolicy
 
 
 def test_groot_n1_7_optimizer_matches_isaac_training_contract():
-    optimizer = GrootConfig().get_optimizer_preset()
+    optimizer = GrootConfig(device="cpu").get_optimizer_preset()
 
     assert optimizer.lr == pytest.approx(1e-4)
     assert optimizer.betas == pytest.approx((0.9, 0.999))
     assert optimizer.eps == pytest.approx(1e-8)
     assert optimizer.weight_decay == pytest.approx(1e-5)
     assert optimizer.grad_clip_norm == pytest.approx(1.0)
+    assert optimizer.use_npu_fused is False
+
+
+def test_groot_n1_7_automatically_enables_fused_adamw_on_npu():
+    config = GrootConfig()
+    config.device = "npu:0"
+    optimizer = config.get_optimizer_preset()
+
+    assert optimizer.use_npu_fused is True
 
 
 def test_groot_n1_7_sampler_excludes_incomplete_action_tails():
