@@ -124,8 +124,6 @@ class PI05Config(PreTrainedConfig):
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 0.01
     optimizer_grad_clip_norm: float = 1.0
-    # Use Ascend's fused AdamW kernel (NPU only); see NpuFusedAdamW for the tradeoff.
-    optimizer_npu_fused: bool = False
 
     # Scheduler settings: see openpi `CosineDecaySchedule`
     # Note: These will auto-scale if --steps < scheduler_decay_steps
@@ -206,7 +204,7 @@ class PI05Config(PreTrainedConfig):
             eps=self.optimizer_eps,
             weight_decay=self.optimizer_weight_decay,
             grad_clip_norm=self.optimizer_grad_clip_norm,
-            use_npu_fused=self.optimizer_npu_fused,
+            use_npu_fused=str(self.device).split(":", 1)[0] == "npu",
         )
 
     def get_scheduler_preset(self):
