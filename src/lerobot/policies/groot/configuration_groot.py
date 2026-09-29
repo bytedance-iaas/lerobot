@@ -485,6 +485,7 @@ class GrootConfig(PreTrainedConfig):
             eps=self.optimizer_eps,
             weight_decay=self.optimizer_weight_decay,
             grad_clip_norm=1.0,
+            use_npu_fused=str(self.device).split(":", 1)[0] == "npu",
         )
 
     def get_scheduler_preset(self) -> DiffuserSchedulerConfig:
