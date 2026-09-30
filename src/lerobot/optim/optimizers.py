@@ -106,23 +106,20 @@ class AdamWConfig(OptimizerConfig):
     eps: float = 1e-8
     weight_decay: float = 1e-2
     grad_clip_norm: float = 10.0
-    # Opt-in: route the update through Ascend's fused npu_apply_adam_w kernel.
-    # Off by default because it is not bit-identical to torch.optim.AdamW.
-    use_npu_fused: bool = False
 
     def build(self, params: OptimizerParams) -> torch.optim.Optimizer:
         kwargs = asdict(self)
         kwargs.pop("grad_clip_norm")
-        use_npu_fused = kwargs.pop("use_npu_fused")
-        if use_npu_fused and is_npu_fused_adamw_available():
-            logging.info("Using NpuFusedAdamW (Ascend fused npu_apply_adam_w)")
-            return NpuFusedAdamW(params, **kwargs)
-        if use_npu_fused:
+        optimizer = torch.optim.AdamW(params, **kwargs)
+        devices = {parameter.device.type for group in optimizer.param_groups for parameter in group["params"]}
+        if devices == {"npu"} and is_npu_fused_adamw_available():
+            logging.info("Using NpuFusedAdamW")
+            return NpuFusedAdamW(optimizer.param_groups, **kwargs)
+        if "npu" in devices:
             logging.warning(
-                "use_npu_fused was requested but npu_apply_adam_w is unavailable; "
-                "falling back to torch.optim.AdamW"
+                "NPU parameters detected but NPU fused AdamW is unavailable; falling back to torch.optim.AdamW"
             )
-        return torch.optim.AdamW(params, **kwargs)
+        return optimizer
 
 
 @OptimizerConfig.register_subclass("sgd")

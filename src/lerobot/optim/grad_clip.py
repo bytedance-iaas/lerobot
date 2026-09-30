@@ -1,4 +1,4 @@
-"""Opt-in single-NPU gradient scaling using the foreach Scalar kernel."""
+"""NPU and replicated DDP gradient scaling using the foreach Scalar kernel."""
 
 from collections import defaultdict
 from collections.abc import Iterable
@@ -17,7 +17,7 @@ def clip_grad_norm_npu_(
     max_norm: float,
     norm_type: float = 2.0,
 ) -> torch.Tensor | None:
-    """Clip single-NPU gradients, preserving Accelerator behavior on other paths.
+    """Clip NPU gradients, preserving Accelerator behavior on other paths.
 
     Keep the original global norm and FP32/BF16 coefficient precision. Reading
     the coefficient once on the host enables NPU's fused foreach Scalar kernel.
@@ -28,8 +28,7 @@ def clip_grad_norm_npu_(
     grads = [p.grad for p in params if p.grad is not None]
     distributed_type = getattr(accelerator.distributed_type, "value", accelerator.distributed_type)
     supported = (
-        distributed_type == "NO"
-        and accelerator.num_processes == 1
+        (distributed_type == "MULTI_NPU" or (distributed_type == "NO" and accelerator.num_processes == 1))
         and bool(grads)
         and all(
             type(g) is torch.Tensor
@@ -55,4 +54,3 @@ def clip_grad_norm_npu_(
     for group in grouped.values():
         torch._foreach_mul_(group, coefficient)
     return total_norm
-

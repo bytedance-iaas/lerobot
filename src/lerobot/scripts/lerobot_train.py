@@ -100,7 +100,7 @@ def update_policy(
         lr_scheduler: An optional learning rate scheduler.
         lock: An optional lock for thread-safe optimizer updates.
         sample_weighter: Optional SampleWeighter instance for per-sample loss weighting.
-        npu_fused_grad_clip: Enable the opt-in single-NPU foreach scaling path.
+        npu_fused_grad_clip: Deprecated compatibility option. Selection is automatic.
 
     Returns:
         A tuple containing:
@@ -148,10 +148,9 @@ def update_policy(
 
     # Clip gradients if specified
     if grad_clip_norm > 0:
-        if npu_fused_grad_clip:
-            grad_norm = clip_grad_norm_npu_(accelerator, policy.parameters(), grad_clip_norm)
-        else:
-            grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+        # The helper selects its fused path only for compatible NPU tensors and
+        # transparently preserves Accelerator behavior everywhere else.
+        grad_norm = clip_grad_norm_npu_(accelerator, policy.parameters(), grad_clip_norm)
     else:
         grad_norm = torch.nn.utils.clip_grad_norm_(
             policy.parameters(), float("inf"), error_if_nonfinite=False
@@ -212,11 +211,18 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     # It will automatically detect if running in distributed mode or single-process mode
     # We set step_scheduler_with_optimizer=False to prevent accelerate from adjusting the lr_scheduler steps based on the num_processes
     if accelerator is None:
-        _find_unused = cfg.ddp_find_unused_parameters and not cfg.ddp_static_graph
+        is_groot_npu = (
+            getattr(cfg.trainable_config, "type", None) == "groot"
+            and str(cfg.trainable_config.device).split(":", 1)[0] == "npu"
+        )
+        # GR00T's training graph has no unused trainable parameters. Smaller
+        # buckets overlap its large gradient reduction more effectively.
+        _find_unused = False if is_groot_npu else cfg.ddp_find_unused_parameters and not cfg.ddp_static_graph
+        bucket_cap_mb = 25 if is_groot_npu else cfg.ddp_bucket_cap_mb
         ddp_kwargs = DistributedDataParallelKwargs(
             find_unused_parameters=_find_unused,
             static_graph=cfg.ddp_static_graph,
-            bucket_cap_mb=cfg.ddp_bucket_cap_mb,
+            bucket_cap_mb=bucket_cap_mb,
             gradient_as_bucket_view=cfg.ddp_gradient_as_bucket_view,
         )
         # Accelerate auto-detects the device based on the available hardware and ignores the policy.device setting.
