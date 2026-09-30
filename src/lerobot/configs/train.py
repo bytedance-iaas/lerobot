@@ -173,7 +173,7 @@ class TrainPipelineConfig(HubMixin):
     # Model-artifact format inside checkpoints; non-default values require a sharded run.
     checkpoint_format: CheckpointFormat = CheckpointFormat.SAFETENSORS
     use_policy_training_preset: bool = True
-    # Opt-in foreach scaling for single-NPU gradients; other paths use Accelerator.
+    # Deprecated compatibility field. Compatible NPU gradients are detected automatically.
     npu_fused_grad_clip: bool = False
     # DDP reducer settings.
     ddp_bucket_cap_mb: int = 200

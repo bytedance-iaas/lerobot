@@ -43,4 +43,3 @@ def test_empty_parameters_preserve_accelerator_return():
     )
     assert clip_grad_norm_npu_(accelerator, iter([]), 1.0) is None
     assert calls == [[]]
-

@@ -187,9 +187,7 @@ class PI05Config(PreTrainedConfig):
             raise ValueError(f"Invalid vlm_mlp_fp8_format: {self.vlm_mlp_fp8_format}")
 
         if self.vlm_mlp_fp8_amax_compute_algo not in ["max", "most_recent"]:
-            raise ValueError(
-                f"Invalid vlm_mlp_fp8_amax_compute_algo: {self.vlm_mlp_fp8_amax_compute_algo}"
-            )
+            raise ValueError(f"Invalid vlm_mlp_fp8_amax_compute_algo: {self.vlm_mlp_fp8_amax_compute_algo}")
 
         if self.vlm_mlp_fp8_amax_history_len <= 0:
             raise ValueError(
@@ -242,7 +240,6 @@ class PI05Config(PreTrainedConfig):
             weight_decay=self.optimizer_weight_decay,
             grad_clip_norm=self.optimizer_grad_clip_norm,
             fused=self.optimizer_fused,
-            use_npu_fused=str(self.device).split(":", 1)[0] == "npu",
         )
 
     def get_scheduler_preset(self):

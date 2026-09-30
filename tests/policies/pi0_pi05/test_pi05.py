@@ -31,14 +31,6 @@ from lerobot.utils.random_utils import set_seed
 from tests.utils import require_cuda, require_hf_token  # noqa: E402
 
 
-def test_pi05_automatically_selects_npu_fused_adamw():
-    config = PI05Config(device="cpu")
-    assert config.get_optimizer_preset().use_npu_fused is False
-
-    config.device = "npu:0"
-    assert config.get_optimizer_preset().use_npu_fused is True
-
-
 @require_cuda
 @require_hf_token
 def test_policy_instantiation():

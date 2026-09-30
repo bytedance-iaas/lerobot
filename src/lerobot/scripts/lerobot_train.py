@@ -221,8 +221,8 @@ def update_policy(
             per-sample loss weighting. Defaults to None.
         ema (EMA | None, optional): The EMA of the policy weights, stepped after every applied
             optimizer update. Defaults to None.
-        npu_fused_grad_clip (bool, optional): Use the opt-in single-NPU foreach scaling path
-            instead of accelerate's clipping. Defaults to False.
+        npu_fused_grad_clip (bool, optional): Kept for compatibility and ignored; the clip helper
+            selects its fused path itself, only for compatible NPU tensors. Defaults to False.
 
     Returns:
         tuple[MetricsTracker, dict | None]: The updated MetricsTracker with new statistics for this
@@ -276,12 +276,11 @@ def update_policy(
         # Gradients are complete only on sync micro-batches; clipping partial gradients would
         # be meaningless. Always pass the full parameter list: accelerate's FSDP2 path requires
         # an exact match with the prepared model's parameters for a globally correct norm.
+        # The helper picks its fused path only for compatible NPU tensors and otherwise defers to
+        # accelerate, so there is nothing to branch on here.
         grad_norm = None
         if accelerator.sync_gradients and grad_clip_norm > 0:
-            if npu_fused_grad_clip:
-                grad_norm = clip_grad_norm_npu_(accelerator, policy.parameters(), grad_clip_norm)
-            else:
-                grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+            grad_norm = clip_grad_norm_npu_(accelerator, policy.parameters(), grad_clip_norm)
 
         # Optimizer step (a no-op on non-final micro-batches under gradient accumulation).
         # Under fp16 the scaler runs it and skips it whenever a gradient overflowed.
