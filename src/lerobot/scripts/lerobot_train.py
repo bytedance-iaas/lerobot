@@ -177,6 +177,7 @@ def _log_profiler_summary(
     The per-card peak that MFU is divided by is hardware-specific and cannot be detected,
     so it comes from LEROBOT_PROF_PEAK_TFLOPS.
     """
+    import statistics
     import time as _time
     from pathlib import Path
 
@@ -206,8 +207,8 @@ def _log_profiler_summary(
         warn = None
         clean = clean_step_s
         if steps_per_epoch:
-            steady = [(i, d) for i, d in clean_step_s if i >= 2 * steps_per_epoch]
-            if len(steady) >= 10:
+            steady = [(i, d) for i, d in clean_step_s if i >= steps_per_epoch]
+            if len(steady) >= 50:
                 clean = steady
             else:
                 warn = (
@@ -225,6 +226,15 @@ def _log_profiler_summary(
             num_processes=num_processes,
             peak_tflops=peak,
         )
+        if clean and step_s:
+            median_s = statistics.median(d for _, d in clean)
+            if median_s > 0 and step_s / median_s > 1.02:
+                slow_i, slow_s = max(clean, key=lambda pair: pair[1])
+                lines.append(
+                    f"  note: mean {step_s:.3f} s vs median {median_s:.3f} s over {len(clean)} "
+                    f"steps -- outliers dominate; slowest was iteration {slow_i} at {slow_s:.3f} s. "
+                    f"Cross-check with benchmarks/throughput.py before quoting the throughput."
+                )
         if warn:
             lines.append(warn)
         if not lines:
