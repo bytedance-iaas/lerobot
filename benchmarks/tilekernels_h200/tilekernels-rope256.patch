@@ -1,0 +1,17 @@
+diff --git a/tile_kernels/transform/rope_cuda.py b/tile_kernels/transform/rope_cuda.py
+index d459e31..4c13743 100644
+--- a/tile_kernels/transform/rope_cuda.py
++++ b/tile_kernels/transform/rope_cuda.py
+@@ -24 +24 @@ def get_rope_kernel_cuda(
+-    assert rotary_dim in (64, 128)
++    assert rotary_dim in (64, 128, 256)
+diff --git a/tile_kernels/transform/rope_kernel.py b/tile_kernels/transform/rope_kernel.py
+index fead36a..fce3c70 100644
+--- a/tile_kernels/transform/rope_kernel.py
++++ b/tile_kernels/transform/rope_kernel.py
+@@ -63 +63,4 @@ def apply_rotary(
+-    assert rot_dim in (64, 128)
++    # The CUDA kernel is dimension-generic for vector-aligned power-of-two
++    # rotary widths. PI05's Gemma attention uses a 256-wide head. Ascend keeps
++    # its original 64/128 restriction in the backend-specific implementation.
++    assert rot_dim in ((64, 128) if is_ascend() else (64, 128, 256))
