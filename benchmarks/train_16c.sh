@@ -23,7 +23,6 @@ PORT=${PORT:-29531}
 # Optimisations, all off by default. ALL_OPT=true turns every one on at once; an
 # individual variable set explicitly still wins over ALL_OPT.
 ALL_OPT=${ALL_OPT:-false}
-FUSED_ADAMW=${FUSED_ADAMW:-$ALL_OPT}   # torch_npu npu_apply_adam_w in place of torch AdamW
 FUSED_CLIP=${FUSED_CLIP:-$ALL_OPT}     # fused grad-norm clip (single process only; silently
                                        # falls back when num_processes > 1)
 FUSED_GEGLU=${FUSED_GEGLU:-$ALL_OPT}   # fused GELU(tanh)+gating in the Gemma MLP
@@ -108,7 +107,6 @@ exec accelerate launch \
   --policy.freeze_vision_encoder=false \
   --policy.push_to_hub=false \
   --policy.normalization_mapping='{"ACTION":"MEAN_STD","STATE":"MEAN_STD","VISUAL":"IDENTITY"}' \
-  --policy.optimizer_npu_fused="$FUSED_ADAMW" \
   --npu_fused_grad_clip="$FUSED_CLIP" \
   --policy.npu_fused_geglu="$FUSED_GEGLU" \
   --policy.reuse_rope_embeddings="$ROPE_REUSE" \

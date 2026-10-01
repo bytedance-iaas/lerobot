@@ -205,9 +205,9 @@ def _log_profiler_summary(
         # and then spent, so early steps run faster than the pipeline can sustain. Prefer
         # steps from epoch 2 onward.
         warn = None
-        clean = clean_step_s
+        clean = [(i, d) for i, d in clean_step_s if i > 0]
         if steps_per_epoch:
-            steady = [(i, d) for i, d in clean_step_s if i >= steps_per_epoch]
+            steady = [(i, d) for i, d in clean if i >= steps_per_epoch]
             if len(steady) >= 50:
                 clean = steady
             else:
