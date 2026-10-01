@@ -86,47 +86,154 @@ class _NullProfiler:
         pass
 
 
-def _make_profiler(rank: int):
+@dataclasses.dataclass(frozen=True)
+class _ProfInfo:
+    """Where a profile was written, and which loop iterations it perturbed.
+
+    The perturbed range is excluded when picking the step time for the MFU summary: the
+    profiler slows the steps it captures, so MFU measured inside the window understates
+    the real run. A one-iteration margin is included on each side.
+    """
+
+    prof_dir: str
+    rank: int
+    dirty_from: int
+    dirty_to: int
+
+    def is_dirty(self, iteration: int) -> bool:
+        return self.dirty_from <= iteration <= self.dirty_to
+
+
+def _make_profiler(rank: int) -> tuple[Any, _ProfInfo | None]:
     """Ascend profiler when LEROBOT_PROF=1, else a no-op stand-in.
 
-    Writes ASCEND_PROFILER_OUTPUT/step_trace_time.csv, whose Computing /
-    Communication / Overlapped / Free columns show how much of the gradient
-    all-reduce is hidden behind compute. Profiler level Level1 is the lowest
-    that emits the HCCL data those columns are derived from.
-
     Env: LEROBOT_PROF_DIR, LEROBOT_PROF_{SKIP,WAIT,WARMUP,ACTIVE},
-    LEROBOT_PROF_RANKS ("0", "0,8" or "all"), LEROBOT_PROF_SHAPES.
+    LEROBOT_PROF_RANKS ("0", "0,8" or "all"), LEROBOT_PROF_SHAPES, LEROBOT_PROF_AIC.
     """
     if os.environ.get("LEROBOT_PROF", "0") != "1":
-        return _NullProfiler()
+        return _NullProfiler(), None
 
     wanted = os.environ.get("LEROBOT_PROF_RANKS", "0")
     if wanted != "all" and rank not in {int(r) for r in wanted.split(",") if r.strip()}:
-        return _NullProfiler()
+        return _NullProfiler(), None
 
-    import torch_npu
+    try:
+        import torch_npu
+    except ImportError:
+        logging.warning(
+            "LEROBOT_PROF=1 but torch_npu is not importable, so the Ascend profiler hook "
+            "cannot run. Profiling is DISABLED for this run; training continues."
+        )
+        return _NullProfiler(), None
 
     prof_dir = os.environ.get("LEROBOT_PROF_DIR", "./prof")
+    # LEROBOT_PROF_AIC=1 turns on the AI Core PMU counters, which add an aic_cube_fops
+    # column to kernel_details.csv: a hardware count of the matmul FLOPs each kernel
+    # actually issued. Off by default: the counters perturb the step, so
+    # never quote throughput from a run with this on.
+    aic_metrics = (
+        torch_npu.profiler.AiCMetrics.ArithmeticUtilization
+        if os.environ.get("LEROBOT_PROF_AIC", "0") == "1"
+        else torch_npu.profiler.AiCMetrics.AiCoreNone
+    )
     experimental_config = torch_npu.profiler._ExperimentalConfig(
         profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+        aic_metrics=aic_metrics,
     )
+    skip = int(os.environ.get("LEROBOT_PROF_SKIP", "60"))
+    wait = int(os.environ.get("LEROBOT_PROF_WAIT", "0"))
+    warmup = int(os.environ.get("LEROBOT_PROF_WARMUP", "1"))
+    active = int(os.environ.get("LEROBOT_PROF_ACTIVE", "4"))
     logging.info(f"NPU profiler enabled on rank {rank}, writing to {prof_dir}")
+    info = _ProfInfo(
+        prof_dir=prof_dir,
+        rank=rank,
+        dirty_from=max(0, skip - 1),
+        dirty_to=skip + wait + warmup + active,
+    )
     return torch_npu.profiler.profile(
         activities=[
             torch_npu.profiler.ProfilerActivity.CPU,
             torch_npu.profiler.ProfilerActivity.NPU,
         ],
         schedule=torch_npu.profiler.schedule(
-            skip_first=int(os.environ.get("LEROBOT_PROF_SKIP", "60")),
-            wait=int(os.environ.get("LEROBOT_PROF_WAIT", "0")),
-            warmup=int(os.environ.get("LEROBOT_PROF_WARMUP", "1")),
-            active=int(os.environ.get("LEROBOT_PROF_ACTIVE", "4")),
-            repeat=1,
+            skip_first=skip, wait=wait, warmup=warmup, active=active, repeat=1
         ),
         on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(prof_dir),
         record_shapes=os.environ.get("LEROBOT_PROF_SHAPES", "0") == "1",
         experimental_config=experimental_config,
-    )
+    ), info
+
+
+def _log_profiler_summary(
+    info: "_ProfInfo",
+    clean_step_s: list[tuple[int, float]],
+    batch_size: int,
+    num_processes: int,
+    steps_per_epoch: int = 0,
+) -> None:
+    """Append MFU and compute/communication overlap once the profile has been written.
+
+    The per-card peak that MFU is divided by is hardware-specific and cannot be detected,
+    so it comes from LEROBOT_PROF_PEAK_TFLOPS.
+    """
+    import time as _time
+    from pathlib import Path
+
+    from lerobot.utils.profiler_summary import DEFAULT_PEAK_TFLOPS, summarise
+
+    try:
+        peak = float(os.environ.get("LEROBOT_PROF_PEAK_TFLOPS", DEFAULT_PEAK_TFLOPS))
+        deadline = _time.monotonic() + float(os.environ.get("LEROBOT_PROF_WAIT_S", "300"))
+        root = Path(info.prof_dir)
+        while _time.monotonic() < deadline:
+            if any(root.rglob("ASCEND_PROFILER_OUTPUT/kernel_details.csv")) or any(
+                root.rglob("ASCEND_PROFILER_OUTPUT/step_trace_time.csv")
+            ):
+                break
+            _time.sleep(2.0)
+        else:
+            logging.warning(
+                f"profiler summary: no CSV under {info.prof_dir} yet; "
+                f"read it later with `python3 benchmarks/prof_flops.py {info.prof_dir}`"
+            )
+            return
+
+        # Epoch 1 is not representative: the dataloader prefetch buffer
+        # (num_workers x prefetch_factor batches per rank) is filled during the slow warmup
+        # and then spent, so early steps run faster than the pipeline can sustain. Prefer
+        # steps from epoch 2 onward.
+        warn = None
+        clean = clean_step_s
+        if steps_per_epoch:
+            steady = [(i, d) for i, d in clean_step_s if i >= 2 * steps_per_epoch]
+            if len(steady) >= 10:
+                clean = steady
+            else:
+                warn = (
+                    f"  WARNING: this run never got past epoch 1 (~{steps_per_epoch} steps/epoch), "
+                    f"so the step time still includes the dataloader prefetch transient and MFU "
+                    f"above is OPTIMISTIC. Re-run with STEPS>={int(2.2 * steps_per_epoch)}, or take "
+                    f"the throughput from benchmarks/throughput.py."
+                )
+        step_s = (sum(d for _, d in clean) / len(clean)) if clean else None
+        lines = summarise(
+            info.prof_dir,
+            step_s=step_s,
+            step_s_label=f"mean of {len(clean)} unprofiled steps, rank {info.rank}",
+            batch_size=batch_size,
+            num_processes=num_processes,
+            peak_tflops=peak,
+        )
+        if warn:
+            lines.append(warn)
+        if not lines:
+            logging.warning(f"profiler summary: nothing readable under {info.prof_dir}")
+            return
+        for line in lines:
+            logging.info(line)
+    except Exception as exc:
+        logging.warning(f"profiler summary failed ({type(exc).__name__}: {exc})")
 
 
 def update_policy(
@@ -642,10 +749,14 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
         )
 
-    profiler = _make_profiler(accelerator.process_index)
+    profiler, prof_info = _make_profiler(accelerator.process_index)
     profiler.start()
+    # Step times from iterations the profiler did NOT perturb, for the MFU summary below.
+    clean_step_s: list[tuple[int, float]] = []
+    iteration = -1
 
     for _ in range(step, cfg.steps):
+        iteration += 1
         start_time = time.perf_counter()
         batch = next(dl_iter)
         for cam_key in dataset.meta.camera_keys:
@@ -665,7 +776,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             sample_weighter=sample_weighter,
             npu_fused_grad_clip=cfg.npu_fused_grad_clip,
         )
-        train_tracker.step_s = time.perf_counter() - start_time
+        step_duration = time.perf_counter() - start_time
+        train_tracker.step_s = step_duration
+        if prof_info is not None and not prof_info.is_dirty(iteration):
+            clean_step_s.append((iteration, step_duration))
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
         # increment `step` here.
@@ -812,6 +926,14 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             accelerator.wait_for_everyone()
 
     profiler.stop()
+    if prof_info is not None:
+        _log_profiler_summary(
+            prof_info,
+            clean_step_s,
+            cfg.batch_size,
+            accelerator.num_processes,
+            steps_per_epoch=max(1, dataset.num_frames // effective_batch_size),
+        )
 
     if is_main_process:
         progbar.close()
