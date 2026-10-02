@@ -84,7 +84,7 @@ export HCCL_EXEC_TIMEOUT=1800
 
 export PYTORCH_NPU_ALLOC_CONF=${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}
 
-echo "# optimisations: adamw=$FUSED_ADAMW clip=$FUSED_CLIP geglu=$FUSED_GEGLU" \
+echo "# optimisations: clip=$FUSED_CLIP geglu=$FUSED_GEGLU" \
      "rope_reuse=$ROPE_REUSE fused_rope=$FUSED_ROPE attn=$FUSED_ATTN rms=$FUSED_RMS" >&2
 echo "# NP=$NP BS=$BS GC=$GC NW=$NW OMP=$OMP STEPS=$STEPS" >&2
 echo "# ddp: static_graph=$STATIC_GRAPH bucket_mb=$BUCKET_MB grad_as_view=$GRAD_AS_VIEW" "tokenizer_max_length=$TOK_MAX pyav_threads=${LEROBOT_PYAV_THREADS:-1}" >&2
