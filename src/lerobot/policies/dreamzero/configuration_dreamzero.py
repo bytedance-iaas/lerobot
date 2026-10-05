@@ -481,6 +481,14 @@ class DreamZeroConfig(PreTrainedConfig):
             eps=self.optimizer_eps,
             weight_decay=self.optimizer_weight_decay,
             grad_clip_norm=1.0,
+            # Ascend's fused ApplyAdamW cannot run this recipe. It takes beta2 in the parameter
+            # dtype, and bfloat16 rounds 0.999 up to exactly 1.0, so the second-moment bias
+            # correction divides by zero: measured on a 950PR, LoRA loss is 0.066 at step 1 and
+            # NaN from step 2 on, while torch.optim.AdamW continues 0.088, 0.058, 0.107. The
+            # kernel also rejects scalars that do not match the parameter dtype, so fp32 betas
+            # are not a way out. Nothing is lost here -- LoRA trains 108.6 M of 22.9 B, so the
+            # optimizer was 0.4% of a 10.8 s step, which is inside the run-to-run noise.
+            allow_npu_fused=False,
         )
 
     def get_scheduler_preset(self) -> DiffuserSchedulerConfig:

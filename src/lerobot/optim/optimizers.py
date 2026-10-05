@@ -106,12 +106,23 @@ class AdamWConfig(OptimizerConfig):
     eps: float = 1e-8
     weight_decay: float = 1e-2
     grad_clip_norm: float = 10.0
+    # Ascend's ApplyAdamW takes its scalars in the parameter dtype, which makes it unusable for
+    # some combinations of dtype and betas: bfloat16 has no value between 0.99609375 and 1.0, so a
+    # beta2 of 0.999 reaches the kernel as exactly 1.0, the second-moment bias correction divides
+    # by zero, and every update is NaN from the first step on. Set this to False for a policy that
+    # trains bf16 parameters with such a beta -- DreamZero does -- and the update stays in
+    # torch.optim.AdamW, which keeps its betas in Python floats whatever the parameters are.
+    # pi0.5 (beta2 0.95 in bf16) and GR00T (beta2 0.999 but fp32 parameters) are unaffected.
+    allow_npu_fused: bool = True
 
     def build(self, params: OptimizerParams) -> torch.optim.Optimizer:
         kwargs = asdict(self)
         kwargs.pop("grad_clip_norm")
+        allow_npu_fused = kwargs.pop("allow_npu_fused")
         optimizer = torch.optim.AdamW(params, **kwargs)
         devices = {parameter.device.type for group in optimizer.param_groups for parameter in group["params"]}
+        if not allow_npu_fused:
+            return optimizer
         if devices == {"npu"} and is_npu_fused_adamw_available():
             logging.info("Using NpuFusedAdamW")
             return NpuFusedAdamW(optimizer.param_groups, **kwargs)

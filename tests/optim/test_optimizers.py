@@ -279,3 +279,20 @@ def test_save_and_load_empty_multi_optimizer_state(base_params_dict, tmp_path):
         torch.testing.assert_close(
             optimizer.state_dict()["param_groups"], loaded_optimizers[name].state_dict()["param_groups"]
         )
+
+
+def test_adamw_build_skips_the_npu_kernel_when_not_allowed():
+    """DreamZero opts out: bf16 rounds its beta2 of 0.999 to 1.0, which makes ApplyAdamW NaN."""
+    parameter = torch.nn.Parameter(torch.ones(4))
+    optimizer = AdamWConfig(betas=(0.95, 0.999), allow_npu_fused=False).build([parameter])
+    assert type(optimizer) is torch.optim.AdamW
+    assert optimizer.defaults["betas"] == (0.95, 0.999)
+    assert "allow_npu_fused" not in optimizer.defaults
+
+
+def test_dreamzero_preset_opts_out_of_the_npu_kernel():
+    from lerobot.policies.dreamzero.configuration_dreamzero import DreamZeroConfig
+
+    preset = DreamZeroConfig().get_optimizer_preset()
+    assert preset.betas == (0.95, 0.999)
+    assert preset.allow_npu_fused is False
