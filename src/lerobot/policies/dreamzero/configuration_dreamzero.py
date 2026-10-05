@@ -161,6 +161,16 @@ class DreamZeroConfig(PreTrainedConfig):
     # torch.compile the text/image/VAE encoders (upstream `post_initialize` does this too). Off by
     # default: it costs a few minutes of warmup and is only worth it for long rollouts.
     compile_encoders: bool = False
+    # Recompute each DiT block in the backward pass instead of keeping its activations, which is
+    # what the recompute traffic in a profile is: 16.6 k in-place copies and 5.1 k in-place adds
+    # per step. Upstream hardcodes it on, and on a 950PR there is no room to turn it off -- 40
+    # blocks of activations at batch 1 reach 121.7 GiB of the card's 123.2 GiB, and 2-card FSDP
+    # does not help because it shards parameters and gradients but not activations. Keeping only
+    # 5 of the 40 blocks unrecomputed runs on a single card (9.54 vs 9.89 s/step) but still OOMs
+    # under FSDP. The knob is here because the DiT hardcoded it and `WANPolicyHeadConfig` has a
+    # field of the same meaning that nothing reads, so neither could be turned off at all; it is
+    # wired to the DiT in `DreamZeroPolicy.__init__`.
+    gradient_checkpointing: bool = True
 
     # Diffusion. `num_inference_timesteps` is a TRAINING parameter (the released DROID checkpoint
     # trained with 4); the inference loop uses `WANPolicyHead.num_inference_steps`, which upstream

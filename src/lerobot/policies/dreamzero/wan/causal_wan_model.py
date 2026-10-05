@@ -2167,7 +2167,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     use_reentrant=False,
                 )
             else:
-                x = block(x, **kwargs)
+                # Same unwrapping as `custom_forward` above: a block returns
+                # (hidden_states, updated_kv_cache), and training never fills the cache.
+                # Without this the uncheckpointed path hands the next block a tuple.
+                x, updated_kv_cache = block(x, **kwargs)
+                assert updated_kv_cache is None
 
         if clean_x is not None:
             x = x[:, clean_x.shape[1]:]

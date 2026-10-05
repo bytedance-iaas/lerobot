@@ -81,6 +81,10 @@ class DreamZeroPolicy(PreTrainedPolicy):
         # All-True: this port never uses upstream's skip schedule (see WANPolicyHead.__init__).
         self.action_head.dit_step_mask = [True] * config.num_inference_steps
         self.action_head.cfg_scale = config.cfg_scale
+        # `CausalWanModel.__init__` hardcodes this to True and `WANPolicyHeadConfig`'s field of
+        # the same name is never read, so the only way to honour the LeRobot config is here.
+        self.action_head.use_gradient_checkpointing = config.gradient_checkpointing
+        self.action_head.model.gradient_checkpointing = config.gradient_checkpointing
 
         self.apply_training_mode()
         # FSDP cannot shard a 0-d parameter and this model has one. Doing it here rather than at
