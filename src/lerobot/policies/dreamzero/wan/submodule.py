@@ -22,6 +22,12 @@ import math
 import torch
 import torch.nn as nn
 import os
+
+try:  # optional: Ascend NPU fused kernels
+    import torch_npu
+except ImportError:
+    torch_npu = None
+
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from einops import repeat
@@ -194,6 +200,16 @@ class WanRMSNorm(nn.Module):
         Args:
             x(Tensor): Shape [B, L, C]
         """
+        if torch_npu is not None and x.device.type == "npu":
+            # One kernel for square-mean, rsqrt and the gamma multiply, which is worth 8% of a
+            # DreamZero LoRA step on a 950PR. gamma has to match x's dtype -- aclnnRmsNorm
+            # rejects an fp32 x with a bf16 gamma, and these weights are bf16 -- and the output
+            # dtype is x's either way, as in the eager path below.
+            #
+            # Not bit-identical: the eager path rounds to x's dtype BEFORE the gamma multiply and
+            # the kernel does not. Over a 6-step run the per-step loss agreed to three decimals
+            # while grad norm moved in the last digit (0.095 vs 0.096, 0.142 vs 0.136).
+            return torch_npu.npu_rms_norm(x, self.weight.to(x.dtype), epsilon=self.eps)[0]
         return self._norm(x.float()).type_as(x) * self.weight
 
     def _norm(self, x):
@@ -924,3 +940,4 @@ class WanModel(ModelMixin, ConfigMixin):
 
         # init output layer
         nn.init.zeros_(self.head.head.weight)
+
