@@ -290,9 +290,14 @@ def test_adamw_build_skips_the_npu_kernel_when_not_allowed():
     assert "allow_npu_fused" not in optimizer.defaults
 
 
-def test_dreamzero_preset_opts_out_of_the_npu_kernel():
+def test_dreamzero_preset_follows_the_parameter_dtype():
+    """bf16 cannot hold beta2=0.999, so only the fp32 master-weight recipe may use the kernel."""
     from lerobot.policies.dreamzero.configuration_dreamzero import DreamZeroConfig
 
-    preset = DreamZeroConfig().get_optimizer_preset()
-    assert preset.betas == (0.95, 0.999)
-    assert preset.allow_npu_fused is False
+    lora = DreamZeroConfig(compute_dtype="bfloat16").get_optimizer_preset()
+    assert lora.betas == (0.95, 0.999)
+    assert lora.allow_npu_fused is False
+
+    full = DreamZeroConfig(compute_dtype="float32").get_optimizer_preset()
+    assert full.betas == (0.95, 0.999)
+    assert full.allow_npu_fused is True
