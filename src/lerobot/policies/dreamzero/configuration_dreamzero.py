@@ -491,14 +491,22 @@ class DreamZeroConfig(PreTrainedConfig):
             eps=self.optimizer_eps,
             weight_decay=self.optimizer_weight_decay,
             grad_clip_norm=1.0,
-            # Ascend's fused ApplyAdamW cannot run this recipe. It takes beta2 in the parameter
-            # dtype, and bfloat16 rounds 0.999 up to exactly 1.0, so the second-moment bias
-            # correction divides by zero: measured on a 950PR, LoRA loss is 0.066 at step 1 and
-            # NaN from step 2 on, while torch.optim.AdamW continues 0.088, 0.058, 0.107. The
-            # kernel also rejects scalars that do not match the parameter dtype, so fp32 betas
-            # are not a way out. Nothing is lost here -- LoRA trains 108.6 M of 22.9 B, so the
-            # optimizer was 0.4% of a 10.8 s step, which is inside the run-to-run noise.
-            allow_npu_fused=False,
+            # Ascend's fused ApplyAdamW takes beta2 in the parameter dtype, and bfloat16 has no
+            # value between 0.99609375 and 1.0, so this recipe's 0.999 arrives as exactly 1.0 and
+            # the second-moment bias correction divides by zero. Measured on a 950PR: LoRA loss is
+            # 0.066 at step 1 and NaN from step 2 on, where torch.optim.AdamW continues 0.088,
+            # 0.058, 0.107. Passing fp32 scalars instead is rejected outright, so the dtype of the
+            # parameters is what decides it -- the same bf16 spacing that costs a bf16 master
+            # weight ~84% of its updates at lr 1e-5, which is why a full fine-tune keeps fp32.
+            #
+            # Keyed on the dtype rather than on `training_mode` because `compute_dtype` defaults to
+            # bfloat16 and a full fine-tune only gets fp32 by passing the flag; a full run that
+            # forgot it would otherwise hand bf16 parameters straight back to the kernel.
+            #
+            # LoRA loses nothing by sitting this out: it trains 108.6 M of 22.9 B, so the optimizer
+            # measured 0.4% of a 10.8 s step, inside the run-to-run noise. A full fine-tune trains
+            # 16,484 M and has 150x more to gain.
+            allow_npu_fused=(self.compute_dtype == "float32"),
         )
 
     def get_scheduler_preset(self) -> DiffuserSchedulerConfig:
