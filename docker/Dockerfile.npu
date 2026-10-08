@@ -150,20 +150,35 @@ RUN pip install --no-cache-dir 'gym-hil>=0.1.14,<0.2.0'
 # Derived rather than hardcoded so it stays correct when BASE_IMAGE moves. The 2.X <-> 0.X
 # rule holds from torch 2.9 onwards; if a future base predates that, this fails loudly at
 # build time, which is the point.
-RUN TC=$(python3 -c "import torch; print('.'.join(torch.__version__.split('+')[0].split('.')[:2]))") \
+#
+# TORCH_DEVICE_BACKEND_AUTOLOAD=0 because `import torch` otherwise auto-imports torch_npu,
+# which dlopens libascend_hal.so -- a DRIVER library, present only on a host with Ascend
+# cards. A CI builder has none, so plain `import torch` dies there with
+#   ImportError: libascend_hal.so: cannot open shared object file
+#   RuntimeError: Failed to load the backend extension: torch_npu
+# even though nothing here needs the NPU. Set per-RUN rather than as ENV: as ENV it would
+# survive into the image and change how torch behaves at training time.
+RUN TC=$(TORCH_DEVICE_BACKEND_AUTOLOAD=0 python3 -c "import torch; print('.'.join(torch.__version__.split('+')[0].split('.')[:2]))") \
     && TC_MINOR=${TC#2.} \
     && echo "torch ${TC} -> torchcodec 0.${TC_MINOR}.*" \
     && pip install --no-cache-dir "torchcodec==0.${TC_MINOR}.*"
 
 # Fail the build, not the first training run, if any of the above silently regressed.
-RUN python3 -c "\
-import importlib.util as u, torch, torch_npu;\
+#
+# Autoload off for the same reason as above, which is also why torch_npu is checked through
+# its metadata instead of being imported: importing it needs the driver and there is no way
+# to verify it on a machine with no cards. That it loads at all is what the first run on
+# real hardware proves; what this can prove is that it is installed and that nothing in the
+# install above replaced the CPU torch it was built against.
+RUN TORCH_DEVICE_BACKEND_AUTOLOAD=0 python3 -c "\
+import importlib.metadata as md, importlib.util as u, torch;\
 assert not torch.version.cuda, f'expected a CPU torch build, got CUDA {torch.version.cuda}';\
+tn = md.version('torch-npu');\
 assert u.find_spec('av') is not None, 'PyAV missing: no video decoder left';\
 assert all(u.find_spec(m) for m in ('gym_hil','gym_pusht','mujoco')), 'sim stack incomplete';\
 import torchcodec.decoders;\
 from lerobot.utils.import_utils import get_safe_default_video_backend as b;\
 assert b() == 'torchcodec', f'torchcodec present but unloadable, probe chose {b()!r} -- see the pin above';\
-import lerobot, torchcodec; print('torch', torch.__version__, '| torch_npu', torch_npu.__version__, '| torchcodec', torchcodec.__version__, '| lerobot', lerobot.__version__)"
+import lerobot, torchcodec; print('torch', torch.__version__, '| torch_npu', tn, '| torchcodec', torchcodec.__version__, '| lerobot', lerobot.__version__)"
 
 CMD ["/bin/bash"]
