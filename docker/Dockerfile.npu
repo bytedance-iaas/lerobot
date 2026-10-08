@@ -74,20 +74,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ARG PIP_INDEX=https://mirrors.aliyun.com/pypi/simple/
 ARG PIP_HOST=mirrors.aliyun.com
 
-# A second index, because a mirror can lag upstream and a lagging mirror does not degrade
-# gracefully -- it makes a pin unsatisfiable and fails the build. Both Volcengine mirrors
-# stopped at gym-hil 0.1.13 while the floor below is 0.1.14, which is exactly how this was
-# found; Aliyun and pypi.org both had it. pip considers candidates from every index and
-# takes the highest match, so the fallback costs one extra metadata request per package and
-# changes nothing when the primary is already current. Safe here only because both indexes
-# mirror the same upstream -- never point this at a second, unrelated package source.
-# When PIP_INDEX is left at its default the two are the same URL, which pip tolerates.
+# A fallback index for the one install below that needs it. A mirror can lag upstream, and
+# a lagging mirror does not degrade gracefully -- it makes a pin unsatisfiable and fails the
+# build. Both Volcengine mirrors stopped at gym-hil 0.1.13 while the floor further down is
+# 0.1.14, which is how this was found; Aliyun and pypi.org both had it.
+#
+# It is applied per-command rather than through PIP_EXTRA_INDEX_URL, because globally it is
+# expensive: pip then queries both indexes for every candidate, and that took the big
+# `pip install -e .[extras]` step from 34 s to 938 s on the CP builder. Scoped to the one
+# package that needs it, the same fix costs nothing measurable.
+#
+# Safe only because both indexes mirror the same upstream. Never point this at a second,
+# unrelated package source -- with two indexes pip takes the highest version it finds in
+# either, which is the dependency-confusion shape.
 ARG PIP_EXTRA_INDEX=https://mirrors.aliyun.com/pypi/simple/
 ARG PIP_EXTRA_HOST=mirrors.aliyun.com
 
 # pip splits the list-valued env vars on whitespace, which is how both hosts get trusted.
 ENV PIP_INDEX_URL=${PIP_INDEX} \
-    PIP_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX} \
     PIP_TRUSTED_HOST="${PIP_HOST} ${PIP_EXTRA_HOST}" \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
@@ -118,7 +122,9 @@ RUN pip install --no-cache-dir -e ".[${LEROBOT_EXTRAS}]"
 # gym-hil is classic MuJoCo, not MuJoCo Warp, so the physics runs on the CPU while the
 # policy runs on the NPU — that split is what makes closed-loop RL possible on a machine
 # with no graphics hardware at all.
-RUN pip install --no-cache-dir 'gym-hil>=0.1.14,<0.2.0'
+# --extra-index-url because 0.1.14 is newer than the Volcengine mirrors carry; see the
+# PIP_EXTRA_INDEX comment above for why the fallback is scoped to this line and not global.
+RUN pip install --no-cache-dir --extra-index-url "${PIP_EXTRA_INDEX}" 'gym-hil>=0.1.14,<0.2.0'
 
 # Re-pin torchcodec to the release built against this image's torch. Every torchcodec is
 # compiled against one specific torch (0.9<->2.9, 0.10<->2.10, 0.11<->2.11), but the
