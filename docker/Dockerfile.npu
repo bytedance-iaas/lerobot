@@ -73,8 +73,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 #   --build-arg PIP_INDEX=https://mirrors.ivolces.com/pypi/simple/ --build-arg PIP_HOST=mirrors.ivolces.com
 ARG PIP_INDEX=https://mirrors.aliyun.com/pypi/simple/
 ARG PIP_HOST=mirrors.aliyun.com
+
+# A second index, because a mirror can lag upstream and a lagging mirror does not degrade
+# gracefully -- it makes a pin unsatisfiable and fails the build. Both Volcengine mirrors
+# stopped at gym-hil 0.1.13 while the floor below is 0.1.14, which is exactly how this was
+# found; Aliyun and pypi.org both had it. pip considers candidates from every index and
+# takes the highest match, so the fallback costs one extra metadata request per package and
+# changes nothing when the primary is already current. Safe here only because both indexes
+# mirror the same upstream -- never point this at a second, unrelated package source.
+# When PIP_INDEX is left at its default the two are the same URL, which pip tolerates.
+ARG PIP_EXTRA_INDEX=https://mirrors.aliyun.com/pypi/simple/
+ARG PIP_EXTRA_HOST=mirrors.aliyun.com
+
+# pip splits the list-valued env vars on whitespace, which is how both hosts get trusted.
 ENV PIP_INDEX_URL=${PIP_INDEX} \
-    PIP_TRUSTED_HOST=${PIP_HOST} \
+    PIP_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX} \
+    PIP_TRUSTED_HOST="${PIP_HOST} ${PIP_EXTRA_HOST}" \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
 # Freeze the base image's torch stack into a pip constraint before installing anything.
