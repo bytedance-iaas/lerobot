@@ -63,8 +63,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Aliyun mirror: pulling from pypi.org inside CN turns a 3-minute build into a 40-minute one.
-ENV PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
-    PIP_TRUSTED_HOST=mirrors.aliyun.com \
+#
+# Default rather than hardcoded, because the fastest mirror depends on where the build runs.
+# On a Volcengine machine the internal mirror wins by a wide margin (measured against
+# /pypi/simple/numpy/ from the Ascend host: ivolces 26 ms, aliyun 75 ms, volces 619 ms) but
+# mirrors.ivolces.com does not even resolve outside their network, so it cannot be the
+# default. A build arg is the right knob here and a pipeline environment variable is not:
+# the latter never reaches a RUN layer.
+#   --build-arg PIP_INDEX=https://mirrors.ivolces.com/pypi/simple/ --build-arg PIP_HOST=mirrors.ivolces.com
+ARG PIP_INDEX=https://mirrors.aliyun.com/pypi/simple/
+ARG PIP_HOST=mirrors.aliyun.com
+ENV PIP_INDEX_URL=${PIP_INDEX} \
+    PIP_TRUSTED_HOST=${PIP_HOST} \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
 # Freeze the base image's torch stack into a pip constraint before installing anything.
