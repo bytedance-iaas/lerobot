@@ -705,6 +705,150 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             # Also compile the main forward pass used during training
             self.forward = torch.compile(self.forward, mode=config.compile_mode)
 
+    @staticmethod
+    def _matmul_params(module: nn.Module) -> int:
+        """Parameters that multiply the token stream, i.e. 2 FLOPs each per token.
+
+        Counted structurally rather than from a table of widths and depths, so it cannot
+        drift when the architecture does -- the same reason nanochat counts `Linear`
+        weights instead of deriving them. Here the set is Linear plus Conv2d, because
+        SigLIP's patch embedding is a conv whose kernel equals its stride: one matmul per
+        patch, with `in_channels * kh * kw` as the contraction. Excluded: nn.Embedding
+        (a lookup, no matmul), norms and per-layer scalars (elementwise), and every bias
+        (an add, not a MAC).
+        """
+        return sum(
+            m.weight.numel()
+            for m in module.modules()
+            if isinstance(m, nn.Linear | nn.Conv2d) and getattr(m, "weight", None) is not None
+        )
+
+    @staticmethod
+    def _trainable(module: nn.Module) -> bool:
+        return any(p.requires_grad for p in module.parameters())
+
+    def estimate_flops(self, *, n_images: int = 1, text_tokens: int | None = None) -> dict[str, float]:
+        """Model FLOPs for ONE training sample (forward + backward), by architecture.
+
+        Matmuls only, and only the mathematically necessary ones -- which is what MFU is
+        defined over. Specifically NOT counted:
+
+        * recompute. `gradient_checkpointing_enable()` re-runs forwards and that work is
+          real, but it is hardware work, not model work, so it belongs to HFU. A profile
+          of a checkpointed run DOES see the recomputed kernels, so expect
+          `lerobot.utils.profiler_summary` to read higher than this by roughly the
+          recomputed fraction. That gap is a measurement, not a disagreement.
+        * norms, softmax, rotary, activations -- bandwidth-bound and negligible in FLOPs.
+          Every published MFU omits them; including them here would make this number
+          incomparable with everyone else's.
+        * the cube's 16-alignment padding, which `aic_cube_fops` does bill.
+
+        Unlike a decoder-only LM there is no single FLOPs-per-token: pi05 is three towers
+        over three different token counts (image patches, prefix, action suffix), so a
+        `6 * params * tokens` formula over the whole model would be wrong. Each tower is
+        costed against the tokens it actually sees.
+
+        The forward/backward factor per tower is read off `requires_grad`, not off the
+        config flags, so `freeze_vision_encoder` / `train_expert_only` are honoured
+        however they were applied:
+          3x -- trainable: forward, plus dX and dW.
+          2x -- frozen, but something upstream trains, so dX still has to flow back.
+          1x -- frozen with nothing trainable upstream: forward only.
+
+        Args:
+            n_images: cameras per observation. Each one adds a vision-tower pass AND
+                lengthens the prefix, so cost grows faster than linearly.
+            text_tokens: language tokens in the prefix; defaults to the config's
+                `tokenizer_max_length`, which is what training pads to.
+
+        Returns:
+            Per-part TFLOP plus a ``total`` key, in FLOPs (not TFLOPs).
+        """
+        cfg = self.config
+        text_tokens = cfg.tokenizer_max_length if text_tokens is None else text_tokens
+
+        pg = self.paligemma_with_expert
+        vision = pg.paligemma.model.vision_tower
+        projector = pg.paligemma.model.multi_modal_projector
+        vlm = pg.paligemma.model.language_model
+        expert = pg.gemma_expert.model
+
+        vis_cfg = pg.paligemma.config.vision_config
+        patches = (vis_cfg.image_size // vis_cfg.patch_size) ** 2
+        prefix = n_images * patches + text_tokens
+        suffix = cfg.chunk_size
+
+        vis_train = self._trainable(vision)
+        vlm_train = self._trainable(vlm)
+        # dX has to flow into a frozen tower only if something in front of it trains.
+        vis_mult = 3.0 if vis_train else 1.0
+        vlm_mult = 3.0 if vlm_train else (2.0 if vis_train else 1.0)
+        exp_mult = 3.0 if self._trainable(expert) else (2.0 if (vis_train or vlm_train) else 1.0)
+
+        def attn_fwd(q_len: int, kv_len: int, heads: int, head_dim: int, layers: int) -> float:
+            """QK^T + AV, forward, summed over layers.
+
+            Counted at the full q_len x kv_len even where a block-causal mask hides part
+            of it: the fused Ascend kernel computes whole tiles and masks after, and
+            `profiler_summary.model_flops` reads those same full shapes off
+            FlashAttentionScore. Both overcount identically, which is what lets the two
+            derivations be compared at all.
+
+            Independent of num_key_value_heads -- MQA/GQA shrink the K/V projections and
+            the KV cache, not the score matrix, since each query head still scores against
+            the shared keys.
+            """
+            return 4.0 * layers * heads * q_len * kv_len * head_dim
+
+        txt = pg.paligemma.config.text_config
+        exp_cfg = pg.gemma_expert.config
+
+        parts: dict[str, float] = {}
+
+        # SigLIP tower + the projector onto the VLM width, once per image.
+        vis_fwd = 2.0 * self._matmul_params(vision) * patches + attn_fwd(
+            patches,
+            patches,
+            vis_cfg.num_attention_heads,
+            vis_cfg.hidden_size // vis_cfg.num_attention_heads,
+            vis_cfg.num_hidden_layers,
+        )
+        vis_fwd += 2.0 * self._matmul_params(projector) * patches
+        parts[f"vision tower x{n_images}"] = vis_fwd * n_images * vis_mult
+
+        # VLM over the prefix. Bidirectional within the prefix, which never sees the suffix.
+        vlm_fwd = 2.0 * self._matmul_params(vlm) * prefix + attn_fwd(
+            prefix, prefix, txt.num_attention_heads, txt.head_dim, txt.num_hidden_layers
+        )
+        parts["VLM"] = vlm_fwd * vlm_mult
+
+        # Action expert over the suffix, whose queries attend to prefix + suffix.
+        exp_fwd = 2.0 * self._matmul_params(expert) * suffix + attn_fwd(
+            suffix,
+            prefix + suffix,
+            exp_cfg.num_attention_heads,
+            exp_cfg.head_dim,
+            exp_cfg.num_hidden_layers,
+        )
+        parts["action expert"] = exp_fwd * exp_mult
+
+        # Action in/out projections run per action token; the time MLP runs once a sample.
+        # Their multipliers follow the same rule, and they differ: the input projections
+        # are fed raw actions and the raw timestep, so nothing upstream of them can need
+        # dX, while the output projection sits behind the expert and does.
+        upstream_trains = vis_train or vlm_train or self._trainable(expert)
+        in_fwd = 2.0 * self._matmul_params(self.action_in_proj) * suffix
+        in_fwd += 2.0 * (self._matmul_params(self.time_mlp_in) + self._matmul_params(self.time_mlp_out))
+        in_mult = 3.0 if self._trainable(self.action_in_proj) else 1.0
+        out_fwd = 2.0 * self._matmul_params(self.action_out_proj) * suffix
+        out_mult = (
+            3.0 if self._trainable(self.action_out_proj) else (2.0 if upstream_trains else 1.0)
+        )
+        parts["action heads"] = in_fwd * in_mult + out_fwd * out_mult
+
+        parts["total"] = sum(parts.values())
+        return parts
+
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
         self.gradient_checkpointing_enabled = True
@@ -1265,6 +1409,13 @@ class PI05Policy(PreTrainedPolicy):
             fixed_state_dict[new_key] = value
 
         return fixed_state_dict
+
+    def estimate_flops(self, *, n_images: int = 1, text_tokens: int | None = None) -> dict[str, float]:
+        """Model FLOPs for one training sample (fwd+bwd). See `PI05Pytorch.estimate_flops`.
+
+        `benchmarks/mfu.py` divides this by a measured step time to get MFU.
+        """
+        return self.model.estimate_flops(n_images=n_images, text_tokens=text_tokens)
 
     def get_optim_params(self) -> dict:
         return self.parameters()
