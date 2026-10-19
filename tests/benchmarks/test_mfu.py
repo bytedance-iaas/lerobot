@@ -23,6 +23,7 @@ Every model here is built on the meta device: parameter *counts* do not need par
 """
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -140,3 +141,77 @@ def test_recompute_is_not_counted():
     before = m.estimate_flops()["total"]
     m.gradient_checkpointing_enable()
     assert m.estimate_flops()["total"] == before
+
+
+# --- groot -----------------------------------------------------------------------------
+# GR00T N1.7's backbone config lives in `nvidia/Cosmos-Reason2-2B`, a GATED repo, so these
+# are skipped unless a local copy is pointed at by GROOT_BACKBONE_PATH. What survives
+# without it is the refusal to guess, which is the part most likely to rot into a default.
+
+
+def test_groot_is_registered():
+    assert "groot" in mfu.POLICIES
+
+
+def test_groot_refuses_to_guess_the_prompt_length():
+    """text_tokens is prompt-dependent. A default here would silently rescale every MFU."""
+    with pytest.raises(SystemExit, match="text-tokens"):
+        mfu.POLICIES["groot"](n_images=1)
+
+
+def _groot(**overrides):
+    path = os.environ.get("GROOT_BACKBONE_PATH")
+    if not path:
+        pytest.skip("set GROOT_BACKBONE_PATH to a local Cosmos-Reason2-2B config directory")
+    from lerobot.policies.groot.groot_n1_7 import GR00TN17, GR00TN17Config
+
+    cfg = GR00TN17Config(model_name=path, **overrides)
+    with torch.device("meta"):
+        return GR00TN17(cfg, load_backbone_weights=False)
+
+
+def test_groot_truncates_the_llm_to_select_layer():
+    """`select_layer` pops decoder layers, so the cost must follow the kept ones."""
+    short = _groot(select_layer=8).estimate_flops(text_tokens=19)
+    long = _groot(select_layer=16).estimate_flops(text_tokens=19)
+    assert "LLM (8 of 28 layers)" in short
+    assert "LLM (16 of 28 layers)" in long
+    assert long["LLM (16 of 28 layers)"] == pytest.approx(2 * short["LLM (8 of 28 layers)"], rel=0.02)
+
+
+def test_groot_frozen_backbone_is_forward_only():
+    """Unfreezing the ViT must triple it: forward, dX and dW instead of forward alone."""
+    frozen = _groot().estimate_flops(text_tokens=19)
+    tuned = _groot(tune_visual=True).estimate_flops(text_tokens=19)
+    assert tuned["vision tower x1"] == pytest.approx(3 * frozen["vision tower x1"], rel=1e-6)
+
+
+def test_groot_dit_is_half_self_half_cross():
+    """`interleave_self_attention` alternates, so the split must come out even."""
+    parts = _groot().estimate_flops(text_tokens=19)
+    assert any(k.startswith("DiT (16 self + 16 cross)") for k in parts)
+
+
+def test_groot_category_weights_are_not_billed_per_embodiment():
+    """`CategorySpecificLinear` selects one of `max_num_embodiments` slices per sample.
+
+    Counting the whole parameter would multiply the projectors by 32 on the default
+    config, which is exactly the kind of error that hides inside a plausible total.
+    """
+    few = _groot(max_num_embodiments=2).estimate_flops(text_tokens=19)
+    many = _groot(max_num_embodiments=64).estimate_flops(text_tokens=19)
+    assert few["state/action projectors"] == pytest.approx(many["state/action projectors"], rel=1e-9)
+
+
+def test_groot_cross_attention_scales_with_the_backbone_sequence():
+    """Cross-attention reads K and V off the VL tokens, so more text must cost more."""
+    short = _groot().estimate_flops(text_tokens=19)
+    long = _groot().estimate_flops(text_tokens=219)
+    key = next(k for k in short if k.startswith("DiT ("))
+    assert long[key] > short[key]
+
+
+def test_groot_counts_the_unused_lm_head_separately():
+    """It is real work the profile sees, and naming it is how it gets noticed."""
+    parts = _groot().estimate_flops(text_tokens=19)
+    assert parts["unused LM head"] > 0
