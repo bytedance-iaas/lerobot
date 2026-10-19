@@ -112,6 +112,8 @@ class GrootPolicy(PreTrainedPolicy):
             _tie_unused_qwen_lm_head(qwen_model)
         if self.config.model_params_fp32:
             self._cast_model_parameters_to_fp32(model)
+        if self.config.compile_model:
+            model.enable_compile(self.config.compile_mode, backend=self.config.compile_backend)
         return model
 
     @staticmethod

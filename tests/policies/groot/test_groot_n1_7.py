@@ -3023,3 +3023,159 @@ def test_gr00t_n1_7_model_forward_with_mocked_backbone():
     inference_inputs = {key: value for key, value in inputs.items() if key != "action"}
     action_output = model.get_action(inference_inputs)
     assert action_output["action_pred"].shape == (2, config.action_horizon, config.max_action_dim)
+
+
+def test_groot_compile_is_off_by_default():
+    config = GrootConfig(device="cpu")
+
+    assert config.compile_model is False
+    assert config.compile_mode == "reduce-overhead"
+    assert config.compile_backend is None
+
+
+@pytest.mark.parametrize(
+    ("compile_model", "expected_mode"), [(False, None), (True, ("max-autotune", "npugraph_ex"))]
+)
+def test_groot_policy_installs_compile_only_when_asked(monkeypatch, compile_model, expected_mode):
+    pytest.importorskip("transformers")
+
+    from lerobot.policies.groot.groot_n1_7 import GR00TN17
+
+    class _CompileRecordingModel(_DummyGrootModel):
+        def __init__(self):
+            super().__init__()
+            self.compiled_with = None
+
+        def enable_compile(self, mode, backend=None):
+            self.compiled_with = (mode, backend)
+
+    model = _CompileRecordingModel()
+    monkeypatch.setattr(GR00TN17, "from_pretrained", classmethod(lambda cls, **kwargs: model))
+    config = _groot_config()
+    config.compile_model = compile_model
+    config.compile_mode = "max-autotune"
+    config.compile_backend = "npugraph_ex"
+
+    GrootPolicy(config)
+
+    assert model.compiled_with == expected_mode
+
+
+def test_gr00t_n1_7_compile_copies_the_tensors_crossing_the_boundary(monkeypatch):
+    """The action head must not read the backbone's own output tensors.
+
+    Under a CUDA-graph compile mode those tensors are overwritten by the next replay, so
+    `forward` copies them between the two compiled callables. The copy must be a `clone`,
+    not a `detach` -- a detach would silently stop training the backbone.
+    """
+
+    pytest.importorskip("diffusers")
+    pytest.importorskip("transformers")
+
+    from transformers.feature_extraction_utils import BatchFeature
+
+    from lerobot.policies.groot.groot_n1_7 import GR00TN17, GR00TN17Config
+
+    config = GR00TN17Config(
+        backbone_embedding_dim=32,
+        hidden_size=32,
+        input_embedding_dim=32,
+        max_state_dim=7,
+        max_action_dim=5,
+        action_horizon=4,
+        state_history_length=1,
+        num_inference_timesteps=2,
+        max_num_embodiments=4,
+        use_alternate_vl_dit=False,
+        use_vlln=True,
+        vl_self_attention_cfg={"num_layers": 0},
+        state_dropout_prob=0.0,
+        diffusion_model_cfg={
+            "positional_embeddings": None,
+            "num_layers": 1,
+            "num_attention_heads": 2,
+            "attention_head_dim": 16,
+            "norm_type": "ada_norm",
+            "dropout": 0.0,
+            "final_dropout": False,
+            "output_dim": 32,
+            "interleave_self_attention": False,
+        },
+    )
+
+    class MockBackbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(()))
+            self.features = None
+
+        def prepare_input(self, inputs):
+            return BatchFeature(data=inputs)
+
+        def forward(self, inputs):
+            batch_size = inputs["state"].shape[0]
+            self.features = self.weight + torch.randn(batch_size, 3, config.backbone_embedding_dim)
+            return BatchFeature(
+                data={
+                    "backbone_features": self.features,
+                    "backbone_attention_mask": torch.ones(batch_size, 3, dtype=torch.bool),
+                    "image_mask": torch.zeros(batch_size, 3, dtype=torch.bool),
+                }
+            )
+
+        def set_trainable_parameters(self, *args, **kwargs):
+            return None
+
+    with patch(
+        "lerobot.policies.groot.groot_n1_7.get_backbone_cls",
+        return_value=lambda **kwargs: MockBackbone(),
+    ):
+        model = GR00TN17(config)
+
+    # Stand in for the compiler: the point of the test is the boundary, not inductor.
+    compiled_calls = []
+
+    def fake_compile(fn, *, dynamic, mode=None, backend=None):
+        def wrapper(*args, **kwargs):
+            # Snapshot the tensor on the way IN: the action head rewrites this very entry
+            # (`process_backbone_output` applies the VL LayerNorm into it).
+            compiled_calls.append((fn.__name__, args[0].get("backbone_features")))
+            return fn(*args, **kwargs)
+
+        compiled_calls.append(("compiled", fn.__self__.__class__.__name__, mode, backend, dynamic))
+        return wrapper
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    model.enable_compile("reduce-overhead")
+
+    assert compiled_calls == [
+        ("compiled", "MockBackbone", "reduce-overhead", None, False),
+        ("compiled", "GR00TN17ActionHead", "reduce-overhead", None, False),
+    ]
+    compiled_calls.clear()
+
+    # A backend replaces the mode rather than joining it: `mode` is inductor's knob.
+    model.enable_compile("reduce-overhead", backend="npugraph_ex")
+    assert compiled_calls == [
+        ("compiled", "MockBackbone", None, "npugraph_ex", False),
+        ("compiled", "GR00TN17ActionHead", None, "npugraph_ex", False),
+    ]
+    compiled_calls.clear()
+
+    inputs = {
+        "state": torch.randn(2, config.state_history_length, config.max_state_dim),
+        "action": torch.randn(2, config.action_horizon, config.max_action_dim),
+        "action_mask": torch.ones(2, config.action_horizon, config.max_action_dim),
+        "embodiment_id": torch.zeros(2, dtype=torch.long),
+    }
+    output = model.forward(inputs)
+
+    assert [call[0] for call in compiled_calls] == ["forward", "forward"]
+    assert compiled_calls[0][1] is None  # the backbone is handed the raw batch
+    handed_over = compiled_calls[1][1]
+    assert handed_over is not model.backbone.features
+    assert handed_over.data_ptr() != model.backbone.features.data_ptr()
+    torch.testing.assert_close(handed_over, model.backbone.features)
+
+    output["loss"].backward()
+    assert model.backbone.weight.grad is not None

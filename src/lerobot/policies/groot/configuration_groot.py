@@ -346,6 +346,28 @@ class GrootConfig(PreTrainedConfig):
     # The native N1.7 fine-tuning recipe keeps model parameters in FP32 and computes under BF16 autocast.
     model_params_fp32: bool = True
 
+    # torch.compile the training path (the backbone and the action head, as two graphs).
+    # N1.7 is launch-bound rather than compute-bound: the Qwen3-VL backbone packs images with
+    # `cu_seqlens`, so its ViT issues one attention launch PER SAMPLE per layer and the device
+    # sits idle between them. "reduce-overhead" replays those launches from a CUDA graph, which
+    # is where the win is -- measured on one H200, batch 32, pusht: step 0.268 -> 0.219 s (-18%),
+    # 119 -> 146 samples/s, MFU 12.8% -> 15.6%. Plain "default" mode buys nothing (fusion cannot
+    # cross the ViT's `Tensor.item()` graph break). Caveats: `dynamic=False` means one recompile
+    # per distinct padded prompt length, so a multi-task dataset with varied task strings can
+    # exhaust dynamo's recompile budget and fall back to eager; and this is a CUDA result -- see
+    # `compile_backend` for Ascend, where nothing compiles N1.7 yet.
+    compile_model: bool = False
+    compile_mode: str = "reduce-overhead"
+    # Non-default dynamo backend, which replaces `compile_mode` when set (`mode` is inductor's
+    # knob). It exists for Ascend, where none of the three routes compiles N1.7 as of
+    # torch 2.10 / torch_npu 2.10.0.post4 -- all three die inside Qwen3-VL's `cu_seqlens` path:
+    # the default inductor goes through triton-ascend and fails codegen ("NoTritonConfigsError"),
+    # "npugraph_ex" fails ACL capture (error 107025, and capturing the action head alone reports
+    # an unjoined stream), and "npu" (torchair GE) has no converter for
+    # `aten.repeat_interleave.self_int`. Batching that packed attention at the source would fix
+    # both the launch count and all three of these.
+    compile_backend: str | None = None
+
     # TODO(Steven): Remove these deprecated fields in a future release.
     # Deprecated Isaac-GR00T runner / GR00T N1.5 fields, plus the (never-wired) LoRA fields — all
     # unused by the LeRobot N1.7 implementation except the `tokenizer_assets_repo` N1.5 tripwire and

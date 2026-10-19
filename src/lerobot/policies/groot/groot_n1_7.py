@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from contextlib import suppress
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any
@@ -847,6 +848,9 @@ class GR00TN17(PreTrainedModel):
             load_pretrained_weights=load_backbone_weights,
         )
         self.action_head = GR00TN17ActionHead(config)
+        # torch.compile is opt-in and installed after construction, by `enable_compile`.
+        self._compiled_backbone: Callable[..., BatchFeature] | None = None
+        self._compiled_action_head: Callable[..., BatchFeature] | None = None
         self.post_init()
 
     def prepare_input(self, inputs: dict[str, Any]) -> tuple[BatchFeature, BatchFeature]:
@@ -866,10 +870,46 @@ class GR00TN17(PreTrainedModel):
             tree.map_structure(to_device_with_dtype, action_inputs),
         )
 
+    def enable_compile(self, mode: str = "reduce-overhead", backend: str | None = None) -> None:
+        """torch.compile the training path: the backbone and the action head, separately.
+
+        Not one graph over `forward`, because `prepare_input` tokenises, calls into dm-tree
+        and moves python containers onto the device -- nothing dynamo can trace usefully.
+
+        What is compiled is the two bound `forward` methods, not the modules. Compiling a
+        module would replace it with an `OptimizedModule` wrapper and prefix every
+        `state_dict` key with `_orig_mod.`, which would break checkpoint round-trips.
+
+        `backend` selects a non-default dynamo backend, and then `mode` is not passed at
+        all: `mode` is an inductor concept, and the backend that replaces inductor takes
+        its own configuration (torchair's `npugraph_ex` is the Ascend case).
+        """
+
+        kwargs: dict[str, Any] = {"backend": backend} if backend else {"mode": mode}
+        self._compiled_backbone = torch.compile(self.backbone.forward, dynamic=False, **kwargs)
+        self._compiled_action_head = torch.compile(self.action_head.forward, dynamic=False, **kwargs)
+
     def forward(self, inputs: dict[str, Any]) -> BatchFeature:
         backbone_inputs, action_inputs = self.prepare_input(inputs)
-        backbone_outputs = self.backbone(backbone_inputs)
-        return self.action_head(backbone_outputs, action_inputs)
+        if self._compiled_backbone is None:
+            backbone_outputs = self.backbone(backbone_inputs)
+            return self.action_head(backbone_outputs, action_inputs)
+
+        backbone_outputs = self._compiled_backbone(backbone_inputs)
+        # Own every tensor that crosses from one compiled region into the other. Under a
+        # CUDA-graph mode ("reduce-overhead", "max-autotune") the backbone's outputs live in
+        # a memory pool that the next replay overwrites, and the action head reads them after
+        # that replay has begun -- which raises "accessing tensor output of CUDAGraphs that
+        # has been overwritten by a subsequent run". The copy has to happen HERE, between the
+        # two compiled callables: inside either of them dynamo traces it into the graph, so
+        # the copy lands in the same doomed pool and nothing is gained.
+        backbone_outputs = BatchFeature(
+            data={
+                key: value.clone() if isinstance(value, torch.Tensor) else value
+                for key, value in backbone_outputs.items()
+            }
+        )
+        return self._compiled_action_head(backbone_outputs, action_inputs)
 
     def get_action(self, inputs: dict[str, Any], options: dict[str, Any] | None = None) -> BatchFeature:
         backbone_inputs, action_inputs = self.prepare_input(inputs)
