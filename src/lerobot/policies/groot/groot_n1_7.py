@@ -876,6 +876,171 @@ class GR00TN17(PreTrainedModel):
         backbone_outputs = self.backbone(backbone_inputs)
         return self.action_head.get_action(backbone_outputs, action_inputs, options)
 
+    def estimate_flops(self, *, text_tokens: int, n_images: int = 1) -> dict[str, float]:
+        """Model FLOPs for ONE training sample (forward + backward), by architecture.
+
+        Matmuls only, which is what MFU is defined over: norms, softmax, rotary and
+        activations are bandwidth-bound and every published MFU omits them. Recompute is
+        not counted either -- that is HFU's business.
+
+        N1.7 cannot be costed the way a decoder-only LM is, and not even the way pi05 is.
+        Four different token counts are in play at once, and billing a weight against the
+        wrong one is the easiest way to be quietly wrong:
+
+        * ``patches``  -- the ViT runs on unmerged patches.
+        * ``merged``   -- the spatial merger and deepstack mergers run on 2x2-merged groups.
+        * ``vl_len``   -- the (truncated) LLM, the VL self-attention, and the DiT's
+          CROSS-attention keys and values run on the backbone sequence.
+        * ``sa_len``   -- the DiT's queries, outputs and feed-forwards run on the 1 state
+          plus ``action_horizon`` action tokens, and on nothing else.
+        * ``1``        -- the timestep conditioning. ``AdaLayerNorm.linear``,
+          ``proj_out_1`` and the timestep encoder consume ``temb``, which is one vector
+          per sample, not one per token. Billing those 32 AdaLayerNorm projections
+          against ``sa_len`` would inflate the DiT by a large factor.
+
+        Three further traps, all of them things the profile would have caught later:
+
+        * ``CategorySpecificLinear`` holds a raw ``(max_num_embodiments, in, out)``
+          parameter and selects one slice per sample with ``bmm``. Counting ``W.numel()``
+          overcounts by ``max_num_embodiments`` -- 32x on the default config.
+        * ``AlternateVLDiT`` hands every cross-attention block the FULL backbone sequence
+          and only varies the mask, so ``attend_text_every_n_blocks`` changes no FLOPs.
+        * the Qwen ``lm_head`` runs. ``Qwen3Backbone.forward`` calls the whole
+          ``Qwen3VLForConditionalGeneration`` and lifts the features it wants off a
+          forward hook, so a ``vocab_size``-wide projection is computed and discarded on
+          every step. It is counted here, under its own key, because the profile counts
+          it too -- but it is pure waste, and the key is there so it can be seen.
+
+        The forward/backward multiplier per part is read off ``requires_grad`` rather than
+        off the tune_* flags, so however they were applied is what gets costed. The
+        backbone is the most upstream module, so when it is frozen it costs 1x: there is
+        nothing in front of it for a gradient to reach.
+
+        Args:
+            text_tokens: language tokens in the backbone sequence. Prompt-dependent, so
+                there is no config field to default to -- measure it (an Ascend profile's
+                GEMM M dimension divided by the batch size gives ``vl_len``) or tokenize
+                the prompt. On pusht this is 19.
+            n_images: cameras per observation.
+
+        Returns:
+            Per-part FLOPs plus a ``total`` key.
+        """
+        cfg = self.config
+        vis_cfg = self.backbone.model.config.vision_config
+        txt_cfg = self.backbone.model.config.text_config
+
+        patches = (cfg.image_target_size[0] // vis_cfg.patch_size) * (
+            cfg.image_target_size[1] // vis_cfg.patch_size
+        )
+        merged = patches // (vis_cfg.spatial_merge_size**2)
+        vl_len = n_images * merged + text_tokens
+        sa_len = 1 + cfg.action_horizon  # one state token, then the action chunk
+
+        visual = self.backbone.model.model.visual
+        llm = self.backbone.language_model
+        head = self.action_head
+        dit = head.model
+
+        def trainable(module: nn.Module) -> bool:
+            return any(p.requires_grad for p in module.parameters())
+
+        # The backbone sees no gradient at all when frozen: nothing upstream of it trains.
+        backbone_mult = 3.0 if trainable(self.backbone) else 1.0
+        head_mult = 3.0 if trainable(head) else (2.0 if trainable(self.backbone) else 1.0)
+
+        def linear_flops(module: nn.Module, tokens: int, *, skip: tuple[str, ...] = ()) -> float:
+            """2 FLOPs per weight per token, over every Linear/Conv2d in the subtree."""
+            return (
+                2.0
+                * tokens
+                * sum(
+                    m.weight.numel()
+                    for name, m in module.named_modules()
+                    if isinstance(m, nn.Linear | nn.Conv2d)
+                    and getattr(m, "weight", None) is not None
+                    and not name.endswith(skip)
+                )
+            )
+
+        def attn_flops(q_len: int, kv_len: int, heads: int, head_dim: int, layers: int) -> float:
+            """QK^T plus AV, forward, summed over layers. No weights, so no param count."""
+            return layers * 4.0 * q_len * kv_len * heads * head_dim
+
+        # ---- vision tower -------------------------------------------------------------
+        vit = linear_flops(visual.blocks, patches)
+        vit += attn_flops(
+            patches, patches, vis_cfg.num_heads, vis_cfg.hidden_size // vis_cfg.num_heads, len(visual.blocks)
+        )
+        vit += linear_flops(visual.merger, merged)
+        if getattr(visual, "deepstack_merger_list", None) is not None:
+            vit += linear_flops(visual.deepstack_merger_list, merged)
+
+        # ---- truncated LLM ------------------------------------------------------------
+        text = linear_flops(llm.layers, vl_len)
+        text += attn_flops(
+            vl_len,
+            vl_len,
+            txt_cfg.num_attention_heads,
+            txt_cfg.hidden_size // txt_cfg.num_attention_heads,
+            len(llm.layers),
+        )
+
+        # ---- the LM head nobody reads -------------------------------------------------
+        lm_head = self.backbone.model.lm_head
+        wasted = 2.0 * vl_len * lm_head.weight.numel() if lm_head is not None else 0.0
+
+        # ---- VL self-attention projector ----------------------------------------------
+        vl_sa = 0.0
+        if isinstance(head.vl_self_attention, nn.Module) and not isinstance(
+            head.vl_self_attention, nn.Identity
+        ):
+            blocks = head.vl_self_attention.transformer_blocks
+            vl_sa = linear_flops(blocks, vl_len)
+            first = blocks[0].attn1
+            heads, dim_head = first.heads, first.to_q.weight.shape[0] // first.heads
+            vl_sa += attn_flops(vl_len, vl_len, heads, dim_head, len(blocks))
+
+        # ---- the DiT ------------------------------------------------------------------
+        # Each block is self-attention or cross-attention; `to_k`/`to_v` give it away,
+        # because only a cross block projects from `cross_attention_dim`.
+        dit_flops = linear_flops(dit.timestep_encoder, 1)
+        dit_flops += 2.0 * 1 * dit.proj_out_1.weight.numel()
+        dit_flops += 2.0 * sa_len * dit.proj_out_2.weight.numel()
+        n_self = n_cross = 0
+        for block in dit.transformer_blocks:
+            attn = block.attn1
+            cross = attn.to_k.weight.shape[1] != attn.to_q.weight.shape[1]
+            kv_len = vl_len if cross else sa_len
+            n_cross += cross
+            n_self += not cross
+            dit_flops += 2.0 * sa_len * (attn.to_q.weight.numel() + attn.to_out[0].weight.numel())
+            dit_flops += 2.0 * kv_len * (attn.to_k.weight.numel() + attn.to_v.weight.numel())
+            dit_flops += linear_flops(block.ff, sa_len)
+            dit_flops += 2.0 * 1 * block.norm1.linear.weight.numel()  # temb, one per sample
+            heads, dim_head = attn.heads, attn.to_q.weight.shape[0] // attn.heads
+            dit_flops += attn_flops(sa_len, kv_len, heads, dim_head, 1)
+
+        # ---- the category-specific encoders and decoder -------------------------------
+        # One embodiment is selected per sample, so a (C, in, out) parameter costs in*out.
+        def category_flops(module: nn.Module, tokens: int) -> float:
+            return 2.0 * tokens * sum(p.shape[1] * p.shape[2] for p in module.parameters() if p.dim() == 3)
+
+        proj = category_flops(head.state_encoder, 1)
+        proj += category_flops(head.action_encoder, cfg.action_horizon)
+        proj += category_flops(head.action_decoder, sa_len)
+
+        parts = {
+            f"vision tower x{n_images}": backbone_mult * vit,
+            f"LLM ({len(llm.layers)} of {txt_cfg.num_hidden_layers} layers)": backbone_mult * text,
+            "unused LM head": backbone_mult * wasted,
+            "VL self-attention": head_mult * vl_sa,
+            f"DiT ({n_self} self + {n_cross} cross)": head_mult * dit_flops,
+            "state/action projectors": head_mult * proj,
+        }
+        parts["total"] = sum(parts.values())
+        return parts
+
     @property
     def device(self) -> torch.device:
         return next(iter(self.parameters())).device

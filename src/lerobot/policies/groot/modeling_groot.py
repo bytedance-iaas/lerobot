@@ -281,6 +281,10 @@ class GrootPolicy(PreTrainedPolicy):
         policy.eval()
         return policy
 
+    def estimate_flops(self, *, text_tokens: int, n_images: int = 1) -> dict[str, float]:
+        """Model FLOPs for one training sample. See `GR00TN17.estimate_flops`."""
+        return self._groot_model.estimate_flops(text_tokens=text_tokens, n_images=n_images)
+
     def get_optim_params(self):  # type: ignore[override]
         """Isaac-GR00T excludes biases and normalization parameters from weight decay."""
         return self._build_weight_decay_parameter_groups(self)

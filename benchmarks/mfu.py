@@ -31,13 +31,19 @@ This is the second of two independent paths to the MFU numerator:
   has formulas for.
 * this one derives the cost from the architecture. No run, no hardware, checkable by hand.
 
-They share no code, which is what makes agreement evidence. Measured on pi05 / pusht /
-one 950PR card, batch 32, bf16, one camera: this module says 6.314 TFLOP/sample, the
-profile says 6.099 -- 3.4% apart. The residual is known and sits in two places: the
-fused attention kernel pads the sequence (profile reads 8% above the analytic attention
-term, which is itself only ~2% of the total), and this module bills every Linear in the
-tree against its tower's token count, which slightly overcounts conditioning projections
-that in fact run once per sample. Neither is worth closing by fudging one side.
+They share no code, which is what makes agreement evidence. Both measured on pusht, one
+950PR card, batch 32, one camera:
+
+    pi05    6.314 TFLOP/sample here   6.099 from the profile   3.4% apart
+    groot   0.720                     0.719                    0.1% apart
+
+pi05's residual is known and sits in two places: the fused attention kernel pads the
+sequence (profile reads 8% above the analytic attention term, which is itself only ~2% of
+the total), and pi05's own `estimate_flops` bills every Linear in a tower against that
+tower's token count, which slightly overcounts conditioning projections that in fact run
+once per sample. Neither is worth closing by fudging one side. groot agrees more closely
+because its `estimate_flops` attributes those conditioning projections explicitly -- it
+has to, since N1.7 runs five different token counts at once.
 
 Expect the profile to read HIGHER on a gradient-checkpointed run: recompute is real work
 that it sees and this does not count, because recompute is HFU's business, not MFU's.
@@ -45,6 +51,9 @@ that it sees and this does not count, because recompute is HFU's business, not M
 Usage:
     # FLOPs only
     python benchmarks/mfu.py pi05 --images 1
+
+    # groot needs the prompt's token count, and a local copy of its gated backbone config
+    python benchmarks/mfu.py groot --text-tokens 19 --backbone-path /path/to/Cosmos-Reason2-2B
 
     # MFU from a step time measured in a train log
     python benchmarks/mfu.py pi05 --images 1 --batch 32 --step-s 1.84
@@ -121,13 +130,48 @@ def pi05_flops(**kwargs) -> dict[str, float]:
 
     n_images = kwargs.pop("n_images", 1)
     text_tokens = kwargs.pop("text_tokens", None)
-    cfg = PI05Config(**{k: v for k, v in kwargs.items() if v is not None})
+    fields = ("chunk_size", "freeze_vision_encoder", "train_expert_only")
+    cfg = PI05Config(**{k: kwargs[k] for k in fields if kwargs.get(k) is not None})
     with torch.device("meta"):
         model = PI05Pytorch(cfg)
     return model.estimate_flops(n_images=n_images, text_tokens=text_tokens)
 
 
-POLICIES = {"pi05": pi05_flops}
+def groot_flops(**kwargs) -> dict[str, float]:
+    """Build GR00T N1.7 on the meta device from config and ask it what a sample costs.
+
+    `load_backbone_weights=False` keeps this off the 6.5 GB checkpoint -- the backbone is
+    built from its config, which is all a parameter count needs. That config does have to
+    be reachable, and `nvidia/Cosmos-Reason2-2B` is a gated repo, so off-box you point
+    `--backbone-path` at a local copy of it.
+    """
+    import torch
+
+    from lerobot.policies.groot.groot_n1_7 import GR00TN17, GR00TN17Config
+
+    text_tokens = kwargs.get("text_tokens")
+    if text_tokens is None:
+        raise SystemExit(
+            "groot needs --text-tokens. The backbone's language token count is prompt-\n"
+            "dependent and no config field records it, so there is nothing honest to\n"
+            "default to. Read it off a profile -- a GEMM's M divided by the batch size is\n"
+            "the whole backbone sequence, minus n_images * 64 merged image tokens -- or\n"
+            "tokenize the prompt. On pusht it is 19."
+        )
+    overrides = {
+        name: kwargs[name]
+        for name in ("action_horizon", "tune_llm", "tune_visual", "select_layer")
+        if kwargs.get(name) is not None
+    }
+    if kwargs.get("backbone_path"):
+        overrides["model_name"] = kwargs["backbone_path"]
+    cfg = GR00TN17Config(**overrides)
+    with torch.device("meta"):
+        model = GR00TN17(cfg, load_backbone_weights=False)
+    return model.estimate_flops(n_images=kwargs.get("n_images", 1), text_tokens=text_tokens)
+
+
+POLICIES = {"pi05": pi05_flops, "groot": groot_flops}
 
 
 class Peak(NamedTuple):
@@ -192,6 +236,11 @@ def main() -> None:
     ap.add_argument("--chunk-size", type=int, help="action horizon")
     ap.add_argument("--freeze-vision-encoder", action="store_true", default=None)
     ap.add_argument("--train-expert-only", action="store_true", default=None)
+    ap.add_argument("--action-horizon", type=int, help="groot: action chunk length")
+    ap.add_argument("--select-layer", type=int, help="groot: LLM layers kept")
+    ap.add_argument("--tune-llm", action="store_true", default=None, help="groot: unfreeze the LLM")
+    ap.add_argument("--tune-visual", action="store_true", default=None, help="groot: unfreeze the ViT")
+    ap.add_argument("--backbone-path", help="groot: local copy of the (gated) Cosmos-Reason2-2B config")
     ap.add_argument("--batch", type=int, default=1, help="per-rank batch size")
     ap.add_argument("--ranks", type=int, default=1, help="world size, for global throughput")
     ap.add_argument("--step-s", type=float, help="measured seconds per step; omit for FLOPs only")
@@ -232,6 +281,11 @@ def main() -> None:
         chunk_size=args.chunk_size,
         freeze_vision_encoder=args.freeze_vision_encoder,
         train_expert_only=args.train_expert_only,
+        action_horizon=args.action_horizon,
+        select_layer=args.select_layer,
+        tune_llm=args.tune_llm,
+        tune_visual=args.tune_visual,
+        backbone_path=args.backbone_path,
     )
     per_sample = parts.pop("total")
     per_step = per_sample * args.batch
