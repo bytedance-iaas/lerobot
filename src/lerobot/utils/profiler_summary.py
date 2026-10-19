@@ -9,8 +9,11 @@ Two numbers come out of one profile:
 * **MFU** -- model FLOPs are computed from the per-kernel `Input Shapes`/`Output Shapes`
   that `kernel_details.csv` records. This works with the fused NPU kernels on, which
   `torch.utils.flop_counter` cannot do, and it is not inflated by the cube's alignment
-  padding the way the `aic_cube_fops` PMU counter is. Validated against
-  `benchmarks/mfu.py` on Pi0.5/950PR: 8.195411345 vs 8.195414230 TFLOP/sample (3e-7).
+  padding the way the `aic_cube_fops` PMU counter is. Cross-checked against
+  `benchmarks/mfu.py`, which derives the same quantity from the architecture instead and
+  shares no code with this: on pi05 / pusht / one 950PR card at batch 32 in bf16 with one
+  camera, 6.099 TFLOP/sample here against 6.314 there, 3.4% apart. `mfu.py`'s docstring
+  accounts for the residual.
 
 * **compute/communication overlap** -- from `step_trace_time.csv`, as
   `Overlapped / (Overlapped + Communication(Not Overlapped))`.
