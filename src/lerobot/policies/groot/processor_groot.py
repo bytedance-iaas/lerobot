@@ -1361,10 +1361,163 @@ def _align_video_horizon(video: np.ndarray, horizon: int | None) -> np.ndarray:
     return np.concatenate([pad, video], axis=1)
 
 
+_GROOT_IMAGE_PROCESSOR_CLS: type | None = None
+
+
+def _groot_image_processor_cls() -> type:
+    """The Qwen2-VL image processor, with a patchify that also runs on an Ascend device.
+
+    Nothing in the upstream processor is accelerator-specific: it is torchvision plus plain
+    tensor ops, so passing `device` is the whole of what decides where it runs, and that
+    matters because the work is memory movement with no arithmetic in it -- at batch 32 the
+    host spends ~20 ms on the float32 cast, the normalize and the patch shuffle that a device
+    does in ~0.16 ms.
+
+    One op does not survive the trip. Upstream patchifies by viewing the batch as TEN
+    dimensions, permuting, then reshaping; CANN's `aclnnInplaceCopy` takes at most eight
+    ("AclNN_Parameter_Error(EZ1001): The self tensor cannot be larger than 8 dimensions"), so
+    on an NPU tensor that reshape raises and the processor is stuck on the host. The override
+    expresses the same permutation in two passes of at most seven dimensions.
+
+    It applies to NPU tensors only. The two-pass form is bit-identical to upstream -- a test
+    pins that -- but it walks memory twice, so it is slower on a host, and CPU and CUDA keep
+    calling upstream untouched.
+
+    Built lazily: `Qwen2VLImageProcessor` is None when transformers is missing, and a class
+    statement at module scope would then fail at import time rather than at use.
+    """
+
+    global _GROOT_IMAGE_PROCESSOR_CLS
+    if _GROOT_IMAGE_PROCESSOR_CLS is not None:
+        return _GROOT_IMAGE_PROCESSOR_CLS
+
+    require_package("transformers", extra="groot")
+    from transformers.image_processing_utils import BatchFeature, SizeDict
+    from transformers.image_transforms import group_images_by_shape, reorder_images
+    from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
+
+    class GrootQwen2VLImageProcessor(Qwen2VLImageProcessor):  # type: ignore[misc,valid-type]
+        @staticmethod
+        def patchifies_over_eight_dims(images: list[torch.Tensor]) -> bool:
+            """Whether this batch has to avoid upstream's 10-dimensional reshape."""
+            return bool(images) and torch.is_tensor(images[0]) and images[0].device.type == "npu"
+
+        @staticmethod
+        def flatten_patches_low_rank(
+            patches: torch.Tensor,
+            *,
+            batch_size: int,
+            grid_t: int,
+            channel: int,
+            grid_h: int,
+            grid_w: int,
+            patch_size: int,
+            temporal_patch_size: int,
+            merge_size: int,
+        ) -> torch.Tensor:
+            """Upstream's 10-dimensional permutation, in two passes of at most 7 dimensions.
+
+            Upstream orders a patch by (grid_t, h-block, w-block, h-in-block, w-in-block) and
+            its features by (channel, temporal, y, x). Pass one does the spatial half with
+            everything else folded into one axis; pass two unfolds that axis and moves the
+            patch axis in front of the feature axes. Same element order, fewer dimensions.
+            """
+
+            blocks_h, blocks_w = grid_h // merge_size, grid_w // merge_size
+            height, width = patches.shape[-2:]
+            # (batch, grid_t * temporal, channel, H, W) -> (folded, H, W), channel fastest.
+            spatial = patches.reshape(-1, height, width)
+            spatial = spatial.view(-1, blocks_h, merge_size, patch_size, blocks_w, merge_size, patch_size)
+            spatial = spatial.permute(0, 1, 4, 2, 5, 3, 6)
+            spatial = spatial.reshape(-1, grid_h * grid_w, patch_size * patch_size)
+            unfolded = spatial.view(
+                batch_size, grid_t, temporal_patch_size, channel, grid_h * grid_w, patch_size * patch_size
+            )
+            unfolded = unfolded.permute(0, 1, 4, 3, 2, 5)
+            return unfolded.reshape(
+                batch_size,
+                grid_t * grid_h * grid_w,
+                channel * temporal_patch_size * patch_size * patch_size,
+            )
+
+        def _preprocess(self, images: list[torch.Tensor], **kwargs: Any) -> "BatchFeature":
+            if not self.patchifies_over_eight_dims(images):
+                return super()._preprocess(images, **kwargs)
+
+            patch_size = kwargs["patch_size"]
+            temporal_patch_size = kwargs["temporal_patch_size"]
+            merge_size = kwargs["merge_size"]
+            disable_grouping = kwargs["disable_grouping"]
+
+            grouped, index = group_images_by_shape(images, disable_grouping=disable_grouping)
+            resized_grouped = {}
+            for shape, stacked in grouped.items():
+                if kwargs["do_resize"]:
+                    size = kwargs["size"]
+                    resized_height, resized_width = smart_resize(
+                        *stacked.shape[-2:],
+                        factor=patch_size * merge_size,
+                        min_pixels=size.shortest_edge,
+                        max_pixels=size.longest_edge,
+                    )
+                    stacked = self.resize(
+                        image=stacked,
+                        size=SizeDict(height=resized_height, width=resized_width),
+                        resample=kwargs["resample"],
+                    )
+                resized_grouped[shape] = stacked
+            resized_images = reorder_images(resized_grouped, index)
+
+            grouped, index = group_images_by_shape(resized_images, disable_grouping=disable_grouping)
+            patches_grouped: dict[Any, torch.Tensor] = {}
+            grids_grouped: dict[Any, list[list[int]]] = {}
+            for shape, stacked in grouped.items():
+                resized_height, resized_width = stacked.shape[-2:]
+                patches = self.rescale_and_normalize(
+                    stacked,
+                    kwargs["do_rescale"],
+                    kwargs["rescale_factor"],
+                    kwargs["do_normalize"],
+                    kwargs["image_mean"],
+                    kwargs["image_std"],
+                )
+                if patches.ndim == 4:
+                    patches = patches.unsqueeze(1)
+                if patches.shape[1] % temporal_patch_size != 0:
+                    repeats = patches[:, -1:].repeat(1, temporal_patch_size - 1, 1, 1, 1)
+                    patches = torch.cat([patches, repeats], dim=1)
+                batch_size, grid_t, channel = patches.shape[:3]
+                grid_t = grid_t // temporal_patch_size
+                grid_h, grid_w = resized_height // patch_size, resized_width // patch_size
+                patches_grouped[shape] = self.flatten_patches_low_rank(
+                    patches,
+                    batch_size=batch_size,
+                    grid_t=grid_t,
+                    channel=channel,
+                    grid_h=grid_h,
+                    grid_w=grid_w,
+                    patch_size=patch_size,
+                    temporal_patch_size=temporal_patch_size,
+                    merge_size=merge_size,
+                )
+                grids_grouped[shape] = [[grid_t, grid_h, grid_w]] * batch_size
+
+            return BatchFeature(
+                data={
+                    "pixel_values": torch.cat(reorder_images(patches_grouped, index), dim=0),
+                    "image_grid_thw": torch.tensor(reorder_images(grids_grouped, index), dtype=torch.long),
+                },
+                tensor_type=kwargs["return_tensors"],
+            )
+
+    _GROOT_IMAGE_PROCESSOR_CLS = GrootQwen2VLImageProcessor
+    return _GROOT_IMAGE_PROCESSOR_CLS
+
+
 def _build_n1_7_processor(model_name: str = GROOT_N1_7_BACKBONE_MODEL) -> ProcessorMixin:
     require_package("transformers", extra="groot")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    image_processor = Qwen2VLImageProcessor.from_pretrained(model_name, trust_remote_code=True)
+    image_processor = _groot_image_processor_cls().from_pretrained(model_name, trust_remote_code=True)
     video_processor = Qwen3VLVideoProcessor.from_pretrained(model_name, trust_remote_code=True)
     proc = Qwen3VLProcessor(
         image_processor=image_processor,
@@ -2068,8 +2221,25 @@ class GrootN17VLMEncodeStep(ProcessorStep):
         return self._proc
 
     def _target_device(self) -> torch.device | None:
-        # The albumentations path is cv2/numpy only, so it cannot run on GPU.
-        if self.device is None or self.use_albumentations:
+        # Where the torch geometry path and the Qwen processor run.
+        #
+        # `use_albumentations` deliberately does NOT appear in this condition. cv2 cannot run
+        # on a device, but the cv2 branch of `_build_sample_images` returns before it reads
+        # this value, so withholding the device never protected cv2 from anything -- it only
+        # ever reached the other consumer, the Qwen processor, which takes the cv2 output as
+        # HWC uint8 whichever path produced it. That processor is ~61% of `data_s` while it
+        # runs on the host, and all of it is memory movement: one `image_processor` call at
+        # batch 32 costs 28.8 ms on the H200's CPU vs 3.3 on the card (8.6x), and 44.0 ms on
+        # the 950PR's CPU vs 3.0 on the card (14.5x), `pixel_values` bit-identical both times.
+        #
+        # End to end on one 950PR card, pusht, same session, two pairs at batch 32 agreeing
+        # within 1%: `data_s` 0.069 -> 0.018 s and step 0.332 -> 0.281 (-15.5%), MFU
+        # 20.7% -> 24.5%; at batch 128, where the per-sample cost is the same but the share
+        # of the step is larger, `data_s` 0.288 -> 0.062 and step 1.097 -> 0.874 (-20.3%),
+        # MFU 25.0% -> 31.4%. `updt_s` does not move in either, which is the check that this
+        # changed preprocessing and nothing else. What is left of `data_s` is mostly the
+        # processor's image-token expansion, which is python and has no device to go to.
+        if self.device is None:
             return None
         try:
             return get_safe_torch_device(self.device)

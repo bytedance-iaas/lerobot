@@ -3314,3 +3314,93 @@ def test_groot_backbone_asks_for_no_kv_cache():
     assert backbone.model.seen_kwargs["use_cache"] is False
     assert backbone.model.seen_kwargs["output_hidden_states"] is True
     torch.testing.assert_close(features, torch.zeros(2, 3))
+
+
+def test_groot_image_processor_low_rank_patchify_matches_upstream():
+    """The <=7-dim patchify must be bit-identical to upstream's 10-dim one.
+
+    This is the gate on a copied-from-upstream code path: if transformers changes how it
+    orders patches, this fails instead of silently feeding the ViT a permuted batch.
+    """
+    pytest.importorskip("transformers")
+
+    from lerobot.policies.groot.processor_groot import _groot_image_processor_cls
+
+    cls = _groot_image_processor_cls()
+    batch, channel, patch, merge, temporal = 3, 3, 16, 2, 2
+    grid_h = grid_w = 4
+    height, width = grid_h * patch, grid_w * patch
+
+    torch.manual_seed(0)
+    frames = torch.randn(batch, channel, height, width)
+    patches = frames.unsqueeze(1).repeat(1, temporal, 1, 1, 1)
+
+    # Upstream, verbatim (image_processing_qwen2_vl.py:_preprocess).
+    reference = patches.view(
+        batch,
+        1,
+        temporal,
+        channel,
+        grid_h // merge,
+        merge,
+        patch,
+        grid_w // merge,
+        merge,
+        patch,
+    )
+    reference = reference.permute(0, 1, 4, 7, 5, 8, 3, 2, 6, 9)
+    reference = reference.reshape(batch, grid_h * grid_w, channel * temporal * patch * patch)
+
+    got = cls.flatten_patches_low_rank(
+        patches,
+        batch_size=batch,
+        grid_t=1,
+        channel=channel,
+        grid_h=grid_h,
+        grid_w=grid_w,
+        patch_size=patch,
+        temporal_patch_size=temporal,
+        merge_size=merge,
+    )
+
+    assert got.shape == reference.shape
+    assert torch.equal(got, reference)
+
+
+def test_groot_image_processor_only_diverges_for_npu_tensors():
+    """CPU and CUDA must keep calling upstream: the two-pass form is slower on a host."""
+    pytest.importorskip("transformers")
+
+    from lerobot.policies.groot.processor_groot import _groot_image_processor_cls
+
+    cls = _groot_image_processor_cls()
+    assert cls.patchifies_over_eight_dims([torch.zeros(3, 4, 4)]) is False
+    assert cls.patchifies_over_eight_dims([]) is False
+    assert cls.patchifies_over_eight_dims([object()]) is False
+
+    npu_like = SimpleNamespace(device=torch.device("cpu"))
+    with patch.object(torch, "is_tensor", return_value=True):
+        npu_like.device = SimpleNamespace(type="npu")
+        assert cls.patchifies_over_eight_dims([npu_like]) is True
+        npu_like.device = SimpleNamespace(type="cuda")
+        assert cls.patchifies_over_eight_dims([npu_like]) is False
+
+
+def test_groot_cv2_geometry_does_not_withhold_the_device_from_the_processor():
+    """`use_albumentations` must not decide where the Qwen processor runs.
+
+    cv2 cannot run on an accelerator, but the cv2 branch of `_build_sample_images` returns
+    before it ever reads the device, so gating on `use_albumentations` only ever reached the
+    other consumer -- the Qwen processor, which is the majority of `data_s` on the host.
+    """
+    pytest.importorskip("transformers")
+
+    from lerobot.policies.groot.processor_groot import GrootN17VLMEncodeStep
+
+    with_cv2 = GrootN17VLMEncodeStep(device="cpu", use_albumentations=True)
+    without_cv2 = GrootN17VLMEncodeStep(device="cpu", use_albumentations=False)
+    assert with_cv2._target_device() == torch.device("cpu")
+    assert without_cv2._target_device() == torch.device("cpu")
+
+    # No device configured is still the one reason to stay on the host.
+    assert GrootN17VLMEncodeStep(device=None, use_albumentations=True)._target_device() is None
