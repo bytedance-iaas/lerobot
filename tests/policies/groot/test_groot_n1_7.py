@@ -3179,3 +3179,138 @@ def test_gr00t_n1_7_compile_copies_the_tensors_crossing_the_boundary(monkeypatch
 
     output["loss"].backward()
     assert model.backbone.weight.grad is not None
+
+
+def _vision_attention_module(hidden_size: int = 32, num_heads: int = 4):
+    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLVisionConfig
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionAttention
+
+    config = Qwen3VLVisionConfig(
+        hidden_size=hidden_size, num_heads=num_heads, depth=2, intermediate_size=2 * hidden_size
+    )
+    config._attn_implementation = "sdpa"
+    return Qwen3VLVisionAttention(config).eval()
+
+
+def test_batched_vision_attention_matches_the_per_image_loop():
+    """The batch dimension has to compute exactly what upstream's Python loop computed."""
+    from lerobot.policies.groot.groot_n1_7 import _batched_vision_attention_forward
+
+    torch.manual_seed(0)
+    attention = _vision_attention_module()
+    num_images, patches_per_image = 3, 8
+    hidden_states = torch.randn(num_images * patches_per_image, attention.dim)
+    cu_seqlens = torch.arange(num_images + 1, dtype=torch.int32) * patches_per_image
+    position_embeddings = (
+        torch.randn(hidden_states.shape[0], attention.head_dim),
+        torch.randn(hidden_states.shape[0], attention.head_dim),
+    )
+
+    with torch.no_grad():
+        looped = attention(hidden_states, cu_seqlens, position_embeddings=position_embeddings)
+        batched = _batched_vision_attention_forward(
+            attention, hidden_states, cu_seqlens, position_embeddings=position_embeddings
+        )
+
+    assert batched.shape == looped.shape
+    torch.testing.assert_close(batched, looped, rtol=0, atol=0)
+
+
+def test_batched_vision_attention_refuses_images_of_different_sizes():
+    """Equal-sized images are the precondition for the reshape, so say so instead of lying."""
+    from lerobot.policies.groot.groot_n1_7 import _batched_vision_attention_forward
+
+    torch.manual_seed(0)
+    attention = _vision_attention_module()
+    hidden_states = torch.randn(24, attention.dim)
+    position_embeddings = (
+        torch.randn(24, attention.head_dim),
+        torch.randn(24, attention.head_dim),
+    )
+
+    # Same total patch count, same number of segments, unequal segments.
+    with pytest.raises(ValueError, match="equal-sized images"):
+        _batched_vision_attention_forward(
+            attention,
+            hidden_states,
+            torch.tensor([0, 6, 16, 24], dtype=torch.int32),
+            position_embeddings=position_embeddings,
+        )
+
+    # A segment count the patch count is not divisible by is caught without a host sync.
+    with pytest.raises(ValueError, match="equal-sized images"):
+        _batched_vision_attention_forward(
+            attention,
+            hidden_states,
+            torch.tensor([0, 7, 17, 24, 24, 24], dtype=torch.int32),
+            position_embeddings=position_embeddings,
+        )
+
+
+def test_batch_vision_attention_installs_on_every_vision_block():
+    from lerobot.policies.groot.groot_n1_7 import (
+        _batch_vision_attention,
+        _batched_vision_attention_forward,
+    )
+
+    blocks = [SimpleNamespace(attn=_vision_attention_module()) for _ in range(3)]
+    visual = SimpleNamespace(blocks=blocks)
+
+    assert _batch_vision_attention(visual) == 3
+    for block in blocks:
+        assert block.attn.forward.__func__ is _batched_vision_attention_forward
+        assert block.attn.forward.__self__ is block.attn
+
+    # Nothing to install onto is not an error; it is zero blocks.
+    assert _batch_vision_attention(SimpleNamespace()) == 0
+
+
+def test_groot_batches_vision_attention_by_default(monkeypatch):
+    pytest.importorskip("transformers")
+
+    from lerobot.policies.groot.groot_n1_7 import GR00TN17, Qwen3Backbone
+
+    assert GrootConfig().batch_vision_attention is True
+    assert inspect.signature(Qwen3Backbone.__init__).parameters["batch_vision_attention"].default is True
+
+    # The policy has to forward the knob; the backbone cannot read `GrootConfig`.
+    recorded = {}
+
+    def record(cls, **kwargs):
+        recorded.update(kwargs)
+        return _DummyGrootModel()
+
+    monkeypatch.setattr(GR00TN17, "from_pretrained", classmethod(record))
+    config = _groot_config()
+    config.batch_vision_attention = False
+    GrootPolicy(config)
+
+    assert recorded["batch_vision_attention"] is False
+
+
+def test_groot_backbone_asks_for_no_kv_cache():
+    """A KV cache nothing reads makes dynamo recompile the decoder once per layer."""
+    pytest.importorskip("transformers")
+
+    from lerobot.policies.groot.groot_n1_7 import Qwen3Backbone
+
+    class RecordingQwen(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.last_layer = nn.Identity()
+            self.model = SimpleNamespace(language_model=SimpleNamespace(layers=[self.last_layer]))
+            self.seen_kwargs = None
+
+        def forward(self, **kwargs):
+            self.seen_kwargs = kwargs
+            return SimpleNamespace(hidden_states=[self.last_layer(kwargs["input_ids"])])
+
+    backbone = Qwen3Backbone.__new__(Qwen3Backbone)
+    nn.Module.__init__(backbone)
+    backbone.model = RecordingQwen()
+
+    features = backbone._last_decoder_layer_output({"input_ids": torch.zeros(2, 3)})
+
+    assert backbone.model.seen_kwargs["use_cache"] is False
+    assert backbone.model.seen_kwargs["output_hidden_states"] is True
+    torch.testing.assert_close(features, torch.zeros(2, 3))

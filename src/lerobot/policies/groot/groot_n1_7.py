@@ -20,6 +20,7 @@ import logging
 from collections.abc import Callable
 from contextlib import suppress
 from copy import deepcopy
+from types import MethodType
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -87,6 +88,7 @@ GR00T_N1_7_DEFAULTS: dict[str, Any] = {
     "select_layer": 16,
     "reproject_vision": False,
     "use_flash_attention": False,
+    "batch_vision_attention": True,
     "load_bf16": False,
     "backbone_trainable_params_fp32": True,
     "image_crop_size": N1_7_DEFAULT_IMAGE_CROP_SIZE,
@@ -245,6 +247,100 @@ class MultiEmbodimentActionEncoder(nn.Module):
         return self.W3(x, cat_ids)
 
 
+def _batched_vision_attention_forward(
+    self,
+    hidden_states: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    rotary_pos_emb: torch.Tensor | None = None,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+    **kwargs,
+) -> torch.Tensor:
+    """`Qwen3VLVisionAttention.forward`, with the per-image Python loop replaced by a batch dim.
+
+    Qwen3-VL supports dynamic resolution, so it packs every image of a step into one sequence
+    delimited by `cu_seqlens`, and then -- unless flash attention is installed -- splits that
+    sequence back up with `lengths.tolist()` and calls attention once per image per layer.
+    For N1.7 that is 24 (the ViT depth) x batch attention launches per step, each preceded by a
+    device-to-host sync, and the backbone is launch-bound rather than compute-bound.
+
+    N1.7 resizes every frame to `image_target_size`, so the packed sequence is really a
+    rectangle: all the images carry the same number of patches. Attention under a block-diagonal
+    mask is exactly attention over that rectangle's batch dimension, so the loop collapses into
+    one call on `[images, heads, patches, head_dim]` -- identical numbers, 1/batch the launches,
+    and no `.tolist()`, which was also the graph break that kept `torch.compile` from fusing
+    anything inside the ViT.
+    """
+
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+        apply_rotary_pos_emb_vision,
+        eager_attention_forward,
+    )
+
+    seq_length = hidden_states.shape[0]
+    query_states, key_states, value_states = (
+        self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
+    )
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
+
+    num_images = cu_seqlens.numel() - 1
+    if num_images < 1 or seq_length % num_images:
+        raise ValueError(
+            f"Batched ViT attention needs equal-sized images, got {seq_length} patches "
+            f"packed into {num_images} segments. Set `batch_vision_attention=False`."
+        )
+    # Equal-sized is what makes the reshape below mean what the loop meant, so assert it --
+    # but reading `cu_seqlens` is a host sync, and under `torch.compile` that sync is the
+    # graph break this function exists to remove. So the check runs in eager only, where the
+    # loop it replaces was paying for the same sync anyway.
+    if not torch.compiler.is_compiling():
+        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        if not bool((lengths == lengths[0]).all()):
+            raise ValueError(
+                f"Batched ViT attention needs equal-sized images, got patch counts "
+                f"{lengths.tolist()}. The usual cause is cameras with different ASPECT RATIOS: "
+                f"the preprocessor scales the shortest edge to `image_target_size` and keeps the "
+                f"ratio (unless `letter_box_transform`), so a 4:3 view becomes 256x341 and a 16:9 "
+                f"view 256x454. Set `batch_vision_attention=False` for such a setup."
+            )
+
+    # [patches, heads, head_dim] -> [images, heads, patches per image, head_dim]. The packing is
+    # image-major, so this is a view: the split and the cat the loop did are both gone.
+    shape = (num_images, seq_length // num_images, self.num_heads, -1)
+    query_states = query_states.reshape(shape).transpose(1, 2)
+    key_states = key_states.reshape(shape).transpose(1, 2)
+    value_states = value_states.reshape(shape).transpose(1, 2)
+
+    attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+        self.config._attn_implementation, eager_attention_forward
+    )
+    attn_output, _ = attention_interface(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask=None,
+        scaling=self.scaling,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        is_causal=False,
+        **kwargs,
+    )
+    return self.proj(attn_output.reshape(seq_length, -1).contiguous())
+
+
+def _batch_vision_attention(visual: nn.Module) -> int:
+    """Install `_batched_vision_attention_forward` on every ViT block, returning how many."""
+    installed = 0
+    for block in getattr(visual, "blocks", []):
+        attn = getattr(block, "attn", None)
+        if attn is None:
+            continue
+        attn.forward = MethodType(_batched_vision_attention_forward, attn)
+        installed += 1
+    return installed
+
+
 class Qwen3Backbone(nn.Module):
     """Cosmos-Reason2/Qwen3-VL backbone used by GR00T N1.7.
 
@@ -262,6 +358,7 @@ class Qwen3Backbone(nn.Module):
         select_layer: int = -1,
         reproject_vision: bool = False,
         use_flash_attention: bool = False,
+        batch_vision_attention: bool = True,
         load_bf16: bool = False,
         tune_top_llm_layers: int = 0,
         trainable_params_fp32: bool = False,
@@ -307,6 +404,9 @@ class Qwen3Backbone(nn.Module):
             self.language_model.layers.pop(-1)
 
         self.select_layer = select_layer
+        if batch_vision_attention:
+            installed = _batch_vision_attention(self.visual)
+            logger.info("Batched the ViT attention of %d Qwen3-VL vision blocks.", installed)
         self.set_trainable_parameters(tune_llm, tune_visual, tune_top_llm_layers)
         if load_bf16 and trainable_params_fp32:
             for parameter in self.parameters():
@@ -434,7 +534,15 @@ class Qwen3Backbone(nn.Module):
 
         hook = self.language_model.layers[-1].register_forward_hook(capture_output)
         try:
-            outputs = self.model(**model_input, output_hidden_states=True)
+            # `use_cache=False` because nothing here reads a KV cache -- the action head consumes
+            # the decoder hidden states, and N1.7 never generates text. Leaving it on costs real
+            # time under `torch.compile`: dynamo guards on
+            # `past_key_values.layers[i].is_initialized`, recompiles the decoder layer once per
+            # layer index, hits `config.recompile_limit` (8) partway down the text stack and runs
+            # the rest eager. Measured on one H200, batch 32, pusht, batched ViT attention,
+            # compiled, two interleaved passes: step 0.209/0.208 -> 0.202/0.204 s, and the
+            # recompile-limit warning stops appearing. In eager it makes no difference.
+            outputs = self.model(**model_input, output_hidden_states=True, use_cache=False)
         finally:
             hook.remove()
 
@@ -841,6 +949,7 @@ class GR00TN17(PreTrainedModel):
             select_layer=config.select_layer,
             reproject_vision=config.reproject_vision,
             use_flash_attention=config.use_flash_attention,
+            batch_vision_attention=config.batch_vision_attention,
             load_bf16=config.load_bf16,
             tune_top_llm_layers=config.tune_top_llm_layers,
             trainable_params_fp32=config.backbone_trainable_params_fp32,

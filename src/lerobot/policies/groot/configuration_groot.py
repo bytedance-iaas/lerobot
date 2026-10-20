@@ -325,6 +325,26 @@ class GrootConfig(PreTrainedConfig):
     # Set to True only after installing a flash-attn build matching your torch/CUDA env.
     use_flash_attention: bool = False
 
+    # Batch the Qwen3-VL ViT's attention over the images of a step instead of looping over them.
+    # Qwen3-VL supports dynamic resolution, so it packs the step's images into one `cu_seqlens`
+    # sequence and -- on the SDPA path -- splits it back up with `.tolist()`, calling attention once
+    # per image per layer: 24 x batch launches per step, each behind a host sync. N1.7 resizes every
+    # frame to `image_target_size`, so those segments are all the same length and the loop collapses
+    # into a single batched call. Measured on pusht, batch 32, one card, as median step time:
+    #   H200    0.265 -> 0.246 s, MFU 13.4% -> 14.4%   (with compile_model: 0.220 -> 0.208, 17.0%)
+    #   950PR   0.378 -> 0.330 s, MFU 18.2% -> 20.8%
+    # Ascend gains more because its launch overhead is higher; it does not, however, make N1.7
+    # compile there -- see `compile_backend`. The loss curve is identical to the loop's at every
+    # log point, eager and compiled.
+    #
+    # Set to False when the step's images are NOT all the same size, which in practice means
+    # cameras of differing aspect ratios: the preprocessor scales the shortest edge to
+    # `image_target_size` and preserves the ratio unless `letter_box_transform` is on, so a 96x96
+    # view becomes 256x256 (256 patches), any 4:3 view 256x341 (341) and any 16:9 view 256x454
+    # (454). One aspect ratio across all cameras is fine however many cameras there are; mixing
+    # them is what breaks, and then the batched path raises instead of computing the wrong thing.
+    batch_vision_attention: bool = True
+
     # Enable GR00T-style state-relative action chunks (action chunk expressed relative to the current
     # observation state).
     use_relative_actions: bool = False
@@ -351,7 +371,7 @@ class GrootConfig(PreTrainedConfig):
     # `cu_seqlens`, so its ViT issues one attention launch PER SAMPLE per layer and the device
     # sits idle between them. "reduce-overhead" replays those launches from a CUDA graph, which
     # is where the win is -- measured on one H200, batch 32, pusht: step 0.268 -> 0.219 s (-18%),
-    # 119 -> 146 samples/s, MFU 12.8% -> 15.6%. Plain "default" mode buys nothing (fusion cannot
+    # 119 -> 146 samples/s, MFU 13.2% -> 16.2%. Plain "default" mode buys nothing (fusion cannot
     # cross the ViT's `Tensor.item()` graph break). Caveats: `dynamic=False` means one recompile
     # per distinct padded prompt length, so a multi-task dataset with varied task strings can
     # exhaust dynamo's recompile budget and fall back to eager; and this is a CUDA result -- see
@@ -359,13 +379,16 @@ class GrootConfig(PreTrainedConfig):
     compile_model: bool = False
     compile_mode: str = "reduce-overhead"
     # Non-default dynamo backend, which replaces `compile_mode` when set (`mode` is inductor's
-    # knob). It exists for Ascend, where none of the three routes compiles N1.7 as of
-    # torch 2.10 / torch_npu 2.10.0.post4 -- all three die inside Qwen3-VL's `cu_seqlens` path:
-    # the default inductor goes through triton-ascend and fails codegen ("NoTritonConfigsError"),
-    # "npugraph_ex" fails ACL capture (error 107025, and capturing the action head alone reports
-    # an unjoined stream), and "npu" (torchair GE) has no converter for
-    # `aten.repeat_interleave.self_int`. Batching that packed attention at the source would fix
-    # both the launch count and all three of these.
+    # knob). It exists for Ascend, where nothing compiles N1.7 as of torch 2.10 /
+    # torch_npu 2.10.0.post4. All four routes were retried with `batch_vision_attention` on, and
+    # all four fail the same way they did without it, so none of them was the per-image attention
+    # loop: inductor (both "default" and "reduce-overhead", which routes through it here) fails
+    # triton-ascend codegen with "NoTritonConfigsError: ... Cannot broadcast [1,2,2,1] vs
+    # [32,1,2,1]"; "npugraph_ex" fails ACL capture (error 107025, "capture model contains a stream
+    # that was not joined to the original stream"); and "npu" (torchair GE) has no converter for
+    # `aten.repeat_interleave.self_int` -- the op that BUILDS `cu_seqlens`, which batching the
+    # attention does not remove. So on Ascend the gain has to come from eager, where batching the
+    # ViT attention is worth +2.6pp of MFU on its own.
     compile_backend: str | None = None
 
     # TODO(Steven): Remove these deprecated fields in a future release.
