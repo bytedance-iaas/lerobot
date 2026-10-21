@@ -379,16 +379,27 @@ class GrootConfig(PreTrainedConfig):
     compile_model: bool = False
     compile_mode: str = "reduce-overhead"
     # Non-default dynamo backend, which replaces `compile_mode` when set (`mode` is inductor's
-    # knob). It exists for Ascend, where nothing compiles N1.7 as of torch 2.10 /
-    # torch_npu 2.10.0.post4. All four routes were retried with `batch_vision_attention` on, and
-    # all four fail the same way they did without it, so none of them was the per-image attention
-    # loop: inductor (both "default" and "reduce-overhead", which routes through it here) fails
-    # triton-ascend codegen with "NoTritonConfigsError: ... Cannot broadcast [1,2,2,1] vs
-    # [32,1,2,1]"; "npugraph_ex" fails ACL capture (error 107025, "capture model contains a stream
-    # that was not joined to the original stream"); and "npu" (torchair GE) has no converter for
-    # `aten.repeat_interleave.self_int` -- the op that BUILDS `cu_seqlens`, which batching the
-    # attention does not remove. So on Ascend the gain has to come from eager, where batching the
-    # ViT attention is worth +2.6pp of MFU on its own.
+    # knob). It exists for Ascend, where N1.7 still does not compile usefully as of torch 2.10 /
+    # torch_npu 2.10.0.post4 -- but the reason is no longer a codegen error, it is compile time.
+    #
+    # Two codegen failures used to stop it, both from position code writing results into a
+    # pre-allocated tensor, which produces index expressions torch_npu cannot resolve. Both are
+    # now gone, from the ViT's `rot_pos_emb` being memoised out of the graph and the text mRoPE
+    # being rebuilt as a gather (see `groot_n1_7.py`). What is left is that torch_npu's inductor
+    # autotunes serially: 11 distinct kernels, each compiled about 32 times for different tilings,
+    # 904 compilations in 75 minutes with no training step reached, and
+    # `TORCHINDUCTOR_COMPILE_THREADS` does not parallelise it. So `compile_model` is not worth
+    # turning on an Ascend card, which is also why it defaults to False.
+    #
+    # The other two backends were last tried before those two fixes and failed earlier than
+    # codegen, so they are untested against the current code: "npugraph_ex" failed ACL capture
+    # (error 107025, "capture model contains a stream that was not joined to the original
+    # stream"), and "npu" (torchair GE) had no converter for `aten.repeat_interleave.self_int`,
+    # the op that builds `cu_seqlens`.
+    #
+    # None of this costs the Ascend path anything, because every gain measured there is an eager
+    # one: batching the ViT attention, preprocessing on the card, threading the cv2 geometry and
+    # memoising the rotary ids take batch-32 MFU from 18.2% to 24.5%, and 32.7% at batch 160.
     compile_backend: str | None = None
 
     # TODO(Steven): Remove these deprecated fields in a future release.

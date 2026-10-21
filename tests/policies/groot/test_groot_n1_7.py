@@ -3544,3 +3544,53 @@ def test_groot_rot_pos_emb_cache_is_keyed_on_the_grid():
 
     # Nothing to patch is not an error.
     assert _cache_vision_rot_pos_emb(SimpleNamespace()) is False
+
+
+def test_groot_mrope_gather_matches_the_strided_scatter():
+    """The gather must reproduce upstream's interleave exactly, and stop mutating its input.
+
+    Upstream's `freqs_t[..., offset:section*3:3] = freqs[dim, ..., same]` writes into a view of
+    `freqs`, so it both mutates its argument and compiles to a strided `slice_scatter` whose
+    offset index expressions torch_npu's inductor backend cannot resolve.
+    """
+    pytest.importorskip("transformers")
+
+    from lerobot.policies.groot.groot_n1_7 import (
+        _interleave_mrope_by_gather,
+        _interleaved_mrope_lane_sources,
+    )
+
+    mrope_section = [24, 20, 20]
+    lanes = sum(mrope_section)
+
+    def upstream(freqs):
+        freqs = freqs.clone()
+        freqs_t = freqs[0]
+        for dim, offset in enumerate((1, 2), start=1):
+            idx = slice(offset, mrope_section[dim] * 3, 3)
+            freqs_t[..., idx] = freqs[dim, ..., idx]
+        return freqs_t
+
+    rotary_emb = SimpleNamespace(apply_interleaved_mrope=lambda freqs, section: None)
+    text_model = SimpleNamespace(rotary_emb=rotary_emb)
+    assert _interleave_mrope_by_gather(text_model) is True
+
+    torch.manual_seed(0)
+    for batch, seq in ((4, 7), (1, 1), (2, 83)):
+        freqs = torch.randn(3, batch, seq, lanes)
+        reference = upstream(freqs)
+        before = freqs.clone()
+        got = rotary_emb.apply_interleaved_mrope(freqs, mrope_section)
+
+        assert got.shape == reference.shape == (batch, seq, lanes)
+        assert torch.equal(got, reference)
+        assert torch.equal(freqs, before), "the gather must not mutate its input"
+
+    # THW repeated, then a T tail -- the layout the docstring describes.
+    sources = _interleaved_mrope_lane_sources(tuple(mrope_section), lanes, "cpu")
+    assert sources[:6].tolist() == [0, 1, 2, 0, 1, 2]
+    assert sources[-4:].tolist() == [0, 0, 0, 0]
+    assert [sources.tolist().count(i) for i in (0, 1, 2)] == mrope_section
+
+    # Nothing to patch is not an error.
+    assert _interleave_mrope_by_gather(SimpleNamespace()) is False

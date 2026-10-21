@@ -335,6 +335,55 @@ def _batched_vision_attention_forward(
 _ROT_POS_EMB_CACHE_ENTRIES = 8
 
 
+@lru_cache(maxsize=16)
+def _interleaved_mrope_lane_sources(mrope_section: tuple[int, ...], lanes: int, device: str) -> torch.Tensor:
+    """Which of (T, H, W) each rotary lane reads from. Constant for a given rope config.
+
+    Qwen3-VL interleaves the three position components as THWTHW... and then pads the tail
+    with T, so with `mrope_section=[24, 20, 20]` the 64 lanes read
+    `[T H W] * 20 + [T T T T]`.
+    """
+
+    sources = [0] * lanes
+    for dim, offset in enumerate((1, 2), start=1):
+        for lane in range(offset, mrope_section[dim] * 3, 3):
+            sources[lane] = dim
+    return torch.tensor(sources, dtype=torch.long, device=device)
+
+
+def _interleave_mrope_by_gather(text_model: nn.Module) -> bool:
+    """Build the interleaved mRoPE by gathering lanes instead of scattering into a view.
+
+    Upstream writes the H and W components into the T component in place, with a strided
+    slice (`freqs_t[..., offset:section*3:3] = freqs[dim, ..., same]`). Two problems:
+
+    * it mutates its argument, since `freqs_t = freqs[0]` is a view of `freqs`; and
+    * it compiles to `slice_scatter(..., start=2, end=60, step=3)`, whose index expressions
+      carry a constant offset. torch_npu's inductor backend looks index variables up in
+      `range_tree_nodes_removed` and only handles bare ones, so an offset one raises
+      `KeyError: y0 - 2` (`torch_npu/_inductor/codegen/ir.py:74`) and N1.7 does not compile
+      on Ascend at all.
+
+    Each output lane reads from exactly one of the three components, so the same thing is one
+    `gather` along the component axis -- no writes, no offsets, no mutation. vLLM takes the
+    same route for the same reason, splitting the lanes and concatenating the chosen ones
+    (`vllm/model_executor/layers/rotary_embedding/mrope_interleaved.py:_rebuild_pos_emb`); a
+    gather expresses it in one op. Bit-identical to upstream, which a test pins.
+    """
+
+    rotary_emb = getattr(text_model, "rotary_emb", None)
+    if rotary_emb is None or not hasattr(rotary_emb, "apply_interleaved_mrope"):
+        return False
+
+    def apply_interleaved_mrope(freqs: torch.Tensor, mrope_section: list[int]) -> torch.Tensor:
+        sources = _interleaved_mrope_lane_sources(tuple(mrope_section), freqs.shape[-1], str(freqs.device))
+        index = sources.view(1, 1, 1, -1).expand(1, *freqs.shape[1:])
+        return freqs.gather(0, index).squeeze(0)
+
+    rotary_emb.apply_interleaved_mrope = apply_interleaved_mrope
+    return True
+
+
 def _cache_vision_rot_pos_emb(visual: nn.Module) -> bool:
     """Compute the ViT's rotary position ids for ONE image, reuse them for the rest, once.
 
@@ -470,6 +519,9 @@ class Qwen3Backbone(nn.Module):
             self.language_model.layers.pop(-1)
 
         self.select_layer = select_layer
+        # Independent of image sizing, and bit-identical, so it is not behind a knob.
+        if _interleave_mrope_by_gather(self.language_model):
+            logger.info("Rebuilt the text mRoPE interleave as a gather.")
         if batch_vision_attention:
             installed = _batch_vision_attention(self.visual)
             logger.info("Batched the ViT attention of %d Qwen3-VL vision blocks.", installed)
