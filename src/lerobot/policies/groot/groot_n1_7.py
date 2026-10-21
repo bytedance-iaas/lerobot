@@ -20,6 +20,7 @@ import logging
 from collections.abc import Callable
 from contextlib import suppress
 from copy import deepcopy
+from functools import lru_cache
 from types import MethodType
 from typing import TYPE_CHECKING, Any
 
@@ -329,6 +330,71 @@ def _batched_vision_attention_forward(
     return self.proj(attn_output.reshape(seq_length, -1).contiguous())
 
 
+# One entry per distinct grid; capped so a multi-resolution dataset cannot grow it without
+# bound. Each entry is small -- 8192 x 32 floats at batch 32.
+_ROT_POS_EMB_CACHE_ENTRIES = 8
+
+
+def _cache_vision_rot_pos_emb(visual: nn.Module) -> bool:
+    """Compute the ViT's rotary position ids for ONE image, reuse them for the rest, once.
+
+    `Qwen3VLVisionModel.rot_pos_emb` builds a `(tokens, 2)` table of each patch's (row, col)
+    by looping over images in python -- `grid_thw.tolist()`, then about ten small ops an image
+    -- and gathers the rotary table with it. Installed alongside `_batch_vision_attention`,
+    which already requires every image to be the same size, so all `batch` iterations of that
+    loop produce an identical block and `grid_thw` does not change between steps.
+
+    So: run upstream's own code on a one-image grid and `repeat` it, then keep the result.
+    Measured on one 950PR card, against upstream's loop:
+
+        images   upstream    one image + repeat    cached
+        32       2.14 ms     0.096 ms              0.016 ms
+        128      8.13 ms     0.109 ms              0.018 ms
+        160     13.59 ms     0.146 ms              0.019 ms
+
+    The repeat is what makes it flat in batch; the `lru_cache` then takes the constant case to a
+    hit. vLLM caches the same thing the same way, keyed on one image's geometry
+    (`@lru_cache` on `rot_pos_ids(h, w, spatial_merge_size)` in
+    `vllm/model_executor/models/qwen3_vl.py`), which is what keeps the key independent of how
+    many images a step happens to carry. The image count is in the key here as well, only so
+    that a hit returns the repeated tensor rather than rebuilding it -- vLLM pays a `cat` per
+    step instead. A grid whose rows are not all equal falls back to upstream untouched: unequal
+    images are legitimate for position ids, only the batched attention requires equal ones.
+
+    `torch._dynamo.disable` because the cache fills lazily: the first call would otherwise
+    happen INSIDE the compiled region, dynamo would trace the uncached path and inductor would
+    codegen it -- which on Ascend is what triton-ascend rejects ("Cannot broadcast ...
+    [1, 2, 2, 1], [32, 1, 2, 1]", the 2 being `spatial_merge_size`). Nothing is lost by keeping
+    it out: the value is a constant, and `tolist()` was making dynamo specialise on tensor
+    contents there anyway. Note this forecloses `fullgraph=True`, which refuses to call a
+    disabled function.
+    """
+
+    original = getattr(visual, "rot_pos_emb", None)
+    if original is None:
+        return False
+
+    # Defined HERE rather than at module scope on purpose: an `lru_cache` out there would key on
+    # the bound method and hold this model alive for the life of the process.
+    @lru_cache(maxsize=_ROT_POS_EMB_CACHE_ENTRIES)
+    def uniform_grid(row: tuple[int, int, int], images: int, device: str) -> torch.Tensor:
+        grid = torch.tensor([row], dtype=torch.long, device=device)
+        return original(grid).repeat(images, 1)
+
+    def cached_rot_pos_emb(grid_thw: torch.Tensor) -> torch.Tensor:
+        rows = [tuple(row) for row in grid_thw.tolist()]
+        if len(set(rows)) > 1:
+            return original(grid_thw)
+        try:
+            device = str(visual.rotary_pos_emb.inv_freq.device)
+        except AttributeError:
+            device = str(grid_thw.device)
+        return uniform_grid(rows[0], len(rows), device)
+
+    visual.rot_pos_emb = torch._dynamo.disable(cached_rot_pos_emb)
+    return True
+
+
 def _batch_vision_attention(visual: nn.Module) -> int:
     """Install `_batched_vision_attention_forward` on every ViT block, returning how many."""
     installed = 0
@@ -407,6 +473,9 @@ class Qwen3Backbone(nn.Module):
         if batch_vision_attention:
             installed = _batch_vision_attention(self.visual)
             logger.info("Batched the ViT attention of %d Qwen3-VL vision blocks.", installed)
+            # Same precondition -- every image the same size -- so the rotary position ids are
+            # one image's, repeated, and then held.
+            _cache_vision_rot_pos_emb(self.visual)
         self.set_trainable_parameters(tune_llm, tune_visual, tune_top_llm_layers)
         if load_bf16 and trainable_params_fp32:
             for parameter in self.parameters():

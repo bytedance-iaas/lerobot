@@ -3452,3 +3452,95 @@ def test_groot_cv2_geometry_threading_changes_nothing(monkeypatch, training):
 
     # The pool must be reused rather than rebuilt per call, and must be per-process.
     assert pg._cv2_geometry_pool() is pg._cv2_geometry_pool()
+
+
+def test_groot_rot_pos_emb_computes_one_image_and_repeats_it():
+    """Equal-sized images: upstream's own code on one image, repeated, cached, identical."""
+    pytest.importorskip("transformers")
+
+    from lerobot.policies.groot.groot_n1_7 import _cache_vision_rot_pos_emb
+
+    calls = []
+
+    class Visual(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.rotary_pos_emb = SimpleNamespace(inv_freq=torch.zeros(4))
+
+        def rot_pos_emb(self, grid_thw):
+            """Stand in for upstream: one row per token, per-image block identical."""
+            grid = grid_thw.tolist()
+            calls.append(len(grid))
+            per_image = grid[0][0] * grid[0][1] * grid[0][2]
+            block = torch.arange(per_image, dtype=torch.float32).unsqueeze(1).repeat(1, 2)
+            return block.repeat(len(grid), 1)
+
+    visual = Visual()
+    upstream = visual.rot_pos_emb
+    grid = torch.tensor([[1, 4, 4]] * 5)
+    want = upstream(grid)
+    calls.clear()
+
+    assert _cache_vision_rot_pos_emb(visual) is True
+    first = visual.rot_pos_emb(grid)
+    second = visual.rot_pos_emb(grid)
+
+    torch.testing.assert_close(first, want, rtol=0, atol=0)
+    assert second is first  # held, not recomputed
+    # Upstream was called ONCE, and with a single-image grid rather than all five.
+    assert calls == [1]
+
+    # A ragged grid is legitimate -- only the batched attention needs equal images -- so it
+    # falls back to upstream on the whole grid rather than repeating one image.
+    calls.clear()
+    ragged = torch.tensor([[1, 4, 4], [1, 2, 2]])
+    got = visual.rot_pos_emb(ragged)
+    assert calls == [2]
+    torch.testing.assert_close(got, upstream(ragged), rtol=0, atol=0)
+
+    # Nothing to patch is not an error.
+    assert _cache_vision_rot_pos_emb(SimpleNamespace()) is False
+
+
+def test_groot_rot_pos_emb_cache_is_keyed_on_the_grid():
+    """The memoised rotary ids must be identical to upstream's, and re-derived if the grid moves."""
+    pytest.importorskip("transformers")
+
+    from lerobot.policies.groot.groot_n1_7 import _cache_vision_rot_pos_emb
+
+    calls = []
+
+    class Visual(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.rotary_pos_emb = SimpleNamespace(inv_freq=torch.zeros(4))
+
+        def rot_pos_emb(self, grid_thw):
+            calls.append(tuple(grid_thw.flatten().tolist()))
+            # Stand in for upstream's per-image loop: one row per token, value = the grid.
+            tokens = int((grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]).sum())
+            return torch.full((tokens, 2), float(grid_thw[0, 1]))
+
+    visual = Visual()
+    uncached = visual.rot_pos_emb
+    grid = torch.tensor([[1, 4, 4]] * 3)
+    want = uncached(grid)
+    calls.clear()
+
+    assert _cache_vision_rot_pos_emb(visual) is True
+    first = visual.rot_pos_emb(grid)
+    second = visual.rot_pos_emb(grid)
+
+    torch.testing.assert_close(first, want, rtol=0, atol=0)
+    assert second is first  # a hit, not a recompute
+    assert len(calls) == 1
+
+    # A different grid is a different key, so it is recomputed rather than wrongly reused.
+    other = torch.tensor([[1, 8, 8]] * 2)
+    third = visual.rot_pos_emb(other)
+    assert len(calls) == 2
+    assert third.shape != first.shape
+    torch.testing.assert_close(third, uncached(other), rtol=0, atol=0)
+
+    # Nothing to patch is not an error.
+    assert _cache_vision_rot_pos_emb(SimpleNamespace()) is False
