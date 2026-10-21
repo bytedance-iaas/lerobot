@@ -15,7 +15,9 @@
 # limitations under the License.
 
 import logging
+import os
 import random
+from concurrent.futures import ThreadPoolExecutor
 from copy import copy, deepcopy
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
@@ -1529,6 +1531,41 @@ def _build_n1_7_processor(model_name: str = GROOT_N1_7_BACKBONE_MODEL) -> Proces
     return proc
 
 
+# cv2 releases the GIL around every call (its `ERRWRAP2` macro wraps the C++ call in an RAII
+# `PyAllowThreads`, the same trick as pybind11's `gil_scoped_release`), so the per-frame geometry
+# below parallelises across plain threads: 128 frames go from 14.6 ms to 4.2 ms at 8 threads.
+#
+# Threads rather than processes, which lose here: the work is 14.6 ms but the result is 25 MB of
+# 256x256 frames per step, and pickling that back costs more than it saves -- measured 13.6 ms at
+# 4 processes and 16.2 ms at 8, the latter slower than running serially. Threads share the arrays.
+#
+# The ceiling is ~3.5x rather than 8x because the python around the cv2 calls (crop arithmetic,
+# branches) does hold the GIL.
+_CV2_GEOMETRY_THREADS = 8
+# Below this many frames the pool dispatch costs more than it saves.
+_CV2_GEOMETRY_MIN_FRAMES = 8
+_CV2_GEOMETRY_POOL: ThreadPoolExecutor | None = None
+_CV2_GEOMETRY_POOL_PID: int | None = None
+
+
+def _cv2_geometry_pool() -> ThreadPoolExecutor:
+    """A process-local thread pool for the cv2 geometry, built on first use.
+
+    Keyed on the pid: threads do not survive `fork`, so a dataloader worker has to build its
+    own rather than inherit the parent's. Deliberately not stored on the processor step, which
+    has to stay copyable and serialisable -- an executor is neither.
+    """
+
+    global _CV2_GEOMETRY_POOL, _CV2_GEOMETRY_POOL_PID
+    pid = os.getpid()
+    if _CV2_GEOMETRY_POOL is None or pid != _CV2_GEOMETRY_POOL_PID:
+        _CV2_GEOMETRY_POOL = ThreadPoolExecutor(
+            max_workers=_CV2_GEOMETRY_THREADS, thread_name_prefix="groot-cv2"
+        )
+        _CV2_GEOMETRY_POOL_PID = pid
+    return _CV2_GEOMETRY_POOL
+
+
 def _transform_n1_7_image_for_vlm_albumentations(
     image: np.ndarray,
     *,
@@ -2262,28 +2299,40 @@ class GrootN17VLMEncodeStep(ProcessorStep):
         if self.use_albumentations:
             video_np = np.asarray(video)
             train_crop = self.training and torch.is_grad_enabled()
-            sample_images: list[list[Any]] = []
-            for batch_idx in range(batch_size):
-                # Isaac-GR00T samples ONE crop window per sample and replays it
-                # across every (timestep, view) frame of that sample, keeping
-                # cross-view geometry consistent. Eval keeps the center crop.
-                crop_position = (random.random(), random.random()) if train_crop else None
-                sample_images.append(
-                    [
-                        _transform_n1_7_image_for_vlm_albumentations(
-                            video_np[batch_idx, timestep, view_idx],
-                            image_crop_size=self.image_crop_size,
-                            image_target_size=self.image_target_size,
-                            shortest_image_edge=self.shortest_image_edge,
-                            crop_fraction=self.crop_fraction,
-                            letter_box_transform=self.letter_box_transform,
-                            crop_position=crop_position,
-                        )
-                        for timestep in range(video_np.shape[1])
-                        for view_idx in range(video_np.shape[2])
-                    ]
+            # Isaac-GR00T samples ONE crop window per sample and replays it across every
+            # (timestep, view) frame of that sample, keeping cross-view geometry consistent.
+            # Eval keeps the center crop. Every window is drawn HERE, in sample order, before
+            # any frame is transformed: the threads below must not touch `random`, or the crop
+            # a sample gets would depend on how the pool happened to schedule it.
+            crop_positions = [
+                (random.random(), random.random()) if train_crop else None for _ in range(batch_size)
+            ]
+            timesteps, views = video_np.shape[1], video_np.shape[2]
+
+            def transform(task: tuple[int, int, int]) -> np.ndarray:
+                batch_idx, timestep, view_idx = task
+                return _transform_n1_7_image_for_vlm_albumentations(
+                    video_np[batch_idx, timestep, view_idx],
+                    image_crop_size=self.image_crop_size,
+                    image_target_size=self.image_target_size,
+                    shortest_image_edge=self.shortest_image_edge,
+                    crop_fraction=self.crop_fraction,
+                    letter_box_transform=self.letter_box_transform,
+                    crop_position=crop_positions[batch_idx],
                 )
-            return sample_images
+
+            tasks = [
+                (batch_idx, timestep, view_idx)
+                for batch_idx in range(batch_size)
+                for timestep in range(timesteps)
+                for view_idx in range(views)
+            ]
+            if len(tasks) >= _CV2_GEOMETRY_MIN_FRAMES:
+                frames = list(_cv2_geometry_pool().map(transform, tasks))
+            else:
+                frames = [transform(task) for task in tasks]
+            per_sample = timesteps * views
+            return [frames[i * per_sample : (i + 1) * per_sample] for i in range(batch_size)]
 
         video_t = video if torch.is_tensor(video) else torch.from_numpy(np.ascontiguousarray(video))
         # (B, T, V, H, W, C) uint8 -> (B, T, V, C, H, W)

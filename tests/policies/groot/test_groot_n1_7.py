@@ -3404,3 +3404,51 @@ def test_groot_cv2_geometry_does_not_withhold_the_device_from_the_processor():
 
     # No device configured is still the one reason to stay on the host.
     assert GrootN17VLMEncodeStep(device=None, use_albumentations=True)._target_device() is None
+
+
+def _albumentations_step(training: bool):
+    from lerobot.policies.groot.processor_groot import GrootN17VLMEncodeStep
+
+    return GrootN17VLMEncodeStep(
+        image_crop_size=[230, 230],
+        image_target_size=[256, 256],
+        use_albumentations=True,
+        training=training,
+        device=None,
+    )
+
+
+@pytest.mark.parametrize("training", [False, True])
+def test_groot_cv2_geometry_threading_changes_nothing(monkeypatch, training):
+    """Threading the per-frame cv2 geometry must change neither pixels nor the RNG stream.
+
+    cv2 releases the GIL so the frames genuinely run in parallel, but the crop windows are
+    drawn up front in sample order -- if a thread drew its own, the crop a sample got would
+    depend on pool scheduling, and training would silently stop being reproducible.
+    """
+    pytest.importorskip("transformers")
+    import random as _random
+
+    from lerobot.policies.groot import processor_groot as pg
+
+    rng = np.random.default_rng(0)
+    batch, timesteps, views = 4, 1, 2
+    video = rng.integers(0, 255, (batch, timesteps, views, 96, 96, 3), dtype=np.uint8)
+    step = _albumentations_step(training)
+
+    with torch.enable_grad():
+        _random.seed(1234)
+        threaded = step._build_sample_images(video, batch, None)
+        # Same input, same seed, but forced down the serial path.
+        monkeypatch.setattr(pg, "_CV2_GEOMETRY_MIN_FRAMES", 10**9)
+        _random.seed(1234)
+        serial = step._build_sample_images(video, batch, None)
+
+    assert len(threaded) == len(serial) == batch
+    for threaded_sample, serial_sample in zip(threaded, serial, strict=True):
+        assert len(threaded_sample) == len(serial_sample) == timesteps * views
+        for got, want in zip(threaded_sample, serial_sample, strict=True):
+            assert np.array_equal(got, want)
+
+    # The pool must be reused rather than rebuilt per call, and must be per-process.
+    assert pg._cv2_geometry_pool() is pg._cv2_geometry_pool()
