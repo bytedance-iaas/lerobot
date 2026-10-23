@@ -31,8 +31,10 @@ from pathlib import Path
 
 TFLOP = 1e12
 US_PER_MS = 1000.0
-# 950PR bf16, measured manually with GEMM operations. Override per machine.
-DEFAULT_PEAK_TFLOPS = 368.6
+# 950PR bf16, measured manually with GEMM operations, on the SUSTAINED basis -- what a
+# step can hold, not the burst clock it cannot. Must equal `benchmarks/mfu.py`'s table
+# entry. Override per machine.
+DEFAULT_PEAK_TFLOPS = 335.3
 
 CUBE_TYPES = frozenset(
     {
