@@ -83,21 +83,24 @@ TFLOP = 1e12
 # silently rescale every MFU this tool ever prints, so a missing one is an error
 # (`--measure-peak` or `--peak-tflops`), never a fallback.
 #
-# 950PR bf16 = 368.6 is also `profiler_summary.DEFAULT_PEAK_TFLOPS`; the two must stay
+# 950PR bf16 = 335.3 is also `profiler_summary.DEFAULT_PEAK_TFLOPS`; the two must stay
 # equal, which `tests/benchmarks/test_mfu.py` asserts.
 #
-# The value is on the BURST basis, and what that costs is worth stating, because every
-# MFU printed here is divided by it. Measured on idle cards, square bf16 GEMM:
+# The value is on the SUSTAINED basis, and which basis it is matters more than the
+# digits, because every MFU printed here is divided by it. Measured on idle cards,
+# square bf16 GEMM:
 #
 #                       burst        sustained
 #     950PR             363.6            335.3   (-7.8%)
 #     H200              734.2            650.2   (-11.4%)
 #
-# `measure_peak` now reports the sustained figure, so it no longer reproduces 368.6 --
-# it reads 9% under it. Sustained is the basis a training step actually runs at; the
-# burst clock is one no step can hold. Moving the table to it would raise pi05's
-# measured MFU on the 950PR from 61.0% to 67.0%, which is a re-baselining of every
-# number this tool has printed, so it is a deliberate decision and not done here.
+# Sustained is what a training step actually runs at; the burst clock is one no step can
+# hold, so dividing by it credits the hardware with a ceiling it never offers. The table
+# held the burst figure (368.6) until the 950PR reports were rewritten in MFU terms, and
+# moving it here raises every MFU this tool prints by ~10% -- pi05 on the 950PR reads
+# 67.0% where it used to read 61.0%. Published numbers from before that switch are on
+# the old basis; divide by 1.0993 to compare. `measure_peak` reports sustained, so the
+# table is now reproducible from it, which 368.6 never was.
 #
 # A third basis exists and sits above both: during real pi05 training the profile shows
 # its large GEMMs running at 374-375 TFLOP/s, above even the burst probe. A pure-GEMM
@@ -106,7 +109,7 @@ TFLOP = 1e12
 # a mixed workload and the hardware's own in-situ reading is the generous end.
 # ---------------------------------------------------------------------------------------
 PEAK_TFLOPS: dict[str, dict[str, float]] = {
-    "ascend950pr": {"bfloat16": 368.6},
+    "ascend950pr": {"bfloat16": 335.3},
 }
 DEFAULT_DEVICE = "ascend950pr"
 
