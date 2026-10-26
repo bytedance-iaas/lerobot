@@ -512,9 +512,13 @@ Measured on 8xH200, `training_mode=full`, micro-batch 1:
 | trainable | 16,484 M |
 | effective batch | 8 |
 | gradient norm | 0.23-0.38 |
-| model FLOPs | 1478.8 TFLOP per sample |
-| **MFU** | **33.0%** of 650.2 TFLOP/s (sustained bf16) |
-| **HFU** | **43.2%** — the gap is recompute |
+| model FLOPs | 1461.3 TFLOP per sample |
+| **MFU** | **32.6%** of 650.2 TFLOP/s (sustained bf16) at the measured step |
+| **HFU** | **42.8%** — the gap is recompute |
+
+The 6.9 s was measured before the modulation change described under the dial below, which took
+17.5 TFLOP per sample and ~1.2 GiB per block out of the step; expect ~6.84 s and ~32.9% MFU
+now, and re-measure before quoting either.
 
 For reference, RLinf reports 9.0 s/step on 8xH100 with plain FSDP2 and 6.7 s/step with their
 compile/CUDA-graph stack, which this port does not carry — landing at 6.9 s on faster hardware
@@ -530,15 +534,15 @@ MFU counts only the arithmetic the model's math requires; HFU counts what the ca
 They differ here by **24% of the work executed**, which is exactly the DiT blocks being
 recomputed in the backward pass — so the 10 points between them are the price of
 `gradient_checkpointing`, not a property of the kernels. Chasing MFU up to HFU means finding
-that memory somewhere else.
+that memory somewhere else, which is what the dial below does.
 
 ### `gradient_checkpointing` is a dial
 
-All-or-nothing is the wrong granularity for this model. 40 blocks of activations reach
-121.7 GiB at batch 1, so recompute cannot simply be turned off — but an 8xH200 full fine-tune
-sits at 57.0 GB of 141 GB, and **leaving most of that headroom unused costs a quarter of every
-step**. So the field takes a count as well as a bool: `True` checkpoints all 40 blocks, `False`
-none, and an int checkpoints that many.
+All-or-nothing is the wrong granularity for this model. 40 blocks of activations measured
+121.7 GiB at batch 1, so recompute could not simply be turned off — but an 8xH200 full
+fine-tune sits at 57.0 GB of 141 GB, and **leaving most of that headroom unused costs a quarter
+of every step**. So the field takes a count as well as a bool: `True` checkpoints all 40
+blocks, `False` none, and an int checkpoints that many.
 
 ```bash
 --policy.gradient_checkpointing=20     # half recompute, roughly half the headroom spent
@@ -555,23 +559,34 @@ compute-bound — so they are what to expect, not what was observed:
 
 | checkpointed | recompute | step (predicted) | MFU | samples/s | extra activations |
 |---|---|---|---|---|---|
-| 40 (`True`) | 457.1 TFLOP | 6.90 s *(measured)* | 33.0% | 1.16 | — |
-| 25 | 285.7 | 6.29 s | 36.2% | 1.27 | ~43 GiB |
-| **20** | 228.5 | 6.09 s | 37.4% | 1.31 | ~58 GiB |
-| 12 | 137.1 | 5.76 s | 39.5% | 1.39 | ~81 GiB |
-| 0 (`False`) | 0 | 5.27 s | 43.2% | 1.52 | ~117 GiB |
+| 40 (`True`) | 457.1 TFLOP | 6.84 s | 32.9% | 1.17 | — |
+| 25 | 285.7 | 6.23 s | 36.1% | 1.28 | ~25 GiB |
+| 20 | 228.5 | 6.02 s | 37.3% | 1.33 | ~33 GiB |
+| 12 | 137.1 | 5.70 s | 39.4% | 1.40 | ~47 GiB |
+| **0 (`False`)** | 0 | **5.21 s** | **43.2%** | **1.54** | ~67 GiB |
 
-The activation column is the arithmetic for choosing a value: 121.7 GiB over 40 blocks is
-~3.04 GiB per block, against ~0.16 GiB for the block input a checkpointed block stores instead,
-so each block left unrecomputed costs ~2.9 GiB. Against ~78 GiB of headroom that admits at most
-~27 blocks, and **20 is the suggested starting point** — it leaves margin for fragmentation and
-FSDP's all-gather transients. Both inputs are per-card measurements of a different card
-(950PR) and a different parallel layout, so bisect from there rather than trusting the row.
+**The bottom row is the one to aim for, and it only became reachable by fixing the
+modulation.** Before that, 121.7 GiB over 40 blocks was ~3.04 GiB per block, ~2.9 GiB of it
+chargeable to leaving a block unrecomputed, and 40 of those wanted ~117 GiB against ~78 GiB of
+headroom — so the ladder stopped around 27 blocks and 20 was the safe pick. ~1.22 GiB of that
+per-block figure was the time embedding: `e0` was expanded to one row per token, so every block
+modulated and kept a `[1, 15940, 6, 5120]` tensor (934 MiB) plus the two `1 + scale` operands
+built from it. The blocks now broadcast `e0` from one row per *distinct timestep* — 9 latent
+frames, one for the zeroed clean half, one per action and state register, 118 rows rather than
+15,940 — which leaves ~1.82 GiB per block, ~1.66 GiB chargeable, **~67 GiB for all 40 against
+~78 GiB of headroom**.
 
-On a 950PR at batch 1 there is no headroom at all and `True` is the only safe value: 121.7 GiB
-of a 123.2 GiB card. Keeping 5 of the 40 blocks unrecomputed does run on one card there
-(9.54 vs 9.89 s/step, the 3.5% the ladder predicts) but still OOMs under FSDP, which shards
-parameters and gradients and not activations.
+Read the measured/derived line carefully before trusting the last column: the 3.04 GiB came off
+a card, the 1.22 GiB subtracted from it is tensor shapes, and both are a different card (950PR)
+and a different parallel layout than the 8xH200 recipe. Bisect down from `True` rather than
+starting at `False`.
+
+On a 950PR at batch 1, `True` was the only safe value before the change: 121.7 GiB of a
+123.2 GiB card, with 1/2/4/8-card runs all OOMing between 119.70 and 121.74 GiB because FSDP
+shards parameters and gradients and not activations. Keeping 5 of the 40 blocks unrecomputed
+did run on one card there (9.54 vs 9.89 s/step, the 3.5% the ladder predicts). Whether the
+~49 GiB the modulation change gives back is enough to open the dial on that card has not been
+measured.
 
 Where the per-sample FLOPs go, and what each part is billed:
 
@@ -580,9 +595,13 @@ Where the per-sample FLOPs go, and what each part is billed:
 | DiT blocks x40 | 1152.9 | 3x | fwd + dgrad + wgrad; all 16.5 B parameters train |
 | DiT attention (800 calls) | 218.3 | 3x | 18 self-attention calls per layer + both halves of i2v cross-attention |
 | VAE encode (tiled) | 84.6 | 1x | frozen, and nothing precedes it, so no gradient reaches it |
-| DiT embed/head/projectors | 17.9 | 3x | patch embedding, time embedding/projection, head |
+| DiT embed/head/projectors | 0.4 | 3x | patch embedding, time embedding/projection, head |
 | text encoder (umt5) | 4.7 | 1x | frozen; 512 tokens is cheap even at 5.7 B parameters |
 | image encoder (CLIP) | 0.3 | 1x | frozen; one 224x224 frame |
+
+That 0.4 is the whole point of the modulation change seen from the FLOPs side: the time
+embedding and projection used to run on 15,940 rows instead of 118, which was 17.5 of the
+17.9 TFLOP the row used to read — 1.2% of the step, spent computing 135 copies of each row.
 
 Two things that table makes visible. **`tiled=True` is costing 47.6 TFLOP per sample for nothing**
 — the 352x640 canvas does not need tiling, and `--untiled-vae` prices the same encode at 37.0

@@ -1120,6 +1120,73 @@ class CausalWanSelfAttention(nn.Module):
         return x, updated_kv_cache
 
 
+def _modulation_run(rows: int, tokens: int) -> tuple[int, int]:
+    """One `(rows, tokens_per_row)` run, checked to divide evenly."""
+    if rows <= 0 or tokens % rows:
+        raise ValueError(f"{tokens} tokens do not divide into {rows} modulation rows")
+    return (rows, tokens // rows)
+
+
+def _join_runs(*runs: tuple[int, int]) -> tuple[tuple[int, int], ...]:
+    """Concatenate runs, merging adjacent 1:1 ones so they stay a single slice."""
+    joined: list[tuple[int, int]] = []
+    for count, repeat in runs:
+        if joined and repeat == 1 and joined[-1][1] == 1:
+            joined[-1] = (joined[-1][0] + count, 1)
+        else:
+            joined.append((count, repeat))
+    return tuple(joined)
+
+
+def _per_run(x, runs, fn, *rows):
+    """Apply `fn(x_run, *row_runs)` run by run, broadcasting each row over its own tokens.
+
+    `x` is [B, L, C] and each tensor in `rows` is [B, R, C], with `runs` a tuple of
+    `(rows, tokens_per_row)` saying how the R rows cover the L tokens in order. Viewing a run
+    as [B, rows, tokens_per_row, C] lets the row broadcast along the token axis, so no
+    [B, L, C] copy of the modulation is built -- and, more to the point, none is kept alive
+    for the backward pass.
+
+    Every element sees the arithmetic it saw when the modulation was pre-expanded, so the
+    **forward is bit-identical**. The backward is not, quite: a row's gradient is now summed
+    over its tokens before reaching `time_projection` rather than inside that matmul's weight
+    gradient, and reordering a sum of 880 bf16 terms moves the last bit. Measured on a
+    2-block model, 8 of 101 gradients differ -- `time_embedding`, `time_projection` and each
+    block's `modulation`, the three whose gradient is a reduction over tokens -- by at most
+    4.4e-3 relative, which is one bf16 ulp. Nothing else moves at all.
+    """
+    if sum(count * repeat for count, repeat in runs) != x.shape[1]:
+        raise ValueError(f"modulation runs do not cover the {x.shape[1]} tokens of x")
+    if runs == ((x.shape[1], 1),):
+        return fn(x, *rows)
+    out = []
+    token = 0
+    row = 0
+    for count, repeat in runs:
+        span = count * repeat
+        picks = [r[:, row:row + count] for r in rows]
+        if repeat == 1:
+            out.append(fn(x[:, token:token + span], *picks))
+        else:
+            out.append(fn(
+                x[:, token:token + span].unflatten(1, (count, repeat)),
+                *(pick.unsqueeze(2) for pick in picks),
+            ).flatten(1, 2))
+        token += span
+        row += count
+    return out[0] if len(out) == 1 else torch.cat(out, dim=1)
+
+
+def modulate_tokens(x, runs, scale, shift):
+    """`x * (1 + scale) + shift`, with scale/shift at one row per distinct timestep."""
+    return _per_run(x, runs, lambda t, s, b: t * (1 + s) + b, scale, shift)
+
+
+def gate_tokens(x, runs, gate):
+    """`x * gate`, with the gate at one row per distinct timestep."""
+    return _per_run(x, runs, lambda t, g: t * g, gate)
+
+
 class CausalWanAttentionBlock(nn.Module):
 
     def __init__(self,
@@ -1184,6 +1251,7 @@ class CausalWanAttentionBlock(nn.Module):
         freqs_state: torch.Tensor,
         action_register_length: int | None,
         context: torch.Tensor,
+        e_runs: tuple[tuple[int, int], ...],
         kv_cache: torch.Tensor | None = None,
         crossattn_cache: torch.Tensor | None = None,
         current_start_frame: int = 0,
@@ -1192,28 +1260,15 @@ class CausalWanAttentionBlock(nn.Module):
         r"""
         Args:
             x(Tensor): Shape [B, L, C]
-            e(Tensor): Shape [B, F, 6, C]
+            e(Tensor): Shape [B, R, 6, C], one row per distinct timestep
+            e_runs: how those R rows cover the L tokens, see `_per_run`
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
-        e = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
-
-        # Align modulation sequence length to x so mul/add broadcast (e.g. when F != L under compile)
-        L = x.shape[1]
-        aligned = []
-        for part in e:
-            L_e = part.shape[1]
-            if L_e == L:
-                aligned.append(part)
-            elif L_e >= L:
-                aligned.append(part[:, :L])
-            else:
-                repeat = (L + L_e - 1) // L_e
-                aligned.append(part.repeat_interleave(repeat, dim=1)[:, :L])
-        e = tuple(aligned)
+        e = [part.squeeze(2) for part in (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)]
 
         # self-attention
         y, updated_kv_cache = self.self_attn(
-            x=(self.norm1(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2)),
+            x=modulate_tokens(self.norm1(x), e_runs, e[1], e[0]),
             freqs=freqs,
             freqs_action=freqs_action,
             freqs_state=freqs_state,
@@ -1222,15 +1277,13 @@ class CausalWanAttentionBlock(nn.Module):
             is_tf=is_tf,
             current_start_frame=current_start_frame,
         )
-        x = x + (y * e[2].squeeze(2))
+        x = x + gate_tokens(y, e_runs, e[2])
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, e):
             x = x + self.cross_attn(self.norm3(x), context)
-            y = self.ffn(
-                (self.norm2(x) * (1 + e[4].squeeze(2)) + e[3].squeeze(2))
-            )
-            x = x + (y * e[5].squeeze(2))
+            y = self.ffn(modulate_tokens(self.norm2(x), e_runs, e[4], e[3]))
+            x = x + gate_tokens(y, e_runs, e[5])
             return x
 
         x = cross_attn_ffn(x, context, e)
@@ -1254,28 +1307,15 @@ class CausalHead(nn.Module):
         # modulation
         self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
 
-    def forward(self, x, e):
+    def forward(self, x, e, e_runs):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
-            e(Tensor): Shape [B, F, 1, C]
+            e(Tensor): Shape [B, R, 1, C], one row per distinct timestep
+            e_runs: how those R rows cover the L1 tokens, see `_per_run`
         """
-        e = (self.modulation.unsqueeze(1) + e).chunk(2, dim=2)
-        # Align modulation sequence length to x (e.g. when F != L1 under compile)
-        L = x.shape[1]
-        aligned = []
-        for part in e:
-            L_e = part.shape[1]
-            if L_e == L:
-                aligned.append(part)
-            elif L_e >= L:
-                aligned.append(part[:, :L])
-            else:
-                repeat = (L + L_e - 1) // L_e
-                aligned.append(part.repeat_interleave(repeat, dim=1)[:, :L])
-        e = tuple(aligned)
-        x = (self.head(self.norm(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2)))
-        return x
+        e = [part.squeeze(2) for part in (self.modulation.unsqueeze(1) + e).chunk(2, dim=2)]
+        return self.head(modulate_tokens(self.norm(x), e_runs, e[1], e[0]))
 
 
 class CausalWanModel(ModelMixin, ConfigMixin):
@@ -1818,13 +1858,21 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             action_length = 0
             action_register_length = None
 
-        # time embeddings: expand to exactly seq_len so e matches x (5B: frame_seqlen=50, 1 frame -> 50 tokens)
-        if F <= seq_len:
-            repeat = (seq_len + F - 1) // F
-            timestep = timestep.repeat_interleave(repeat, dim=1)[:, :seq_len]
+        # Time embeddings: one row per frame when the F values cover seq_len evenly, which is
+        # every supported preset. Otherwise expand to exactly seq_len so e matches x -- the
+        # uneven and the F > seq_len cases keep their old behaviour, and inference retains
+        # nothing for a backward pass anyway, so there is nothing to win there.
+        if seq_len >= F and seq_len % F == 0:
+            video_run = (F, seq_len // F)
         else:
-            indices = torch.linspace(0, F - 1, seq_len, device=timestep.device, dtype=torch.long)
-            timestep = timestep[:, indices]
+            if F <= seq_len:
+                repeat = (seq_len + F - 1) // F
+                timestep = timestep.repeat_interleave(repeat, dim=1)[:, :seq_len]
+            else:
+                indices = torch.linspace(0, F - 1, seq_len, device=timestep.device, dtype=torch.long)
+                timestep = timestep[:, indices]
+            video_run = (seq_len, 1)
+        e_runs = (video_run,)
 
         if action is not None:
             assert timestep_action is not None
@@ -1832,6 +1880,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             stride = timestep_action.shape[1] // state_features.shape[1]
             timestep_state = timestep_action[:, ::stride]
             timestep = torch.cat([timestep, timestep_action, timestep_state], dim=1)
+            e_runs = _join_runs(*e_runs, (action_register_length, 1))
 
         e = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, timestep.flatten()).type_as(x))
@@ -1856,6 +1905,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 freqs_state=self.freqs_state,
                 context=context,
                 action_register_length=action_register_length,
+                e_runs=e_runs,
                 kv_cache=kv_cache[block_index],
                 current_start_frame=current_start_frame,
             )
@@ -1869,10 +1919,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         # Build a tensor that contains only video tokens per sample with length = max(video_lens)
         x_video = x[:, :seq_len]
-        e_video = e[:, :seq_len]
+        e_video = e[:, :video_run[0]]
 
         # Unpatchify video-only tokens
-        x_video = self.head(x_video, e_video.unsqueeze(2))
+        x_video = self.head(x_video, e_video.unsqueeze(2), (video_run,))
 
         return x_video, action_noise_pred, updated_kv_caches
 
@@ -2122,9 +2172,15 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             action_register = None
             action_register_length = None
 
-        # time embeddings
-        timestep = timestep.unsqueeze(-1).expand(B, F, seq_len // F).reshape(B, -1)
-        timestep_original = timestep.clone()
+        # Time embeddings stay at one row per distinct timestep -- F frame values, plus one
+        # per action and state register -- and the blocks broadcast each row over the tokens
+        # that share it (`_per_run`). Expanding to one row per token here instead made every
+        # block modulate, and keep for the backward pass, a [B, L, 6, dim] tensor: 934 MiB at
+        # L = 15,940, over a gigabyte a block once the `1 + scale` operands are counted, which
+        # is most of why 40 blocks of activations did not fit on one card with recompute off.
+        timestep_frames = timestep
+        video_run = _modulation_run(F, seq_len)
+        e_runs = (video_run,)
 
         if action is not None:
             assert timestep_action is not None
@@ -2132,6 +2188,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             stride = timestep_action.shape[1] // state_features.shape[1]
             timestep_state = timestep_action[:, ::stride]
             timestep = torch.cat([timestep, timestep_action, timestep_state], dim=1)
+            e_runs = _join_runs(*e_runs, (action_register_length, 1))
 
         e = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, timestep.flatten()).type_as(x))
@@ -2156,20 +2213,24 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
             x = torch.cat([clean_x, x], dim=1)
 
+            # One row per frame, like the noisy half; the default is the same value in all
+            # of them, so the clean half costs 9 rows rather than `seq_len` of them.
             if aug_t is None:
-                aug_t = torch.zeros_like(timestep_original)
+                aug_t = torch.zeros_like(timestep_frames)
             assert aug_t is not None
 
             e_clean = self.time_embedding(
                 sinusoidal_embedding_1d(self.freq_dim, aug_t.flatten()).type_as(x))
-            e_clean = e_clean.unflatten(dim=0, sizes=timestep_original.shape)
+            e_clean = e_clean.unflatten(dim=0, sizes=aug_t.shape)
             e0_clean = self.time_projection(e_clean)
             e0_clean = e0_clean.unflatten(dim=2, sizes=(6, self.dim))
             e0 = torch.cat([e0_clean, e0], dim=1)
+            e_runs = _join_runs(_modulation_run(aug_t.shape[1], seq_len), *e_runs)
 
         # arguments
         kwargs = dict(
             e=e0,
+            e_runs=e_runs,
             freqs=freqs,
             freqs_action=self.freqs_action,
             freqs_state=self.freqs_state,
@@ -2211,10 +2272,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         # Build a tensor that contains only video tokens per sample with length = max(video_lens)
         x_video = x[:, :seq_len]
-        e_video = e[:, :seq_len]
+        e_video = e[:, :video_run[0]]
 
         # Unpatchify video-only tokens
-        x_video = self.head(x_video, e_video.unsqueeze(2))
+        x_video = self.head(x_video, e_video.unsqueeze(2), (video_run,))
         video_noise_pred = self.unpatchify(x_video, grid_size)
 
         return video_noise_pred, action_noise_pred
