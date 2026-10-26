@@ -945,12 +945,17 @@ class WanImageEncoder(torch.nn.Module):
     def __init__(self, image_encoder_pretrained_path: str=None):
         super().__init__()
         # init model
+        # Upstream passes device="cpu" here, which overrides any ambient device context and so
+        # defeats `init_weights_on_device()` for this one component: the CLIP tower allocates
+        # 4.5 GB of real fp32 on the host even when everything around it is being built on meta,
+        # and the checkpoint then overwrites it. Taking the default device instead keeps a meta
+        # build on meta and is a no-op outside one, since the default device IS cpu.
         self.model, self.transforms = clip_xlm_roberta_vit_h_14(
             pretrained=False,
             return_transforms=True,
             return_tokenizer=False,
             dtype=torch.float32,
-            device="cpu")
+            device=torch.get_default_device())
         self.image_encoder_pretrained_path = image_encoder_pretrained_path
 
     def encode_image(self, videos):
