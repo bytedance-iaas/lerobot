@@ -289,7 +289,7 @@ def update_policy(
     # available, so `gpu_mem_gb` silently stayed 0 for every NPU run -- which is the one number
     # you want when choosing `gradient_checkpointing`.
     backend = accelerator_module(accelerator.device)
-    if backend is not None and backend.is_available():
+    if backend is not None:
         backend.reset_peak_memory_stats()
 
     # Compute sample weights if a weighter is provided
@@ -353,7 +353,7 @@ def update_policy(
     train_metrics.grad_norm = grad_norm.item()
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
-    if backend is not None and backend.is_available():
+    if backend is not None:
         train_metrics.gpu_mem_gb = backend.max_memory_allocated() / (1024**3)
     return train_metrics, output_dict
 
@@ -742,7 +742,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         # Derived from the post-reduce max step time; set once per log window on the main rank.
         "samples_per_s": AverageMeter("smp/s", ":.0f"),
     }
-    if torch.cuda.is_available():
+    # Same `accelerator_module` test `update_policy` uses to fill it in -- the two have to agree
+    # or the field is written to a tracker that never declared it.
+    if accelerator_module(accelerator.device) is not None:
         # max() because headroom is gated by the worst-case rank.
         train_metrics["gpu_mem_gb"] = AverageMeter("mem_gb", ":.2f", reduction="max")
 
