@@ -197,42 +197,46 @@ class DreamZeroConfig(PreTrainedConfig):
     compile_dit: bool = False
     # Recompute DiT blocks in the backward pass instead of keeping their activations, which is
     # what the recompute traffic in a profile is: 16.6 k in-place copies and 5.1 k in-place adds
-    # per step. Upstream hardcodes it on, and on a 950PR there was no room to turn it off -- 40
-    # blocks of activations at batch 1 reached 121.7 GiB of the card's 123.2 GiB, and 2-card FSDP
-    # does not help because it shards parameters and gradients but not activations. Keeping only
-    # 5 of the 40 blocks unrecomputed ran on a single card (9.54 vs 9.89 s/step) but still OOMed
-    # under FSDP. Those are pre-modulation-change measurements; see the arithmetic below. The knob is here because the DiT hardcoded it and `WANPolicyHeadConfig` has a
-    # field of the same meaning that nothing reads, so neither could be turned off at all; it is
-    # wired to the DiT in `DreamZeroPolicy.__init__`.
+    # per step. Upstream hardcodes it on, and on a 950PR there is no room to turn it off: all 40
+    # blocks of activations at batch 1 want ~217 GiB against a 123.2 GiB card, and adding cards
+    # does not help because FSDP shards parameters and gradients but not activations. Keeping 5
+    # of the 40 unrecomputed does run on a single card there (9.54 vs 9.89 s/step) but still
+    # OOMs under FSDP, which has the all-gathered shards to hold as well. The knob is here
+    # because the DiT hardcoded it and `WANPolicyHeadConfig` has a field of the same meaning
+    # that nothing reads, so neither could be turned off at all; it is wired to the DiT in
+    # `DreamZeroPolicy.__init__`.
     #
     # It is a DIAL, not a switch, because all-or-nothing is the wrong granularity for this
     # model: True checkpoints all 40 blocks, False none, and an int checkpoints that many
     # (`CausalWanModel.checkpointed_blocks` spreads them; which ones is immaterial, only how
     # many). The all-or-nothing version left the whole gap between them unreachable, and the
     # gap is large -- 24% of the work an 8xH200 full fine-tune runs, which is the 10 points
-    # between its ~33% MFU and ~43% HFU (`benchmarks/mfu.py dreamzero`).
+    # between its ~33% MFU and ~43% HFU (`benchmarks/mfu.py dreamzero`). Only about a quarter of
+    # those ten points is actually reachable, though: see the measured cost per block below.
     #
-    # The arithmetic for choosing a value: the 121.7 GiB over 40 blocks measured above was
-    # ~3.04 GiB of activations per block, of which ~1.22 GiB was the per-token modulation --
-    # a [1, 15940, 6, dim] copy of `e0` plus the two `1 + scale` operands built from it, all
-    # held for the backward pass. The blocks now broadcast `e0` from one row per frame
-    # instead (`causal_wan_model._per_run`), which leaves ~1.82 GiB per block, against
-    # ~0.16 GiB for the block input a checkpointed block stores, so each block left
-    # unrecomputed costs ~1.66 GiB and buys back 1/40th of the recompute. An 8xH200 full
-    # fine-tune sits at 57.0 GB of 141 GB, so ~78 GiB of headroom now covers all 40 blocks
-    # (~67 GiB) with margin for fragmentation and FSDP's all-gather transients -- False
-    # should read ~43% MFU against True's ~33%.
+    # The arithmetic for choosing a value, MEASURED on one 950PR card (lora, batch 1,
+    # --log_freq=1): peak is 56.68 GiB at 40 checkpointed, 62.20 at 38, 73.31 at 36, 84.41 at
+    # 34, 95.52 at 32. Three consecutive +11.11 GiB steps over two blocks each, so **5.56 GiB
+    # per block left unrecomputed**, and all 40 of them want ~217 GiB. The first pair costs
+    # half that because at True the peak falls during recompute rather than at the end of the
+    # forward, so the first two blocks fit in the slack before the forward becomes the peak.
     #
-    # Note what is measured and what is not: the 3.04 GiB came off a card, the 1.22 GiB
-    # subtracted from it is tensor shapes, and the per-card numbers are from a different card
-    # (950PR) and a different parallel layout. So bisect down from True rather than trusting
-    # the arithmetic, and re-measure before relying on False.
+    # An 8xH200 full fine-tune sits at 57.0 GB of 141 GB, so ~78 GiB of headroom buys 15
+    # blocks (5.52 + 13 x 5.555 = 77.7): `gradient_checkpointing=25` is the line and **28 is
+    # the value to start from**, leaving ~17 GiB for fragmentation and FSDP's all-gather
+    # transients, neither of which `max_memory_allocated` counts. That is worth ~2.5 points of
+    # MFU and ~8% of throughput, not the ten points to HFU.
     #
-    # The default stays True even so, because activations are per sample: False fits only at
-    # micro-batch 1, `TrainPipelineConfig.batch_size` defaults to 8, and a 950PR has no
-    # headroom at batch 1 at all. The recipe that can afford False passes it explicitly --
-    # see the 8xH200 command in this policy's README, and the throughput-vs-effective-batch
-    # table under it, which is why spending the headroom here beats spending it on the batch.
+    # Do not carry 5.56 GiB/block straight to CUDA. `rope_dtypes` returns complex64 on NPU and
+    # complex128 on CUDA, and each block ropes a q and a k of [1, 15940, 40, 64] -- 326 MB
+    # apiece against 653 MB -- so expect ~6.2 GiB there until it is measured.
+    #
+    # What this replaced, because the mistake is instructive: the earlier figure of 3.04 GiB
+    # per block came from dividing 121.7 GiB by 40, and that 121.7 was read off the allocator's
+    # OOM message ("121.74 GiB already allocated" of 123.16). That is where a run ran out, not
+    # what it needed -- runs wanting 217 GiB and runs wanting 130 both fail at ~122 on that
+    # card. The number carried no information about the requirement, and everything derived
+    # from it, including a recommendation of `False`, was wrong by a factor of two.
     gradient_checkpointing: bool | int = True
 
     # Diffusion. `num_inference_timesteps` is a TRAINING parameter (the released DROID checkpoint
