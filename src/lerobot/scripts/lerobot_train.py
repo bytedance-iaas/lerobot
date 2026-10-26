@@ -90,6 +90,7 @@ from lerobot.processor.rename_processor import rename_batch_keys, rename_stats
 from lerobot.rewards import make_reward_pre_post_processors
 from lerobot.utils.collate import lerobot_collate_fn
 from lerobot.utils.constants import PRETRAINED_MODEL_DIR, TRAINING_STATE_DIR
+from lerobot.utils.device_utils import accelerator_module
 from lerobot.utils.import_utils import (
     _accelerate_available,
     _peft_available,
@@ -404,8 +405,12 @@ def update_policy(
     start_time = time.perf_counter()
     policy.train()
 
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
+    # Through `accelerator_module`, not `torch.cuda`: on an Ascend NPU the latter is never
+    # available, so `gpu_mem_gb` silently stayed 0 for every NPU run -- which is the one number
+    # you want when choosing `gradient_checkpointing`.
+    backend = accelerator_module(accelerator.device)
+    if backend is not None and backend.is_available():
+        backend.reset_peak_memory_stats()
 
     # Compute sample weights if a weighter is provided
     sample_weights = None
@@ -493,8 +498,8 @@ def update_policy(
         train_metrics.grad_scale = accelerator.scaler.get_scale()
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
-    if torch.cuda.is_available() and "gpu_mem_gb" in train_metrics.metrics:
-        train_metrics.gpu_mem_gb = torch.cuda.max_memory_allocated() / (1024**3)
+    if backend is not None and backend.is_available() and "gpu_mem_gb" in train_metrics.metrics:
+        train_metrics.gpu_mem_gb = backend.max_memory_allocated() / (1024**3)
     # Aggregate the policy's scalar outputs for logging and rank-reduction across the log window.
     if output_dict:
         train_metrics.update_metrics(output_dict)
