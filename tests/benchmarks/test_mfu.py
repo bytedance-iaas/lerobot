@@ -327,7 +327,11 @@ def test_dreamzero_lora_pays_dgrad_but_not_wgrad_on_the_base_weights():
 
 
 def test_dreamzero_vae_tiling_is_not_free():
-    """`tiled=True` re-encodes overlapping tiles, which no parameter count can see."""
+    """`tiled=True` re-encodes overlapping tiles, which no parameter count can see.
+
+    Not free, and not wasted either: the tiles are feathered together, so the two paths give
+    different latents (67.8% of elements, at the real geometry). `benchmarks/vae_tiling.py`.
+    """
     tiled = _dreamzero(training_mode="full")["VAE encode (tiled)"]
     untiled = _dreamzero(training_mode="full", untiled_vae=True)["VAE encode (untiled)"]
     assert tiled > 2 * untiled

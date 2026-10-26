@@ -21,7 +21,6 @@ from einops import rearrange, repeat
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from tqdm import tqdm
 
 CACHE_T = 2
 
@@ -1135,7 +1134,10 @@ class WanVideoVAE(nn.Module):
             device=hidden_states.device,
         )
 
-        for h, h_, w, w_ in tqdm(tasks, desc="VAE decoding"):
+        # No progress bar: both tiled paths run inside a single policy step, so a bar here
+        # writes one line per tile per step to stderr -- 741 of them per sample for a
+        # 352x640 canvas at the default tile geometry.
+        for h, h_, w, w_ in tasks:
             hidden_states_batch = hidden_states[:, :, :, h:h_, w:w_]
             hidden_states_batch = self.model.decode(hidden_states_batch, self.scale)
 
@@ -1191,7 +1193,8 @@ class WanVideoVAE(nn.Module):
             device=video.device,
         )
 
-        for h, h_, w, w_ in tqdm(tasks, desc="VAE encoding"):
+        # No progress bar, for the same reason as `tiled_decode`.
+        for h, h_, w, w_ in tasks:
             hidden_states_batch = video[:, :, :, h:h_, w:w_]
             hidden_states_batch = self.model.encode(hidden_states_batch, self.scale)
 

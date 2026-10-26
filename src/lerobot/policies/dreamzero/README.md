@@ -635,9 +635,19 @@ That 0.4 is the whole point of the modulation change seen from the FLOPs side: t
 embedding and projection used to run on 15,940 rows instead of 118, which was 17.5 of the
 17.9 TFLOP the row used to read — 1.2% of the step, spent computing 135 copies of each row.
 
-Two things that table makes visible. **`tiled=True` is costing 47.6 TFLOP per sample for nothing**
-— the 352x640 canvas does not need tiling, and `--untiled-vae` prices the same encode at 37.0
-instead of 84.6, about 3% of the step. And **the attention is 640 separate kernel launches per
+Two things that table makes visible. **`tiled=True` costs 47.6 TFLOP per sample** — 84.6
+against the 37.0 `--untiled-vae` prices the same encode at, about 3% of the step — because the
+352x640 canvas is cut into **741 tiles of 34x34** at the default geometry, each a full pass
+through the VAE encoder. That is not 47.6 TFLOP for nothing, though, and an earlier version of
+this file said so wrongly: the tiles overlap and `build_mask` feathers them together, so the
+two paths give different latents. Measured at the real geometry, 67.8% of latent elements
+differ, by 0.18% of full scale on average and 6.0% at worst. **`tiled=False` is a change to
+what the DiT trains on, not a free switch** — score it against the released checkpoint first.
+What it is worth in time is also unmeasured on a GPU; `benchmarks/vae_tiling.py` settles both
+on the card, and note that on CPU the two paths come out the same speed despite the 3.8x pixel
+area, so the FLOPs ratio is not a time estimate.
+
+And **the attention is 640 separate kernel launches per
 forward**, because the teacher-forcing pattern is built by slicing q and k/v in Python rather than
 with a mask. It was 800 until the 160 single-token state self-attention calls came out: at
 `num_state_per_block=1` each one is softmax over a single key, which is exactly 1, so the call
