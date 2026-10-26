@@ -269,14 +269,16 @@ def test_dreamzero_window_tokenizes_to_the_dit_frame_seqlen():
 
 
 def test_dreamzero_counts_every_attention_call():
-    """18 self-attention calls per layer plus both halves of i2v cross-attention.
+    """14 self-attention calls per layer plus both halves of i2v cross-attention.
 
     The number itself is the point: it is what makes a formula the wrong tool here, and if a
-    refactor collapses those calls the count should change loudly rather than drift.
+    refactor collapses those calls the count should change loudly rather than drift. It has
+    changed loudly once: 800 before the single-token state blocks stopped launching a kernel
+    to copy v (`CausalWanSelfAttention._process_state_blocks`), 4 per layer of them.
     """
     parts = _dreamzero(training_mode="full")
     key = next(k for k in parts if k.startswith("DiT attention"))
-    assert "(800 calls)" in key
+    assert "(640 calls)" in key
     assert parts[key] > 0
 
 

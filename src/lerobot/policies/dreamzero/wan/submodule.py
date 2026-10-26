@@ -166,10 +166,20 @@ def rope_action_apply_polar(
 ) -> torch.Tensor:
     B, seq_len, n, _ = x.shape
 
-    # precompute multipliers
+    # precompute multipliers. Same dtype rule as `causal_rope_action_apply_polar`, which the
+    # causal self-attention also calls: CANN has no complex128 polar/cat/mul, so NPU runs the
+    # rotation in single precision and everything else keeps float64. `_create_freqs` already
+    # casts the freqs that way, so hardcoding float64 here left NPU multiplying a complex128 x
+    # by complex64 freqs. On every other backend this is the dtype it already used.
+    real_dtype, complex_dtype = rope_dtypes(x.device)
     x = torch.view_as_complex(
-        x.to(torch.float64).reshape(B, seq_len, n, -1, 2)
+        x.to(real_dtype).reshape(B, seq_len, n, -1, 2)
     )
+    freqs = freqs.to(complex_dtype)
+    if freqs_action is not None:
+        freqs_action = freqs_action.to(complex_dtype)
+    if freqs_state is not None:
+        freqs_state = freqs_state.to(complex_dtype)
 
     if action_register_length is not None:
         assert num_action_per_block is not None
