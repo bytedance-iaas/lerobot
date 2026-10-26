@@ -248,3 +248,28 @@ class GatherSeq(torch.autograd.Function):
 
 def gather_seq(x: torch.Tensor, sizes: list[int], rank: int, world: int, group=None) -> torch.Tensor:
     return x if world == 1 else GatherSeq.apply(x, sizes, rank, group)
+
+
+def make_sp_group(degree: int):
+    """This rank's Ulysses group, or None at degree 1.
+
+    Members are contiguous ranks, so the all-to-alls -- four per block per forward, the heavy
+    traffic here -- stay inside one node's NVLink domain, and the data-parallel axis is the
+    strided one. Every rank builds every group in the same order, because `new_group` is itself
+    collective and skipping one deadlocks the ranks that do not.
+    """
+    if degree == 1:
+        return None
+    if not dist.is_available() or not dist.is_initialized():
+        raise RuntimeError("a sequence-parallel degree above 1 needs an initialised process group")
+    world = dist.get_world_size()
+    if world % degree:
+        raise ValueError(f"a world size of {world} does not divide into sequence-parallel groups of {degree}")
+    rank = dist.get_rank()
+    mine = None
+    for base in range(0, world, degree):
+        members = list(range(base, base + degree))
+        group = dist.new_group(members)
+        if rank in members:
+            mine = group
+    return mine

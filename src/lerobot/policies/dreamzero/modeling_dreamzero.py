@@ -89,6 +89,10 @@ class DreamZeroPolicy(PreTrainedPolicy):
         # assigning there would set a field on the wrapper while the block loop went on reading
         # the real one, and the config's value would be silently ignored.
         self.action_head.dit().gradient_checkpointing = config.gradient_checkpointing
+        if config.sp_degree > 1:
+            from .wan.ulysses import make_sp_group
+
+            self.action_head.dit().set_sequence_parallel(config.sp_degree, make_sp_group(config.sp_degree))
         if config.compile_dit:
             self._compile_dit()
 
@@ -552,6 +556,19 @@ class DreamZeroPolicy(PreTrainedPolicy):
         backbone_output = self._empty_backbone_output(action_input)
         outputs = self.action_head(backbone_output, action_input)
         loss = outputs["loss"]
+        if self.config.sp_degree > 1:
+            # Do not remove this without reading the whole paragraph; the forward is exact
+            # either way, so nothing here will fail if it goes.
+            #
+            # Under sequence parallelism a rank holds a slice of the tokens, so every weight's
+            # gradient is a partial sum over that slice, and the slices' partials add up to the
+            # true gradient. FSDP averages gradients across ranks rather than summing them,
+            # which leaves every gradient a factor of `sp_degree` short. Scaling the loss is
+            # the one-line correction, and it is uniform only because every parameter in the
+            # model -- including the head's, which runs on the shard with just its output
+            # gathered -- carries a partial gradient. The symptom of dropping it is that a
+            # multi-card run converges as if the learning rate were `sp_degree` times smaller.
+            loss = loss * self.config.sp_degree
         # detach before float(): these are the reported component losses (dynamics/action), which
         # still carry grad_fn — converting them straight to Python scalars warns and needlessly
         # keeps the graph alive for logging.
