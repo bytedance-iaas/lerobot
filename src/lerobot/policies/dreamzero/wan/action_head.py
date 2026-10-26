@@ -1046,10 +1046,13 @@ class WANPolicyHead(ActionHead):
             f"DiT attention ({len(attn_calls)} calls)": attention_mult * attention_fwd,
         }
         parts["total"] = sum(parts.values())
-        # Gradient checkpointing wraps the block loop and nothing else, so what it repeats is one
-        # forward of the blocks -- not the patch embedding, time embedding, head, or the encoders.
-        parts["recompute"] = (
-            fwd.get("DiT blocks", 0.0) + attention_fwd if dit.gradient_checkpointing else 0.0
+        # Gradient checkpointing wraps the block loop and nothing else, so what it repeats is a
+        # forward of the checkpointed blocks -- not the patch embedding, time embedding, head, or
+        # the encoders. Every block costs the same, so the fraction is exact rather than an
+        # average, and a partial setting lands between the two extremes proportionally.
+        checkpointed = sum(dit.checkpointed_blocks())
+        parts["recompute"] = (checkpointed / dit.num_layers) * (
+            fwd.get("DiT blocks", 0.0) + attention_fwd
         )
         return parts
 

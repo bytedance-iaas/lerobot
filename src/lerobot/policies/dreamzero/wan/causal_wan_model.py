@@ -1457,6 +1457,32 @@ class CausalWanModel(ModelMixin, ConfigMixin):
     def _set_gradient_checkpointing(self, module, value=False):
         self.gradient_checkpointing = value
 
+    def checkpointed_blocks(self) -> tuple[bool, ...]:
+        """Which of the blocks recompute in the backward pass, one flag each.
+
+        `gradient_checkpointing` is a dial rather than a switch: `True`/`False` mean all and
+        none, and an int means checkpoint that many of them. A fractional setting is the useful
+        one whenever there is spare memory but not enough to turn recompute off, which is the
+        normal situation here -- 40 blocks of activations do not fit, 20 do.
+
+        WHICH blocks are chosen changes neither memory nor time, only how many does. Every
+        block has the same activation footprint and the same recompute cost, and the peak is
+        reached at the end of the forward pass with every un-checkpointed block's activations
+        live at once -- so the even spacing below is cosmetic. It is spaced rather than
+        contiguous only because a contiguous run reads as though the position mattered.
+        """
+        total = len(self.blocks)
+        flag = self.gradient_checkpointing
+        # bool is a subclass of int, so it has to be settled first or True would mean "one".
+        if isinstance(flag, bool):
+            flag = total if flag else 0
+        count = max(0, min(total, int(flag)))
+        if count == 0 or count == total:
+            return (count > 0,) * total
+        # Floor, not round: it keeps every index inside range and distinct for count <= total.
+        chosen = {(i * total) // count for i in range(count)}
+        return tuple(i in chosen for i in range(total))
+
     @staticmethod
     def _prepare_blockwise_causal_attn_mask(
         device: torch.device | str, num_frames: int = 21,
@@ -2159,8 +2185,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 return outputs
             return custom_forward
 
-        for block in self.blocks:
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
+        checkpointed = self.checkpointed_blocks()
+        for index, block in enumerate(self.blocks):
+            if torch.is_grad_enabled() and checkpointed[index]:
                 x = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
                     x, **kwargs,

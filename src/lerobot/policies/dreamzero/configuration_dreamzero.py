@@ -164,7 +164,7 @@ class DreamZeroConfig(PreTrainedConfig):
     # torch.compile the text/image/VAE encoders (upstream `post_initialize` does this too). Off by
     # default: it costs a few minutes of warmup and is only worth it for long rollouts.
     compile_encoders: bool = False
-    # Recompute each DiT block in the backward pass instead of keeping its activations, which is
+    # Recompute DiT blocks in the backward pass instead of keeping their activations, which is
     # what the recompute traffic in a profile is: 16.6 k in-place copies and 5.1 k in-place adds
     # per step. Upstream hardcodes it on, and on a 950PR there is no room to turn it off -- 40
     # blocks of activations at batch 1 reach 121.7 GiB of the card's 123.2 GiB, and 2-card FSDP
@@ -173,7 +173,24 @@ class DreamZeroConfig(PreTrainedConfig):
     # under FSDP. The knob is here because the DiT hardcoded it and `WANPolicyHeadConfig` has a
     # field of the same meaning that nothing reads, so neither could be turned off at all; it is
     # wired to the DiT in `DreamZeroPolicy.__init__`.
-    gradient_checkpointing: bool = True
+    #
+    # It is a DIAL, not a switch, because all-or-nothing is the wrong granularity for this
+    # model: True checkpoints all 40 blocks, False none, and an int checkpoints that many
+    # (`CausalWanModel.checkpointed_blocks` spreads them; which ones is immaterial, only how
+    # many). The all-or-nothing version left the whole gap between them unreachable, and the
+    # gap is large -- 24% of the work an 8xH200 full fine-tune runs, which is the 10 points
+    # between its 33.0% MFU and 43.2% HFU (`benchmarks/mfu.py dreamzero`).
+    #
+    # The arithmetic for choosing a value, from the two measurements above: 121.7 GiB over 40
+    # blocks is ~3.04 GiB of activations per block, against ~0.16 GiB for the block input a
+    # checkpointed block stores instead, so each block left unrecomputed costs ~2.9 GiB and
+    # buys back 1/40th of the recompute. An 8xH200 full fine-tune sits at 57.0 GB of 141 GB,
+    # so ~78 GiB of headroom implies at most ~27 blocks; 20 leaves margin for fragmentation
+    # and FSDP's all-gather transients and should read ~37% MFU. Both inputs are per-card
+    # measurements of a different card and a different parallel layout, so treat that as the
+    # starting point for a bisection rather than as a prediction -- and note the 950PR has no
+    # headroom at all at batch 1, where the only safe value is True.
+    gradient_checkpointing: bool | int = True
 
     # Diffusion. `num_inference_timesteps` is a TRAINING parameter (the released DROID checkpoint
     # trained with 4); the inference loop uses `WANPolicyHead.num_inference_steps`, which upstream
@@ -339,6 +356,16 @@ class DreamZeroConfig(PreTrainedConfig):
             raise ValueError(
                 f"Unknown model_variant {self.model_variant!r}; expected one of {list(_DIT_PRESETS)}."
             )
+        if not isinstance(self.gradient_checkpointing, bool):
+            # Clamping instead would hide a typo: a value above the depth reads as "all of them"
+            # and would silently cost a quarter of the step, which is the thing the dial exists
+            # to avoid paying by accident.
+            depth = _DIT_PRESETS[self.model_variant]["num_layers"]
+            if not 0 <= self.gradient_checkpointing <= depth:
+                raise ValueError(
+                    f"gradient_checkpointing must be True, False, or a count in [0, {depth}] "
+                    f"for {self.model_variant}; got {self.gradient_checkpointing}."
+                )
         if self.embodiment_tag not in EMBODIMENT_TAG_TO_PROJECTOR_INDEX:
             raise ValueError(
                 f"Unknown embodiment_tag {self.embodiment_tag!r}; expected one of "

@@ -84,7 +84,11 @@ class DreamZeroPolicy(PreTrainedPolicy):
         # `CausalWanModel.__init__` hardcodes this to True and `WANPolicyHeadConfig`'s field of
         # the same name is never read, so the only way to honour the LeRobot config is here.
         self.action_head.use_gradient_checkpointing = config.gradient_checkpointing
-        self.action_head.model.gradient_checkpointing = config.gradient_checkpointing
+        # Through `dit()`, not `action_head.model`: under `lora` that attribute is a `PeftModel`,
+        # which forwards unknown attribute reads to the base model but absorbs writes -- so
+        # assigning there would set a field on the wrapper while the block loop went on reading
+        # the real one, and the config's value would be silently ignored.
+        self.action_head.dit().gradient_checkpointing = config.gradient_checkpointing
 
         self.apply_training_mode()
         # FSDP cannot shard a 0-d parameter and this model has one. Doing it here rather than at

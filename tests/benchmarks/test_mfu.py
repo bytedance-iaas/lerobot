@@ -345,3 +345,68 @@ def test_dreamzero_estimate_flops_requires_a_meta_model():
     with pytest.raises(RuntimeError, match="meta-device model"):
         WANPolicyHead.estimate_flops(head, **cfg.training_window())
     assert next(head.parameters()).device == torch.device("cpu")
+
+
+# --- the gradient-checkpointing dial ---------------------------------------------------
+# `gradient_checkpointing` is True/False or a count, because all-or-nothing is the wrong
+# granularity for a 40-block DiT whose activations do not fit but whose half does. These pin
+# the counting, and that MFU's numerator stays put while HFU's tracks the dial.
+
+
+def _mask(flag, depth=40) -> tuple[bool, ...]:
+    """Exercise the selection logic without building 23 B meta parameters for it."""
+    from lerobot.policies.dreamzero.wan.causal_wan_model import CausalWanModel
+
+    stub = type("Stub", (), {"blocks": [None] * depth, "gradient_checkpointing": flag})()
+    return CausalWanModel.checkpointed_blocks(stub)
+
+
+def test_checkpoint_dial_endpoints():
+    assert _mask(True) == (True,) * 40
+    assert _mask(False) == (False,) * 40
+    assert _mask(40) == (True,) * 40
+    assert _mask(0) == (False,) * 40
+
+
+def test_checkpoint_dial_true_is_not_one():
+    """`bool` is a subclass of `int`, so a careless check would read True as "one block"."""
+    assert sum(_mask(True)) == 40
+    assert sum(_mask(1)) == 1
+
+
+@pytest.mark.parametrize("count", [1, 5, 12, 20, 25, 39])
+def test_checkpoint_dial_honours_the_count(count):
+    mask = _mask(count)
+    assert len(mask) == 40
+    assert sum(mask) == count
+
+
+def test_checkpoint_dial_spreads_rather_than_clusters():
+    """Position is immaterial to memory and time, but a contiguous run reads as if it weren't."""
+    chosen = [i for i, on in enumerate(_mask(20)) if on]
+    assert chosen != list(range(20))
+    assert max(chosen) < 40
+
+
+def test_config_rejects_a_count_past_the_depth():
+    """Clamping would turn a typo into a silent quarter-step tax, which is what the dial avoids."""
+    from lerobot.policies.dreamzero.configuration_dreamzero import DreamZeroConfig
+
+    with pytest.raises(ValueError, match=r"count in \[0, 40\]"):
+        DreamZeroConfig(gradient_checkpointing=41)
+    with pytest.raises(ValueError, match=r"count in \[0, 40\]"):
+        DreamZeroConfig(gradient_checkpointing=-1)
+    assert DreamZeroConfig(gradient_checkpointing=20).gradient_checkpointing == 20
+
+
+def test_recompute_is_linear_in_the_dial():
+    """Every block costs the same, so half the blocks must be exactly half the recompute."""
+    full = _dreamzero(training_mode="full")["recompute"]
+    half = _dreamzero(training_mode="full", gradient_checkpointing=20)["recompute"]
+    assert half == pytest.approx(full / 2, rel=1e-9)
+
+
+def test_the_dial_does_not_move_mfus_numerator():
+    """Only HFU may respond to it; the model's own arithmetic is unchanged."""
+    totals = {n: _dreamzero(training_mode="full", gradient_checkpointing=n)["total"] for n in (0, 20, 40)}
+    assert len(set(totals.values())) == 1
