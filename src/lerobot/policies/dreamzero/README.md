@@ -530,8 +530,48 @@ MFU counts only the arithmetic the model's math requires; HFU counts what the ca
 They differ here by **24% of the work executed**, which is exactly the DiT blocks being
 recomputed in the backward pass — so the 10 points between them are the price of
 `gradient_checkpointing`, not a property of the kernels. Chasing MFU up to HFU means finding
-that memory somewhere else, and the comment on `DreamZeroConfig.gradient_checkpointing` records
-why there is nowhere obvious: 40 blocks of activations reach 121.7 GiB at batch 1.
+that memory somewhere else.
+
+### `gradient_checkpointing` is a dial
+
+All-or-nothing is the wrong granularity for this model. 40 blocks of activations reach
+121.7 GiB at batch 1, so recompute cannot simply be turned off — but an 8xH200 full fine-tune
+sits at 57.0 GB of 141 GB, and **leaving most of that headroom unused costs a quarter of every
+step**. So the field takes a count as well as a bool: `True` checkpoints all 40 blocks, `False`
+none, and an int checkpoints that many.
+
+```bash
+--policy.gradient_checkpointing=20     # half recompute, roughly half the headroom spent
+```
+
+Which blocks are chosen is immaterial — every block has the same activation footprint and the
+same recompute cost, and the peak is reached at the end of the forward with every
+un-checkpointed block live at once, so only *how many* matters.
+`CausalWanModel.checkpointed_blocks` spreads them evenly for readability.
+
+Pricing the ladder with the tool (`--checkpoint-blocks N`). **Only the first row is measured**;
+the step times below it are that 6.9 s rescaled by hardware FLOPs, which assumes the step stays
+compute-bound — so they are what to expect, not what was observed:
+
+| checkpointed | recompute | step (predicted) | MFU | samples/s | extra activations |
+|---|---|---|---|---|---|
+| 40 (`True`) | 457.1 TFLOP | 6.90 s *(measured)* | 33.0% | 1.16 | — |
+| 25 | 285.7 | 6.29 s | 36.2% | 1.27 | ~43 GiB |
+| **20** | 228.5 | 6.09 s | 37.4% | 1.31 | ~58 GiB |
+| 12 | 137.1 | 5.76 s | 39.5% | 1.39 | ~81 GiB |
+| 0 (`False`) | 0 | 5.27 s | 43.2% | 1.52 | ~117 GiB |
+
+The activation column is the arithmetic for choosing a value: 121.7 GiB over 40 blocks is
+~3.04 GiB per block, against ~0.16 GiB for the block input a checkpointed block stores instead,
+so each block left unrecomputed costs ~2.9 GiB. Against ~78 GiB of headroom that admits at most
+~27 blocks, and **20 is the suggested starting point** — it leaves margin for fragmentation and
+FSDP's all-gather transients. Both inputs are per-card measurements of a different card
+(950PR) and a different parallel layout, so bisect from there rather than trusting the row.
+
+On a 950PR at batch 1 there is no headroom at all and `True` is the only safe value: 121.7 GiB
+of a 123.2 GiB card. Keeping 5 of the 40 blocks unrecomputed does run on one card there
+(9.54 vs 9.89 s/step, the 3.5% the ladder predicts) but still OOMs under FSDP, which shards
+parameters and gradients and not activations.
 
 Where the per-sample FLOPs go, and what each part is billed:
 

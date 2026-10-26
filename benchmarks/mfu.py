@@ -321,7 +321,13 @@ def main() -> None:
         dest="gradient_checkpointing",
         action="store_false",
         default=None,
-        help="dreamzero: cost the run as if the DiT kept its activations (no recompute)",
+        help="dreamzero: cost the run as if the DiT kept every block's activations",
+    )
+    ap.add_argument(
+        "--checkpoint-blocks",
+        dest="gradient_checkpointing",
+        type=int,
+        help="dreamzero: how many of the 40 DiT blocks recompute, for pricing a partial setting",
     )
     ap.add_argument(
         "--untiled-vae", action="store_true", help="dreamzero: cost the VAE encode without tiling"
