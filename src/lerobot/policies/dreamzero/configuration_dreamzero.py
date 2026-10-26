@@ -105,6 +105,9 @@ _DIT_PRESETS = {
 # with the DiT's 2x2 latent patch this fixes the video canvas size (see _validate_video_geometry).
 _VAE_CLASS = "WanVideoVAE"
 _VAE_SPATIAL_COMPRESSION = 8
+# Temporal compression of the same VAE: the first latent frame encodes one raw frame and every
+# later one encodes four, so `num_frames` must be 4k+1 (33 -> 9 latent frames).
+_VAE_TEMPORAL_COMPRESSION = 4
 # DiT patch size along (H, W); the video head consumes 2x2 latent patches.
 _DIT_PATCH_HW = 2
 
@@ -411,6 +414,34 @@ class DreamZeroConfig(PreTrainedConfig):
     def embodiment_projector_index(self) -> int:
         """Always 0 — see `EMBODIMENT_TAG_TO_PROJECTOR_INDEX`. Kept because the tensor is."""
         return EMBODIMENT_TAG_TO_PROJECTOR_INDEX[self.embodiment_tag]
+
+    def training_window(self) -> dict[str, int]:
+        """Every shape one training sample presents to the head, derived from this config.
+
+        `WANPolicyHead.estimate_flops` takes exactly these as keyword arguments, so the geometry
+        is computed once, here, next to the `_validate_video_geometry` that already enforces it —
+        rather than a second time in whatever tool wants a FLOPs count.
+
+        The two token counts come from the asserts in `WANPolicyHead.forward`, which are the
+        authority on how a window is laid out: one action register per `num_frame_per_block`
+        frames carries `num_action_per_block` action tokens, and the state registers are strided
+        against the same blocks. The first latent frame is the i2v conditioning frame and carries
+        no registers, hence `latent_frames - 1`.
+        """
+        latent_frames = (self.num_frames - 1) // _VAE_TEMPORAL_COMPRESSION + 1
+        canvas_h = 2 * self.per_view_height
+        canvas_w = 2 * self.per_view_width
+        blocks = latent_frames - 1
+        return {
+            "canvas_height": canvas_h,
+            "canvas_width": canvas_w,
+            "raw_frames": self.num_frames,
+            "latent_frames": latent_frames,
+            "latent_height": canvas_h // _VAE_SPATIAL_COMPRESSION,
+            "latent_width": canvas_w // _VAE_SPATIAL_COMPRESSION,
+            "action_tokens": blocks * (self.num_action_per_block // self.num_frame_per_block),
+            "state_tokens": blocks // (self.num_frame_per_block // self.num_state_per_block),
+        }
 
     def build_action_head_config(self, defer_lora_injection: bool = False):
         """Assemble the internal `WANPolicyHeadConfig` consumed by `WANPolicyHead`.

@@ -849,6 +849,210 @@ class WANPolicyHead(ActionHead):
 
         return BatchFeature(data=output_dict)
 
+    def dit(self) -> "CausalWanModel":
+        """The `CausalWanModel` itself, past any PEFT wrapper.
+
+        `set_trainable_parameters` replaces `self.model` with a `PeftModel` under `lora`, and that
+        wrapper forwards unknown attribute *reads* to the base model but absorbs *writes* -- so
+        `head.model.gradient_checkpointing = False` sets a field on the wrapper while the block
+        loop keeps reading the real one. Anything that needs to write to the DiT, or needs its
+        blocks, should go through here.
+        """
+        for module in self.modules():
+            if isinstance(module, CausalWanModel):
+                return module
+        raise RuntimeError("no CausalWanModel under this head")
+
+    def estimate_flops(
+        self,
+        *,
+        canvas_height: int,
+        canvas_width: int,
+        raw_frames: int,
+        latent_frames: int,
+        latent_height: int,
+        latent_width: int,
+        action_tokens: int,
+        state_tokens: int,
+    ) -> dict[str, float]:
+        """Model FLOPs for ONE training sample (forward + backward), by part.
+
+        `DreamZeroConfig.training_window()` produces exactly these arguments. Matmuls only, which
+        is what MFU is defined over: norms, softmax, rotary and activations are bandwidth-bound
+        and every published MFU omits them.
+
+        Unlike pi05's and GR00T's `estimate_flops`, this does not count parameters structurally --
+        it RUNS the training forward on the meta device, with hooks on every Linear/Conv and stubs
+        over both attention entry points, and adds up what was actually called. Two things make
+        that the honest option rather than the lazy one:
+
+        * The DiT's teacher-forcing attention is not a formula. `_process_clean_image_only`,
+          `_process_noisy_image_blocks`, `_process_noisy_action_blocks` and `_process_state_blocks`
+          slice q and k/v in Python and issue 18 separate self-attention calls per layer, whose
+          context lengths depend on `local_attn_size`, `max_chunk_size` and the register layout;
+          i2v cross-attention adds 2 more against the text and CLIP halves of the context.
+          Re-deriving that here would copy five non-trivial functions into a counter and let them
+          drift apart silently.
+        * The VAE encoder is convolutional, so its cost depends on each layer's output resolution,
+          and `tiled=True` re-encodes overlapping tiles. Neither is visible in a parameter count:
+          tiling alone is a 2.3x difference on the DROID canvas.
+
+        The forward costs nothing because every tensor is meta -- no memory is allocated and no
+        arithmetic runs, only shape propagation. That is also the requirement: call this on a
+        meta-built model, which is how `benchmarks/mfu.py` builds it.
+
+        Multipliers come off `requires_grad`, per weight, not off `training_mode`:
+
+        * 3x (fwd + dgrad + wgrad) for a weight that trains.
+        * 2x (fwd + dgrad) for a frozen DiT weight while something in the DiT trains -- a `lora`
+          run's base weights, which still pass a gradient back to the projectors at the input.
+        * 1x for the text/image/VAE encoders: `set_trainable_parameters` always freezes them and
+          nothing precedes them, so no gradient ever reaches them.
+
+        Returns:
+            Per-part FLOPs, a ``total`` (the MFU numerator), and ``recompute`` -- the DiT block
+            forward that gradient checkpointing runs a second time. ``recompute`` is NOT included
+            in ``total``, because MFU does not count it; add it to get HFU.
+        """
+        import contextlib
+        import io
+
+        from . import causal_attention, submodule
+
+        if any(p.device.type != "meta" for p in self.parameters()):
+            raise RuntimeError(
+                "estimate_flops runs the training forward in order to count what it calls, so it "
+                "needs a meta-device model -- otherwise it would allocate 23 B parameters' worth "
+                "of activations and actually compute them. Build the head inside "
+                "`with torch.device('meta')`."
+            )
+
+        dit = self.dit()
+        dit_trains = any(p.requires_grad for p in dit.parameters())
+        encoders = {
+            "text_encoder": "text encoder (umt5)",
+            "image_encoder": "image encoder (CLIP)",
+            "vae": "VAE encode",
+        }
+
+        # Attribute every weight to a part by where it lives, rather than by when it is called:
+        # ordering assumptions are exactly what goes stale when the forward is reorganised.
+        where: dict[int, str] = {}
+        block_ids: set[int] = {id(m) for block in dit.blocks for m in block.modules()}
+        for name, module in self.named_modules():
+            if not (
+                isinstance(module, nn.Linear | nn.Conv1d | nn.Conv2d | nn.Conv3d)
+                and getattr(module, "weight", None) is not None
+            ):
+                continue
+            root = name.split(".", 1)[0]
+            if root in encoders:
+                where[id(module)] = encoders[root]
+            elif id(module) in block_ids:
+                where[id(module)] = "DiT blocks"
+            else:
+                where[id(module)] = "DiT embed/head/projectors"
+
+        fwd: dict[str, float] = {}   # one forward, unmultiplied
+        billed: dict[str, float] = {}  # forward + backward, per this run's requires_grad
+        attn_calls: list[tuple[int, int, int, int]] = []
+
+        def hook(module, _inputs, output):
+            out = output[0] if isinstance(output, tuple | list) else output
+            # A Linear is billed per token (every dim but the last); a conv per output position
+            # (every dim but batch and channel -- out_channels is already in weight.numel()).
+            spatial = out.shape[:-1] if isinstance(module, nn.Linear) else out.shape[2:]
+            positions = 1
+            for d in spatial:
+                positions *= d
+            part = where[id(module)]
+            one = 2.0 * positions * module.weight.numel()
+            trains = module.weight.requires_grad
+            mult = 3.0 if trains else (2.0 if part.startswith("DiT") and dit_trains else 1.0)
+            fwd[part] = fwd.get(part, 0.0) + one
+            billed[part] = billed.get(part, 0.0) + mult * one
+
+        handles = [m.register_forward_hook(hook) for m in self.modules() if id(m) in where]
+
+        def record(q, k):
+            attn_calls.append((q.shape[1], k.shape[1], q.shape[2], q.shape[3]))
+            return torch.empty(q.shape, device=q.device, dtype=q.dtype)
+
+        def module_stub(_self, q, k, v, *_a, **_kw):
+            return record(q, k)
+
+        def function_stub(q, k, v, *_a, **_kw):
+            return record(q, k)
+
+        real_module_attn = causal_attention.AttentionModule.forward
+        real_flash_attn = submodule.flash_attention
+        causal_attention.AttentionModule.forward = module_stub
+        submodule.flash_attention = function_stub
+        meta = {"device": "meta", "dtype": torch.float32}
+        try:
+            with torch.no_grad(), contextlib.redirect_stderr(io.StringIO()):
+                # The frozen encoders, in the order `forward` calls them. Token counts come off
+                # the built modules, so no width or resolution is written down here.
+                self.text_encoder(
+                    torch.zeros(1, dit.text_len, dtype=torch.int64, device="meta"),
+                    torch.ones(1, dit.text_len, dtype=torch.int64, device="meta"),
+                )
+                self.vae.encode(
+                    torch.zeros(1, 3, raw_frames, canvas_height, canvas_width, device="meta"),
+                    tiled=self.tiled,
+                    tile_size=(self.tile_size_height, self.tile_size_width),
+                    tile_stride=(self.tile_stride_height, self.tile_stride_width),
+                )
+                side = self.image_encoder.model.image_size
+                clip_feature = self.image_encoder.model.visual(
+                    torch.zeros(1, 3, side, side, device="meta"), use_31_block=True
+                )
+
+                # The DiT, teacher-forced: `clean_x` doubles the video sequence, and the action
+                # and state registers ride on the noisy half only.
+                latents = torch.empty(1, dit.out_dim, latent_frames, latent_height, latent_width, **meta)
+                dit._forward_train(
+                    x=latents,
+                    clean_x=latents,
+                    timestep=torch.zeros(1, latent_frames, dtype=torch.int64, device="meta"),
+                    timestep_action=torch.zeros(1, action_tokens, dtype=torch.int64, device="meta"),
+                    context=torch.empty(1, dit.text_len, dit.text_dim, **meta),
+                    seq_len=latent_frames * dit.frame_seqlen,
+                    y=torch.empty(
+                        1, dit.in_dim - dit.out_dim, latent_frames, latent_height, latent_width, **meta
+                    ),
+                    clip_feature=torch.empty(clip_feature.shape, **meta),
+                    action=torch.empty(1, action_tokens, dit.action_dim, **meta),
+                    state=torch.empty(1, state_tokens, self.config.max_state_dim, **meta),
+                    embodiment_id=torch.zeros(1, dtype=torch.int64, device="meta"),
+                )
+        finally:
+            causal_attention.AttentionModule.forward = real_module_attn
+            submodule.flash_attention = real_flash_attn
+            for h in handles:
+                h.remove()
+
+        # QK^T plus AV per call, at the q and kv lengths the block slicing actually produced. Every
+        # attention call in this model is inside a DiT block -- self-attention and both halves of
+        # i2v cross-attention -- so it is all recomputed when gradient checkpointing is on.
+        attention_fwd = sum(4.0 * q * kv * heads * dim for q, kv, heads, dim in attn_calls)
+        attention_mult = 3.0 if dit_trains else 1.0
+        parts = {
+            encoders["text_encoder"]: billed.get(encoders["text_encoder"], 0.0),
+            encoders["image_encoder"]: billed.get(encoders["image_encoder"], 0.0),
+            f"VAE encode ({'tiled' if self.tiled else 'untiled'})": billed.get(encoders["vae"], 0.0),
+            "DiT embed/head/projectors": billed.get("DiT embed/head/projectors", 0.0),
+            f"DiT blocks x{dit.num_layers}": billed.get("DiT blocks", 0.0),
+            f"DiT attention ({len(attn_calls)} calls)": attention_mult * attention_fwd,
+        }
+        parts["total"] = sum(parts.values())
+        # Gradient checkpointing wraps the block loop and nothing else, so what it repeats is one
+        # forward of the blocks -- not the patch embedding, time embedding, head, or the encoders.
+        parts["recompute"] = (
+            fwd.get("DiT blocks", 0.0) + attention_fwd if dit.gradient_checkpointing else 0.0
+        )
+        return parts
+
     def generate_noise(self, shape, seed=None, device="cpu", dtype=torch.float16):
         generator = None if seed is None else torch.Generator(device).manual_seed(seed)
         noise = torch.randn(shape, generator=generator, device=device, dtype=dtype)

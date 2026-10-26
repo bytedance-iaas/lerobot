@@ -215,3 +215,133 @@ def test_groot_counts_the_unused_lm_head_separately():
     """It is real work the profile sees, and naming it is how it gets noticed."""
     parts = _groot().estimate_flops(text_tokens=19)
     assert parts["unused LM head"] > 0
+
+
+# --- dreamzero -------------------------------------------------------------------------
+# DreamZero's count is not structural: `estimate_flops` runs the training forward on meta and
+# adds up what it calls, because the teacher-forcing attention is 20 hand-sliced calls per
+# layer and the VAE is convolutional. These guard the two halves of that -- that the window
+# geometry handed to it is the one the model asserts on, and that the run-and-count is
+# attributing work to the right side of the MFU/HFU line.
+
+_DZ_CACHE: dict[tuple, dict[str, float]] = {}
+
+
+def _dreamzero(**kwargs) -> dict[str, float]:
+    """~8 s per distinct config (23 B meta parameters), so memoise."""
+    key = tuple(sorted(kwargs.items()))
+    if key not in _DZ_CACHE:
+        _DZ_CACHE[key] = mfu.POLICIES["dreamzero"](**kwargs)
+    return _DZ_CACHE[key]
+
+
+def test_dreamzero_is_registered():
+    assert "dreamzero" in mfu.POLICIES
+
+
+def test_dreamzero_window_matches_the_asserts_in_the_head():
+    """`WANPolicyHead.forward` asserts these two ratios; `training_window` must satisfy them.
+
+    Getting either wrong would not raise here -- it would hand `estimate_flops` a sample shape
+    the model would reject at training time, and quietly cost the wrong thing.
+    """
+    from lerobot.policies.dreamzero.configuration_dreamzero import DreamZeroConfig
+
+    cfg = DreamZeroConfig()
+    w = cfg.training_window()
+    blocks = w["latent_frames"] - 1
+    assert w["action_tokens"] / blocks == cfg.num_action_per_block // cfg.num_frame_per_block
+    assert blocks / w["state_tokens"] == cfg.num_frame_per_block // cfg.num_state_per_block
+
+
+def test_dreamzero_window_tokenizes_to_the_dit_frame_seqlen():
+    """The canvas, the VAE's 8x and the DiT's 2x2 patch have to land on `frame_seqlen`.
+
+    `_validate_video_geometry` enforces it at config build; this pins that `training_window`
+    reports the same latent size that check was run against.
+    """
+    from lerobot.policies.dreamzero.configuration_dreamzero import _DIT_PRESETS, DreamZeroConfig
+
+    cfg = DreamZeroConfig()
+    w = cfg.training_window()
+    tokens = (w["latent_height"] // 2) * (w["latent_width"] // 2)
+    assert tokens == _DIT_PRESETS[cfg.model_variant]["frame_seqlen"]
+
+
+def test_dreamzero_counts_every_attention_call():
+    """18 self-attention calls per layer plus both halves of i2v cross-attention.
+
+    The number itself is the point: it is what makes a formula the wrong tool here, and if a
+    refactor collapses those calls the count should change loudly rather than drift.
+    """
+    parts = _dreamzero(training_mode="full")
+    key = next(k for k in parts if k.startswith("DiT attention"))
+    assert "(800 calls)" in key
+    assert parts[key] > 0
+
+
+def test_dreamzero_recompute_is_reported_but_not_in_the_total():
+    """MFU's numerator must not move when gradient checkpointing does. HFU's must."""
+    on = _dreamzero(training_mode="full")
+    off = _dreamzero(training_mode="full", gradient_checkpointing=False)
+    assert off["recompute"] == 0.0
+    assert on["recompute"] > 0.0
+    assert on["total"] == pytest.approx(off["total"], rel=1e-9)
+
+
+def test_dreamzero_recompute_is_one_forward_of_the_blocks():
+    """Checkpointing wraps the block loop only -- not the embeddings, head, or encoders.
+
+    Billing it as a whole extra forward would overstate HFU; billing the blocks at their
+    trained 3x would overstate it three-fold.
+    """
+    parts = _dreamzero(training_mode="full")
+    blocks = next(v for k, v in parts.items() if k.startswith("DiT blocks"))
+    attention = next(v for k, v in parts.items() if k.startswith("DiT attention"))
+    assert parts["recompute"] == pytest.approx((blocks + attention) / 3.0, rel=1e-9)
+
+
+def test_dreamzero_frozen_encoders_are_forward_only():
+    """umt5/CLIP/VAE are frozen and nothing precedes them, so no gradient ever reaches them.
+
+    Billing them at 3x like the DiT would add ~180 TFLOP of work that never runs.
+    """
+    full = _dreamzero(training_mode="full")
+    lora = _dreamzero(training_mode="lora")
+    for key in ("text encoder (umt5)", "image encoder (CLIP)", "VAE encode (tiled)"):
+        assert full[key] == pytest.approx(lora[key], rel=1e-9)
+
+
+def test_dreamzero_lora_pays_dgrad_but_not_wgrad_on_the_base_weights():
+    """A frozen weight with trainable projectors at the DiT's input still costs fwd + dgrad.
+
+    So the base DiT is 2x under `lora` against 3x under `full` -- two thirds, plus whatever the
+    adapters themselves add.
+    """
+    full = next(v for k, v in _dreamzero(training_mode="full").items() if k.startswith("DiT blocks"))
+    lora = next(v for k, v in _dreamzero(training_mode="lora").items() if k.startswith("DiT blocks"))
+    assert lora / full == pytest.approx(2 / 3, rel=0.02)
+    assert lora > full * 2 / 3  # the adapters are real work on top
+
+
+def test_dreamzero_vae_tiling_is_not_free():
+    """`tiled=True` re-encodes overlapping tiles, which no parameter count can see."""
+    tiled = _dreamzero(training_mode="full")["VAE encode (tiled)"]
+    untiled = _dreamzero(training_mode="full", untiled_vae=True)["VAE encode (untiled)"]
+    assert tiled > 2 * untiled
+
+
+def test_dreamzero_estimate_flops_requires_a_meta_model():
+    """It runs the forward. On a real device that would allocate 23 B parameters of activations."""
+    import torch
+
+    from lerobot.policies.dreamzero.configuration_dreamzero import DreamZeroConfig
+    from lerobot.policies.dreamzero.wan.action_head import WANPolicyHead
+
+    cfg = DreamZeroConfig()
+    head = WANPolicyHead.__new__(WANPolicyHead)
+    nn.Module.__init__(head)
+    head.probe = nn.Linear(2, 2)  # a single real parameter is enough to fail the check
+    with pytest.raises(RuntimeError, match="meta-device model"):
+        WANPolicyHead.estimate_flops(head, **cfg.training_window())
+    assert next(head.parameters()).device == torch.device("cpu")

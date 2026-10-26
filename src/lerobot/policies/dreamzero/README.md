@@ -512,10 +512,50 @@ Measured on 8xH200, `training_mode=full`, micro-batch 1:
 | trainable | 16,484 M |
 | effective batch | 8 |
 | gradient norm | 0.23-0.38 |
+| model FLOPs | 1478.8 TFLOP per sample |
+| **MFU** | **33.0%** of 650.2 TFLOP/s (sustained bf16) |
+| **HFU** | **43.2%** — the gap is recompute |
 
 For reference, RLinf reports 9.0 s/step on 8xH100 with plain FSDP2 and 6.7 s/step with their
 compile/CUDA-graph stack, which this port does not carry — landing at 6.9 s on faster hardware
 without those optimizations is the expected place to be.
+
+### Reading those two numbers
+
+```bash
+python benchmarks/mfu.py dreamzero --training-mode=full --ranks 8 --step-s 6.9 --peak-tflops 650.2
+```
+
+MFU counts only the arithmetic the model's math requires; HFU counts what the card actually ran.
+They differ here by **24% of the work executed**, which is exactly the DiT blocks being
+recomputed in the backward pass — so the 10 points between them are the price of
+`gradient_checkpointing`, not a property of the kernels. Chasing MFU up to HFU means finding
+that memory somewhere else, and the comment on `DreamZeroConfig.gradient_checkpointing` records
+why there is nowhere obvious: 40 blocks of activations reach 121.7 GiB at batch 1.
+
+Where the per-sample FLOPs go, and what each part is billed:
+
+| part | TFLOP | multiplier | why |
+|---|---|---|---|
+| DiT blocks x40 | 1152.9 | 3x | fwd + dgrad + wgrad; all 16.5 B parameters train |
+| DiT attention (800 calls) | 218.3 | 3x | 18 self-attention calls per layer + both halves of i2v cross-attention |
+| VAE encode (tiled) | 84.6 | 1x | frozen, and nothing precedes it, so no gradient reaches it |
+| DiT embed/head/projectors | 17.9 | 3x | patch embedding, time embedding/projection, head |
+| text encoder (umt5) | 4.7 | 1x | frozen; 512 tokens is cheap even at 5.7 B parameters |
+| image encoder (CLIP) | 0.3 | 1x | frozen; one 224x224 frame |
+
+Two things that table makes visible. **`tiled=True` is costing 47.6 TFLOP per sample for nothing**
+— the 352x640 canvas does not need tiling, and `--untiled-vae` prices the same encode at 37.0
+instead of 84.6, about 3% of the step. And **the attention is 800 separate kernel launches per
+forward**, because the teacher-forcing pattern is built by slicing q and k/v in Python rather than
+with a mask; 160 of those are single-token state self-attention, which is an identity.
+
+That is also why DreamZero's `estimate_flops` works differently from pi05's and GR00T's: it runs
+the training forward on the meta device with hooks on every Linear/Conv and stubs over both
+attention entry points, and adds up what was called. Nothing is allocated and nothing is computed
+— meta tensors only propagate shapes — but a hand-written formula would have to restate five
+block-slicing functions and the convolutional VAE's per-layer resolutions, and would drift from
+them silently.
 
 **`--policy.compute_dtype=float32` is required for a full fine-tune**, and pairs with the
 `mixed_precision: bf16` in the accelerate config: fp32 master weights, bf16 forward/backward and
