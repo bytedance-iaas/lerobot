@@ -196,6 +196,12 @@ class DreamZeroConfig(PreTrainedConfig):
     # subtracted from it is tensor shapes, and the per-card numbers are from a different card
     # (950PR) and a different parallel layout. So bisect down from True rather than trusting
     # the arithmetic, and re-measure before relying on False.
+    #
+    # The default stays True even so, because activations are per sample: False fits only at
+    # micro-batch 1, `TrainPipelineConfig.batch_size` defaults to 8, and a 950PR has no
+    # headroom at batch 1 at all. The recipe that can afford False passes it explicitly --
+    # see the 8xH200 command in this policy's README, and the throughput-vs-effective-batch
+    # table under it, which is why spending the headroom here beats spending it on the batch.
     gradient_checkpointing: bool | int = True
 
     # Diffusion. `num_inference_timesteps` is a TRAINING parameter (the released DROID checkpoint

@@ -500,8 +500,12 @@ accelerate launch --config_file src/lerobot/policies/dreamzero/fsdp.yaml \
   --dataset.repo_id=lerobot/droid_1.0.1 \
   --dataset.root=/data/datasets/droid_1.0.1 \
   --dataset.episodes='[0,1,2,3]' \
+  --policy.gradient_checkpointing=false \
   --batch_size=1 --steps=... --output_dir=outputs/train/dreamzero_fsdp
 ```
+
+`gradient_checkpointing=false` is the right value *for this cell* and not the default, because
+activations scale with the micro-batch: see the dial below.
 
 Measured on 8xH200, `training_mode=full`, micro-batch 1:
 
@@ -545,7 +549,8 @@ of every step**. So the field takes a count as well as a bool: `True` checkpoint
 blocks, `False` none, and an int checkpoints that many.
 
 ```bash
---policy.gradient_checkpointing=20     # half recompute, roughly half the headroom spent
+--policy.gradient_checkpointing=false  # 8xH200 at micro-batch 1: no recompute at all
+--policy.gradient_checkpointing=20     # half recompute, half the headroom spent
 ```
 
 Which blocks are chosen is immaterial — every block has the same activation footprint and the
@@ -587,6 +592,33 @@ shards parameters and gradients and not activations. Keeping 5 of the 40 blocks 
 did run on one card there (9.54 vs 9.89 s/step, the 3.5% the ladder predicts). Whether the
 ~49 GiB the modulation change gives back is enough to open the dial on that card has not been
 measured.
+
+#### Why the default stays `True`, and why batch is not the other answer
+
+Activations are per sample, so the dial and the micro-batch compete for the same ~78 GiB and
+`False` only fits at micro-batch 1. The default has to work everywhere -- `batch_size` defaults
+to 8 and a 950PR has no headroom at all -- so it stays `True`, and the recipe that can afford
+`False` says so on the command line.
+
+The competition is not a throughput trade, though, because model FLOPs per sample do not depend
+on the batch: step time grows with N and `samples/s = 8N / step(N)` cancels it. Per-sample
+activations run about `74.8 - 1.66 * checkpointed` GiB against a ~86.6 GiB budget, so what the
+two knobs actually trade is throughput against *effective* batch:
+
+| | checkpointed | micro-batch | samples/s | effective batch |
+|---|---|---|---|---|
+| **the recipe above** | **0** | **1** | **1.54** | **8** |
+| | 20 | 2 | 1.33 | 16 |
+| | 32 | 4 | 1.21 | 32 |
+| | 40 | 10 | 1.17 | 80 |
+
+Raising the micro-batch at a *fixed* dial setting is free — 20 blocks at micro-batch 2 reads the
+same 1.33 samples/s as micro-batch 1 — so the cost of a larger effective batch is entirely in
+having to turn the dial up to make room. There is no gradient accumulation to get it cheaper:
+`lerobot_train` steps the optimizer every micro-batch and never calls
+`accelerator.accumulate`, so accelerate's `gradient_accumulation_steps` would only rescale the
+loss. Upstream's and RLinf's published DROID recipe is 8 ranks at micro-batch 1, effective
+batch 8, which is the first row.
 
 Where the per-sample FLOPs go, and what each part is billed:
 
