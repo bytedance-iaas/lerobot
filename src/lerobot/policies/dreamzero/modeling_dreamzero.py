@@ -89,6 +89,8 @@ class DreamZeroPolicy(PreTrainedPolicy):
         # assigning there would set a field on the wrapper while the block loop went on reading
         # the real one, and the config's value would be silently ignored.
         self.action_head.dit().gradient_checkpointing = config.gradient_checkpointing
+        if config.compile_dit:
+            self._compile_dit()
 
         self.apply_training_mode()
         # FSDP cannot shard a 0-d parameter and this model has one. Doing it here rather than at
@@ -380,6 +382,21 @@ class DreamZeroPolicy(PreTrainedPolicy):
         self.action_head.to(device=self.config.device, dtype=dtype)
         if self.config.compile_encoders:
             self._compile_encoders()
+
+    def _compile_dit(self) -> None:
+        """torch.compile each DiT block, which is where the non-matmul time is.
+
+        One block at a time rather than the whole DiT: the teacher-forcing self-attention is
+        ~20 hand-sliced calls into flash-attention, so `fullgraph=True` is not obtainable, and
+        the value here is fusing the elementwise work between those calls. The 40 blocks share
+        their code, so this is one trace amortised 40 ways.
+
+        Assigning to `forward` rather than compiling the module is the same shape as
+        `_compile_encoders`, and it keeps the compiled region inside FSDP's hooks, which wrap
+        `CausalWanAttentionBlock` itself.
+        """
+        for block in self.action_head.dit().blocks:
+            block.forward = torch.compile(block.forward, fullgraph=False, dynamic=False)
 
     def _compile_encoders(self) -> None:
         """torch.compile the text/image/VAE encoders, as upstream ``post_initialize`` does."""

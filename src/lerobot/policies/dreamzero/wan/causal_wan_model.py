@@ -657,6 +657,16 @@ class CausalWanSelfAttention(nn.Module):
         Instead of looping, we can process all blocks in a single call with block-diagonal masking,
         or even simpler: just one attention call since they're independent.
         """
+        # At `num_state_per_block == 1`, which is the DROID config and upstream's default, each
+        # block is one token attending to itself: softmax over a single key is exactly 1, so the
+        # output is v. The loop below spent 4 attention launches per layer -- 160 per forward,
+        # 160 more in the recompute, plus an `empty_like` and four slice-assigns whose backward
+        # is a chain of CopySlices -- to copy v. The cast is what the attention would have done
+        # on the way out (it returns q's dtype); activations are bf16 on every supported path,
+        # where that makes this exact rather than merely equivalent.
+        if self.num_state_per_block == 1:
+            return state_v.to(state_q.dtype)
+
         num_blocks = state_horizon // self.num_state_per_block
         
         if num_blocks == 1:

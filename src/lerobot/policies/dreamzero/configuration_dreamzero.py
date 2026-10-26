@@ -163,7 +163,38 @@ class DreamZeroConfig(PreTrainedConfig):
     compute_dtype: str = "bfloat16"
     # torch.compile the text/image/VAE encoders (upstream `post_initialize` does this too). Off by
     # default: it costs a few minutes of warmup and is only worth it for long rollouts.
+    # Inference only -- `prepare_for_inference` is what applies it.
     compile_encoders: bool = False
+    # torch.compile each DiT block, for training as well as inference. Per block and
+    # `fullgraph=False` on purpose: the teacher-forcing attention is ~20 hand-sliced calls into
+    # an opaque flash-attention kernel, so a whole-model graph is not obtainable. Compiling
+    # `block.forward` puts the compiled region INSIDE the FSDP hooks, since `fsdp.yaml` wraps
+    # `CausalWanAttentionBlock` -- the order that is documented to work.
+    #
+    # Off by default and UNVERIFIED on either card. Read the following before turning it on,
+    # because the case for it is weaker than it looks:
+    #
+    # * Those ~20 opaque calls mean ~21 graph breaks per block, so what gets fused is only the
+    #   norm/modulation/residual chains BETWEEN the attention calls. 40 blocks sharing one
+    #   trace amortises the compile, but it amortises a trace of 21 small subgraphs, not of one
+    #   block-sized graph.
+    # * That elementwise share is smaller than it was. The 950PR profile that motivated this
+    #   read Add 14% and Cast 8.8%, but that was recompute traffic, which
+    #   `gradient_checkpointing=False` removes; and the largest remaining chain -- the per-token
+    #   time embedding, 934 MiB a block -- was fixed by hand instead (see `_per_run`). Compile's
+    #   upside here has been eaten by the two changes above it.
+    # * RLinf's 9.0 -> 6.7 s/step on 8xH100 is NOT a forecast for this switch. That is compile
+    #   plus CUDA graphs plus their own attention implementation; none of it transfers to
+    #   flipping Dynamo on over this code.
+    # * Do not turn it on an a 950PR. torch_npu's inductor autotunes serially, which is what
+    #   made compiling GR00T there unusable; it is a toolchain defect, pending with Ascend, and
+    #   nothing about it is specific to this model.
+    #
+    # It also wants `gradient_checkpointing=False`: compile under `torch.utils.checkpoint` has
+    # to handle the recomputed forward too and the combination is a known source of trouble, so
+    # the dial being open is what makes this clean. Compile warmup lands on top of the ~95 s the
+    # first step already costs, so judge it on the steady-state step and nothing else.
+    compile_dit: bool = False
     # Recompute DiT blocks in the backward pass instead of keeping their activations, which is
     # what the recompute traffic in a profile is: 16.6 k in-place copies and 5.1 k in-place adds
     # per step. Upstream hardcodes it on, and on a 950PR there was no room to turn it off -- 40

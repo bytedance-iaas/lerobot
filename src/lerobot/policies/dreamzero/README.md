@@ -625,7 +625,7 @@ Where the per-sample FLOPs go, and what each part is billed:
 | part | TFLOP | multiplier | why |
 |---|---|---|---|
 | DiT blocks x40 | 1152.9 | 3x | fwd + dgrad + wgrad; all 16.5 B parameters train |
-| DiT attention (800 calls) | 218.3 | 3x | 18 self-attention calls per layer + both halves of i2v cross-attention |
+| DiT attention (640 calls) | 218.3 | 3x | 14 self-attention calls per layer + both halves of i2v cross-attention |
 | VAE encode (tiled) | 84.6 | 1x | frozen, and nothing precedes it, so no gradient reaches it |
 | DiT embed/head/projectors | 0.4 | 3x | patch embedding, time embedding/projection, head |
 | text encoder (umt5) | 4.7 | 1x | frozen; 512 tokens is cheap even at 5.7 B parameters |
@@ -637,9 +637,13 @@ embedding and projection used to run on 15,940 rows instead of 118, which was 17
 
 Two things that table makes visible. **`tiled=True` is costing 47.6 TFLOP per sample for nothing**
 — the 352x640 canvas does not need tiling, and `--untiled-vae` prices the same encode at 37.0
-instead of 84.6, about 3% of the step. And **the attention is 800 separate kernel launches per
+instead of 84.6, about 3% of the step. And **the attention is 640 separate kernel launches per
 forward**, because the teacher-forcing pattern is built by slicing q and k/v in Python rather than
-with a mask; 160 of those are single-token state self-attention, which is an identity.
+with a mask. It was 800 until the 160 single-token state self-attention calls came out: at
+`num_state_per_block=1` each one is softmax over a single key, which is exactly 1, so the call
+returned v. That is why this row's TFLOP did not move — those launches were ~20 kFLOP apiece,
+and what they cost was launch overhead, an `empty_like` and four slice-assigns per layer whose
+backward is a chain of `CopySlices`.
 
 That is also why DreamZero's `estimate_flops` works differently from pi05's and GR00T's: it runs
 the training forward on the meta device with hooks on every Linear/Conv and stubs over both
