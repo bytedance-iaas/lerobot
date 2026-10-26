@@ -124,20 +124,36 @@ def test_padding_is_what_makes_the_droid_window_divide():
 
 # --- the collectives --------------------------------------------------------------------
 
-WORLD = 2
-HEADS = 4
-SEQ = 6  # global; 3 per rank
+# Overridable so the same tests can be pointed at real devices and a real backend, which is
+# the only way to find out whether that backend's all_to_all_single agrees with gloo's:
+#   LEROBOT_TEST_SP=1 LEROBOT_SP_BACKEND=hccl LEROBOT_SP_WORLD=4 pytest ...
+BACKEND = os.environ.get("LEROBOT_SP_BACKEND", "gloo")
+WORLD = int(os.environ.get("LEROBOT_SP_WORLD", "2"))
+HEADS = 4 * WORLD // 2  # keep heads divisible by the degree
+SEQ = 3 * WORLD  # global; 3 per rank
 DIM = 2
 
 
-def _worker(rank: int, port: int, queue) -> None:
+def _init(rank: int, port: int) -> None:
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group("gloo", rank=rank, world_size=WORLD)
+    if BACKEND != "gloo":
+        import torch  # noqa: F811
+
+        getattr(torch, BACKEND.replace("hccl", "npu")).set_device(rank)
+    dist.init_process_group(BACKEND, rank=rank, world_size=WORLD)
+
+
+def _device() -> str:
+    return "cpu" if BACKEND == "gloo" else BACKEND.replace("hccl", "npu")
+
+
+def _worker(rank: int, port: int, queue) -> None:
+    _init(rank, port)
     try:
         # Every rank builds the same global tensor, then keeps its own sequence shard.
         torch.manual_seed(0)
-        full = torch.randn(1, SEQ, HEADS, DIM, dtype=torch.float64)
+        full = torch.randn(1, SEQ, HEADS, DIM, dtype=torch.float32, device=_device())
         start, end = shard_bounds(SEQ, WORLD, rank)
         mine = full[:, start:end].clone().requires_grad_()
 
@@ -154,7 +170,7 @@ def _worker(rank: int, port: int, queue) -> None:
         back.backward(grad)
         grad_ok = torch.equal(mine.grad, grad)
 
-        queue.put((rank, tuple(heads.shape), exchanged_ok, round_trip_ok, grad_ok))
+        queue.put((rank, tuple(heads.shape), bool(exchanged_ok), bool(round_trip_ok), bool(grad_ok)))
     finally:
         dist.destroy_process_group()
 
@@ -281,9 +297,7 @@ def _run_block(world: int, rank: int, dtype=torch.bfloat16):
 
 
 def _sp_worker(rank: int, port: int, queue) -> None:
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group("gloo", rank=rank, world_size=WORLD)
+    _init(rank, port)
     try:
         out, x_grad, grads = _run_block(WORLD, rank)
         queue.put((rank, out, x_grad, grads))
@@ -395,15 +409,13 @@ def test_the_droid_segments_tile_the_window():
 
 
 def _gather_worker(rank: int, port: int, queue) -> None:
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group("gloo", rank=rank, world_size=WORLD)
+    _init(rank, port)
     try:
         # A 10-token sequence whose "video" segment is tokens 3..9, so the two ranks hold 2 and
         # 4 of it -- uneven on purpose, which is the case `all_gather_into_tensor` cannot do.
         total, lo, hi = 10, 3, 9
         torch.manual_seed(3)
-        full = torch.randn(1, hi - lo, 2, dtype=torch.float64)
+        full = torch.randn(1, hi - lo, 2, dtype=torch.float32, device=_device())
         sizes = segment_sizes(total, WORLD, lo, hi)
         offset = sum(sizes[:rank])
         mine = full[:, offset : offset + sizes[rank]].clone().requires_grad_()
@@ -441,7 +453,7 @@ def test_the_uneven_gather_reassembles_and_its_backward_is_a_slice():
         assert proc.exitcode == 0, f"rank exited {proc.exitcode}"
 
     for rank, sizes, whole_ok, grad_ok in results:
-        assert sizes == [2, 4], f"rank {rank} expected uneven pieces, got {sizes}"
+        assert sum(sizes) == 6 and len(set(sizes)) > 1, f"rank {rank} wanted uneven pieces, got {sizes}"
         assert whole_ok, f"rank {rank} did not reassemble the segment"
         assert grad_ok, f"rank {rank} backward is not a slice of the incoming gradient"
 
@@ -501,9 +513,7 @@ def _forward_model(world: int):
 
 
 def _model_worker(rank: int, port: int, queue) -> None:
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group("gloo", rank=rank, world_size=WORLD)
+    _init(rank, port)
     try:
         queue.put((rank, *_forward_model(WORLD)))
     finally:
