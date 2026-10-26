@@ -238,6 +238,29 @@ class DreamZeroConfig(PreTrainedConfig):
     # card. The number carried no information about the requirement, and everything derived
     # from it, including a recommendation of `False`, was wrong by a factor of two.
     gradient_checkpointing: bool | int = True
+    # Ulysses sequence-parallel degree. 1 is off, and off is a single code path rather than a
+    # branch -- the all-to-alls return their input.
+    #
+    # This is what makes `gradient_checkpointing=False` reachable, which no card does on its
+    # own: the activation bill divides by the degree, so 217 GiB at degree 4 is 54 GiB against
+    # the ~78 an 8xH200 at micro-batch 1 leaves free. Nothing else here buys those ten points
+    # between MFU and HFU.
+    #
+    # Two divisibility constraints, both checked in `CausalWanModel.set_sequence_parallel`
+    # before any data moves. The heads must divide, because the attention runs on `num_heads /
+    # degree` of them per rank: 40 gives 1, 2, 4, 5, 8, 10, 20, 40. And the sequence must
+    # divide, because the all-to-all splits it evenly: L = 15,940 = 2^2 x 5 x 797 at the DROID
+    # window gives 1, 2, 4, 5, 10, 20. **Their intersection excludes 8.** So on eight cards the
+    # configuration is 4-way Ulysses against 2-way data parallelism, which is also enough; a
+    # degree of 8 would need the sequence padded, which is not implemented.
+    #
+    # One thing that must be true wherever the training loop lives: a rank holds a slice of the
+    # tokens, so every weight's gradient is a PARTIAL SUM over its own tokens and the partials
+    # add up to the whole. FSDP averages gradients across ranks rather than summing them, so
+    # the loss has to be multiplied by the degree to compensate. Get that wrong and nothing
+    # raises -- the forward is exact either way, and the symptom is that multi-card converges
+    # as if the learning rate were `degree` times smaller.
+    sp_degree: int = 1
 
     # Diffusion. `num_inference_timesteps` is a TRAINING parameter (the released DROID checkpoint
     # trained with 4); the inference loop uses `WANPolicyHead.num_inference_steps`, which upstream
@@ -403,6 +426,15 @@ class DreamZeroConfig(PreTrainedConfig):
             raise ValueError(
                 f"Unknown model_variant {self.model_variant!r}; expected one of {list(_DIT_PRESETS)}."
             )
+        if self.sp_degree < 1:
+            raise ValueError(f"sp_degree must be at least 1, got {self.sp_degree}.")
+        if self.sp_degree > 1:
+            heads = _DIT_PRESETS[self.model_variant]["num_heads"]
+            if heads % self.sp_degree:
+                raise ValueError(
+                    f"sp_degree must divide the {heads} attention heads of {self.model_variant}; "
+                    f"got {self.sp_degree}."
+                )
         if not isinstance(self.gradient_checkpointing, bool):
             # Clamping instead would hide a typo: a value above the depth reads as "all of them"
             # and would silently cost a quarter of the step, which is the thing the dial exists

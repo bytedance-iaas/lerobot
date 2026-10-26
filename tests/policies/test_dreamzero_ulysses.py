@@ -444,3 +444,109 @@ def test_the_uneven_gather_reassembles_and_its_backward_is_a_slice():
         assert sizes == [2, 4], f"rank {rank} expected uneven pieces, got {sizes}"
         assert whole_ok, f"rank {rank} did not reassemble the segment"
         assert grad_ok, f"rank {rank} backward is not a slice of the incoming gradient"
+
+
+# --- the whole model boundary -------------------------------------------------------------
+
+MODEL = {
+    "model_type": "i2v",
+    "patch_size": (1, 2, 2),
+    "frame_seqlen": 6,
+    "text_len": 8,
+    "in_dim": 4,
+    "dim": 32,
+    "ffn_dim": 64,
+    "freq_dim": 16,
+    "text_dim": 24,
+    "out_dim": 4,
+    "num_heads": 4,
+    "num_layers": 2,
+    "max_chunk_size": 2,
+    "num_frame_per_block": 2,
+    "action_dim": 5,
+    "max_state_dim": 7,
+    "hidden_size": 16,
+    "num_action_per_block": 4,
+    "num_state_per_block": 1,
+    "concat_first_frame_latent": False,
+}
+FRAMES = 3
+VIDEO = 18  # 3 frames x 6 tokens, so L = 36 with no registers: 2 and 4 both divide it
+
+
+def _forward_model(world: int):
+    """One `_forward_train` at the given degree, video-only so the window divides evenly."""
+    from lerobot.policies.dreamzero.wan.causal_wan_model import CausalWanModel
+
+    torch.manual_seed(0)
+    model = CausalWanModel(**MODEL).to(torch.bfloat16)
+    if world > 1:
+        model.set_sequence_parallel(world, dist.group.WORLD)
+
+    torch.manual_seed(1)
+    video, _ = model._forward_train(
+        x=torch.randn(1, 4, FRAMES, 4, 6, dtype=torch.bfloat16),
+        timestep=(torch.rand(1, FRAMES) * 1000).to(torch.bfloat16),
+        timestep_action=None,
+        context=torch.randn(1, 8, 24, dtype=torch.bfloat16) if MODEL["text_len"] else None,
+        seq_len=VIDEO,
+        clean_x=torch.randn(1, 4, FRAMES, 4, 6, dtype=torch.bfloat16),
+        y=torch.randn(1, 4, FRAMES, 4, 6, dtype=torch.bfloat16),
+        clip_feature=torch.randn(1, 3, 1280, dtype=torch.bfloat16),
+        embodiment_id=torch.zeros(1, dtype=torch.long),
+    )
+    video.square().sum().backward()
+    grads = {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
+    return video.detach().clone(), grads
+
+
+def _model_worker(rank: int, port: int, queue) -> None:
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group("gloo", rank=rank, world_size=WORLD)
+    try:
+        queue.put((rank, *_forward_model(WORLD)))
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    os.environ.get("LEROBOT_TEST_SP") != "1",
+    reason="~2 min of process spawn and imports; set LEROBOT_TEST_SP=1. REQUIRED when touching "
+    "the sequence sharding in `_forward_train`.",
+)
+def test_the_whole_forward_matches_one_rank():
+    """L = 36 here, so at degree 2 rank 0 holds nothing but the teacher-forced clean half.
+
+    That makes this the test for the empty-share case as well: rank 0 contributes no video
+    tokens to the head at all, and the gather still has to reassemble the prediction and route
+    the gradient back to the rank that produced each piece.
+    """
+    import socket
+
+    single_video, single_grads = _forward_model(1)
+
+    with socket.socket() as probe:
+        probe.bind(("", 0))
+        port = probe.getsockname()[1]
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    procs = [ctx.Process(target=_model_worker, args=(rank, port, queue)) for rank in range(WORLD)]
+    for proc in procs:
+        proc.start()
+    results = sorted((queue.get(timeout=120) for _ in range(WORLD)), key=lambda r: r[0])
+    for proc in procs:
+        proc.join(timeout=60)
+        assert proc.exitcode == 0, f"rank exited {proc.exitcode}"
+
+    # Every rank reconstructs the same whole prediction, and it is the single-rank one.
+    for rank, video, _ in results:
+        assert video.shape == single_video.shape, f"rank {rank} shape"
+        assert torch.equal(video, single_video), f"rank {rank} prediction"
+
+    # And every weight gradient is a partial sum that adds up to the single-rank gradient.
+    for name, want in single_grads.items():
+        got = sum(grads[name] for _, _, grads in results if name in grads)
+        scale = want.abs().max().double().clamp_min(1e-30)
+        error = (got.double() - want.double()).abs().max()
+        assert error <= 3e-2 * scale, f"{name}: off by {error / scale:.3%} of full scale"

@@ -19,7 +19,15 @@
 from typing import Any, TypeAlias
 
 from .causal_attention import AttentionModule
-from .ulysses import to_head_shard, to_seq_shard
+from .ulysses import (
+    gather_seq,
+    segment_in_shard,
+    segment_sizes,
+    shard_bounds,
+    shard_runs,
+    to_head_shard,
+    to_seq_shard,
+)
 from .action_encoder import (
     SinusoidalPositionalEncoding,
     swish,
@@ -1570,6 +1578,14 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 return module.sp_world
         return 1
 
+    @property
+    def sp_group(self):
+        """The process group the degree above was set with."""
+        for module in self.modules():
+            if isinstance(module, CausalWanSelfAttention):
+                return module.sp_group
+        return None
+
     def checkpointed_blocks(self) -> tuple[bool, ...]:
         """Which of the blocks recompute in the backward pass, one flag each.
 
@@ -2319,6 +2335,21 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 return outputs
             return custom_forward
 
+        # Sequence parallelism starts here, once x is whole: the blocks run on a contiguous
+        # 1/world shard of the tokens, and the all-to-all inside each self-attention is what
+        # gives the attention back the complete sequence. The modulation rows come along as a
+        # slice, which `shard_runs` can express because a shard only ever cuts a row part-way.
+        world = self.sp_world
+        shard_start, shard_stop = 0, x.shape[1]
+        sp_rank = 0
+        if world > 1:
+            sp_rank = dist.get_rank(self.sp_group)
+            shard_start, shard_stop = shard_bounds(x.shape[1], world, sp_rank)
+            x = x[:, shard_start:shard_stop]
+            row_start, row_end, run_slice = shard_runs(e_runs, shard_start, shard_stop)
+            kwargs["e"] = e0[:, row_start:row_end]
+            kwargs["e_runs"] = run_slice
+
         checkpointed = self.checkpointed_blocks()
         for index, block in enumerate(self.blocks):
             if torch.is_grad_enabled() and checkpointed[index]:
@@ -2334,21 +2365,42 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 x, updated_kv_cache = block(x, **kwargs)
                 assert updated_kv_cache is None
 
-        if clean_x is not None:
-            x = x[:, clean_x.shape[1]:]
+        # The tail in global token coordinates, so one code path serves both the whole
+        # sequence (world 1, shard = everything) and a shard of it. The teacher-forced clean
+        # half is simply a segment nobody reads.
+        video_lo = clean_x.shape[1] if clean_x is not None else 0
+        video_hi = video_lo + seq_len
+        action_hi = video_hi + (action_length or 0)
+        total = video_hi + (action_register_length or 0)  # the global sequence length
 
         if action is not None:
-            action_noise_pred = x[:, seq_len: seq_len + action_length]
-            action_noise_pred = self.action_decoder(action_noise_pred, embodiment_id)
+            lo, hi = segment_in_shard(shard_start, shard_stop, video_hi, action_hi)
+            action_noise_pred = self.action_decoder(x[:, lo:hi], embodiment_id)
+            action_noise_pred = gather_seq(
+                action_noise_pred,
+                segment_sizes(total, world, video_hi, action_hi),
+                sp_rank,
+                world,
+                self.sp_group,
+            )
         else:
             action_noise_pred = None
 
-        # Build a tensor that contains only video tokens per sample with length = max(video_lens)
-        x_video = x[:, :seq_len]
-        e_video = e[:, :video_run[0]]
+        # The head is per token, so it runs on this rank's share of the video tokens and only
+        # its output is gathered -- 64 wide against the block's 5120. Running it on a gathered
+        # input instead would give its weights a whole gradient where every other weight in
+        # the model has a partial one, and no single loss scale corrects both.
+        lo, hi = segment_in_shard(shard_start, shard_stop, video_lo, video_hi)
+        # The same intersection in the video segment's own coordinates, which is what the
+        # head's modulation rows are indexed by.
+        inner_lo = max(shard_start, video_lo) - video_lo
+        row_lo, row_hi, head_runs = shard_runs((video_run,), inner_lo, inner_lo + (hi - lo))
+        x_video = self.head(x[:, lo:hi], e[:, row_lo:row_hi].unsqueeze(2), head_runs)
+        x_video = gather_seq(
+            x_video, segment_sizes(total, world, video_lo, video_hi), sp_rank, world, self.sp_group
+        )
 
         # Unpatchify video-only tokens
-        x_video = self.head(x_video, e_video.unsqueeze(2), (video_run,))
         video_noise_pred = self.unpatchify(x_video, grid_size)
 
         return video_noise_pred, action_noise_pred
