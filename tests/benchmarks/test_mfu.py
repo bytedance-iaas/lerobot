@@ -331,6 +331,22 @@ def test_dreamzero_vae_tiling_is_not_free():
     assert tiled > 2 * untiled
 
 
+def test_dreamzero_time_embedding_is_not_priced_per_token():
+    """The time embedding runs on one row per distinct timestep, not one per token.
+
+    `e0` used to be expanded to one row per token before `time_embedding`, which put 15,940
+    rows through two 5120-wide linears and a 5120->30720 projection: 17.5 of the 17.9 TFLOP
+    this part used to report, for 135 copies of each distinct row. The blocks broadcast from
+    118 rows now, so this part collapses to the patch embedding and the head -- which is the
+    FLOPs-side shadow of the ~1.22 GiB per block it stopped keeping for the backward pass.
+    """
+    parts = _dreamzero(training_mode="full")
+    embed = parts["DiT embed/head/projectors"] / 1e12
+    assert embed < 1.0, f"time embedding looks per-token again: {embed:.1f} TFLOP"
+    # Still the smallest real part, and far below the blocks it feeds.
+    assert 0 < embed < parts["DiT blocks x40"] / 1000
+
+
 def test_dreamzero_estimate_flops_requires_a_meta_model():
     """It runs the forward. On a real device that would allocate 23 B parameters of activations."""
     import torch
