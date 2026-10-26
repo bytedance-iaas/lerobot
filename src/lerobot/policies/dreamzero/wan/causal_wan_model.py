@@ -19,6 +19,7 @@
 from typing import Any, TypeAlias
 
 from .causal_attention import AttentionModule
+from .ulysses import to_head_shard, to_seq_shard
 from .action_encoder import (
     SinusoidalPositionalEncoding,
     swish,
@@ -247,6 +248,11 @@ class CausalWanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.attn = AttentionModule(num_heads=self.num_heads, head_dim=self.head_dim)
+        # Ulysses degree and its process group, set by `CausalWanModel.set_sequence_parallel`.
+        # 1 means the all-to-alls return their input and no group is needed, so there is one
+        # code path either way.
+        self.sp_world = 1
+        self.sp_group = None
         self.causal_attn = AttentionModule(num_heads=self.num_heads, head_dim=self.head_dim, causal=True)
 
     def _visualize_attention_mask(self, total_len, first_image_len, image_blocks_len, 
@@ -837,14 +843,27 @@ class CausalWanSelfAttention(nn.Module):
             seq_lens(Tensor): Shape [B]
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
-        b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+        b, s_local, n, d = *x.shape[:2], self.num_heads, self.head_dim
+        # Ulysses: x arrives sharded on the sequence, and the all-to-all in `qkv_fn` moves the
+        # shard to the head axis, so everything below this point sees the WHOLE sequence with
+        # n/world heads. That is the property the rest of this method depends on -- the
+        # teacher-forcing pattern is built by indexing token ranges in Python, and those ranges
+        # are only meaningful against a complete sequence. `s` is therefore the global length.
+        world = self.sp_world
+        s = s_local * world
 
         # query, key, value function
         def qkv_fn(x):
-            q = self.norm_q(self.q(x)).view(b, s, n, d)
-            k = self.norm_k(self.k(x)).view(b, s, n, d)
-            v = self.v(x).view(b, s, n, d)
-            return q, k, v
+            q = self.norm_q(self.q(x)).view(b, s_local, n, d)
+            k = self.norm_k(self.k(x)).view(b, s_local, n, d)
+            v = self.v(x).view(b, s_local, n, d)
+            # After the exchange, and before rope: rope indexes freqs by token, so it needs the
+            # whole sequence, and it is head-agnostic, so the head shard does not affect it.
+            return (
+                to_head_shard(q, world, self.sp_group),
+                to_head_shard(k, world, self.sp_group),
+                to_head_shard(v, world, self.sp_group),
+            )
 
         q, k, v = qkv_fn(x)
 
@@ -1124,7 +1143,9 @@ class CausalWanSelfAttention(nn.Module):
             updated_kv_cache = torch.stack([new_k, new_v], dim=0)
 
 
-        # output
+        # output. Back to a sequence shard first: `self.o` mixes the head axis, so it needs
+        # all n heads, and it is per-token, so a shard of the tokens is all this rank needs.
+        x = to_seq_shard(x, world, self.sp_group)
         x = x.flatten(2)
         x = self.o(x)
         return x, updated_kv_cache
@@ -1506,6 +1527,42 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
     def _set_gradient_checkpointing(self, module, value=False):
         self.gradient_checkpointing = value
+
+    def set_sequence_parallel(self, world: int, group=None) -> None:
+        """Turn on Ulysses sequence parallelism at degree `world` over `group`.
+
+        Checks what has to hold before any data moves, because both failures are otherwise
+        found late and read as something else: the head count must divide (each rank owns
+        `num_heads / world` of them for the attention), and the sequence must divide (the
+        all-to-all splits it evenly). At the DROID window L = 15,940 = 2^2 x 5 x 797, so **4
+        and 5 divide it and 8 does not** -- on 8 cards that means 4-way Ulysses against 2-way
+        data parallelism, which is also the configuration that brings
+        `gradient_checkpointing=False` into reach (217 GiB / 4 = 54 GiB against ~78 of
+        headroom). Degree 8 needs the sequence padded, which is not implemented here yet.
+
+        Nothing about the attention pattern changes, which is the whole reason this form of
+        parallelism was chosen; see `ulysses`.
+        """
+        if world < 1:
+            raise ValueError(f"sequence-parallel degree must be at least 1, got {world}")
+        if self.num_heads % world:
+            raise ValueError(
+                f"{self.num_heads} heads do not divide over {world} sequence-parallel ranks"
+            )
+        if world > 1 and group is None:
+            raise ValueError("a sequence-parallel degree above 1 needs a process group")
+        for module in self.modules():
+            if isinstance(module, CausalWanSelfAttention):
+                module.sp_world = world
+                module.sp_group = group
+
+    @property
+    def sp_world(self) -> int:
+        """The degree the blocks are running at, which the model boundary has to shard to."""
+        for module in self.modules():
+            if isinstance(module, CausalWanSelfAttention):
+                return module.sp_world
+        return 1
 
     def checkpointed_blocks(self) -> tuple[bool, ...]:
         """Which of the blocks recompute in the backward pass, one flag each.
