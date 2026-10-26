@@ -117,6 +117,13 @@ def main() -> None:
     parser.add_argument("--tile-size", type=int, nargs=2, default=(34, 34))
     parser.add_argument("--tile-stride", type=int, nargs=2, default=(18, 16))
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument(
+        "--step-s",
+        type=float,
+        default=None,
+        help="a policy step on THIS card, to express the delta as a share of it; mixing cards here is "
+        "the easy mistake (8xH200 predicts 5.21 s at gradient_checkpointing=false, a 950PR is ~11.9 s)",
+    )
     args = parser.parse_args()
 
     from lerobot.policies.dreamzero.wan.vae import WanVideoVAE
@@ -157,7 +164,10 @@ def main() -> None:
     print(
         f"\n  tiling costs {tiled_s / plain_s:.2f}x the time ({(tiled_s - plain_s) * 1000:.1f} ms per sample)"
     )
-    print(f"  which at a 5.21 s step is {(tiled_s - plain_s) / 5.21 * 100:.1f}% of it")
+    if args.step_s:
+        print(
+            f"  which at a {args.step_s:.2f} s step is {(tiled_s - plain_s) / args.step_s * 100:.1f}% of it"
+        )
     if tiled_peak and plain_peak:
         print(f"  and {(plain_peak - tiled_peak) / 2**30:+.2f} GiB of peak to turn off")
 
