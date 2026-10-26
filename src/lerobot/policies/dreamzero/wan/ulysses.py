@@ -177,3 +177,74 @@ def pad_to_multiple(total: int, world: int) -> int:
     """
     remainder = total % world
     return 0 if remainder == 0 else world - remainder
+
+
+def segment_in_shard(start: int, end: int, lo: int, hi: int) -> tuple[int, int]:
+    """Where a global token segment `[lo, hi)` lands inside this rank's shard `[start, end)`.
+
+    Returned as indices into the shard, so `x_local[:, a:b]` is this rank's part of it. Empty
+    when the two do not overlap, which is normal: at degree 4 the first rank holds nothing but
+    the teacher-forced clean half, so its share of the video segment is empty.
+    """
+    a, b = max(start, lo), min(end, hi)
+    return (0, 0) if a >= b else (a - start, b - start)
+
+
+def segment_sizes(total: int, world: int, lo: int, hi: int) -> list[int]:
+    """How many tokens of `[lo, hi)` each rank holds, which an uneven gather needs up front."""
+    sizes = []
+    for rank in range(world):
+        start, end = shard_bounds(total, world, rank)
+        a, b = segment_in_shard(start, end, lo, hi)
+        sizes.append(b - a)
+    return sizes
+
+
+def _gather_uneven(x: torch.Tensor, sizes: list[int], group) -> torch.Tensor:
+    """All-gather along dim 1 where the ranks' pieces differ in length.
+
+    `dist.all_gather` requires every rank to contribute the same shape, and these pieces do
+    not: a rank's share of the video segment depends on where its shard falls, and at degree 4
+    the first rank's share is empty. So each rank pads to the longest piece, and the receiver
+    trims each one back to the length it knows that rank holds. The tensors this runs on are
+    the head's output, 64 wide against the block's 5120, so the padding is not worth avoiding.
+    """
+    widest = max(sizes)
+    padded = x.new_zeros(x.shape[0], widest, *x.shape[2:])
+    if x.shape[1]:
+        padded[:, : x.shape[1]] = x
+    received = [torch.empty_like(padded) for _ in sizes]
+    dist.all_gather(received, padded.contiguous(), group=group)
+    return torch.cat([piece[:, :size] for piece, size in zip(received, sizes, strict=True)], dim=1)
+
+
+class GatherSeq(torch.autograd.Function):
+    """Sharded -> whole along the sequence, for the small tensors at the end of the forward.
+
+    The adjoint is a slice, not a sum, and that is worth being explicit about. Every rank
+    computes the same thing from the gathered tensor, so each receives the same incoming
+    gradient; what rank r contributed was its own piece, so its gradient is that piece of the
+    incoming one. Nothing is added, because the gather replicated nothing within a rank -- it
+    concatenated disjoint pieces.
+
+    Each rank therefore ends up with a *partial* gradient for every weight, covering only its
+    own tokens, and the partials sum to the true gradient. That uniformity is the point: it
+    lets one `x degree` on the loss correct for FSDP averaging instead of summing, everywhere
+    in the model at once. It is also why the head runs on the shard and only its output is
+    gathered -- a head run redundantly on a gathered input would produce whole gradients where
+    the blocks produce partial ones, and no single scale factor fixes both.
+    """
+
+    @staticmethod
+    def forward(ctx, x, sizes, rank, group):
+        ctx.offset = sum(sizes[:rank])
+        ctx.length = sizes[rank]
+        return _gather_uneven(x, sizes, group)
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad[:, ctx.offset : ctx.offset + ctx.length], None, None, None
+
+
+def gather_seq(x: torch.Tensor, sizes: list[int], rank: int, world: int, group=None) -> torch.Tensor:
+    return x if world == 1 else GatherSeq.apply(x, sizes, rank, group)

@@ -1186,6 +1186,12 @@ def _per_run(x, runs, fn, *rows):
     block's `modulation`, the three whose gradient is a reduction over tokens -- by at most
     4.4e-3 relative, which is one bf16 ulp. Nothing else moves at all.
     """
+    if x.shape[1] == 0:
+        # A rank can legitimately hold none of a segment: under sequence parallelism at degree
+        # 4 the first rank lies entirely inside the teacher-forced clean half, so its share of
+        # the video tokens the head runs on is empty. `runs` is then empty too, and the loop
+        # below would index an empty list.
+        return x
     if sum(count * repeat for count, repeat in runs) != x.shape[1]:
         raise ValueError(f"modulation runs do not cover the {x.shape[1]} tokens of x")
     if runs == ((x.shape[1], 1),):

@@ -258,3 +258,14 @@ def test_the_inference_forward_keeps_rows_at_frame_resolution(tiny, monkeypatch)
     for seen_tokens, seen_rows, runs in seen:
         assert (seen_tokens, seen_rows) == (tokens, frames)
         assert runs == ((frames, 6),)
+
+
+def test_an_empty_shard_of_a_segment_passes_through():
+    """Under sequence parallelism a rank can hold none of the segment the head runs on.
+
+    At degree 4 the first rank is entirely inside the teacher-forced clean half, so its share
+    of the video tokens is empty and `shard_runs` hands back no runs at all.
+    """
+    empty = torch.zeros(1, 0, 4)
+    assert modulate_tokens(empty, (), torch.randn(1, 0, 4), torch.randn(1, 0, 4)) is empty
+    assert gate_tokens(empty, (), torch.randn(1, 0, 4)) is empty
