@@ -500,12 +500,13 @@ accelerate launch --config_file src/lerobot/policies/dreamzero/fsdp.yaml \
   --dataset.repo_id=lerobot/droid_1.0.1 \
   --dataset.root=/data/datasets/droid_1.0.1 \
   --dataset.episodes='[0,1,2,3]' \
-  --policy.gradient_checkpointing=false \
+  --policy.gradient_checkpointing=28 \
   --batch_size=1 --steps=... --output_dir=outputs/train/dreamzero_fsdp
 ```
 
-`gradient_checkpointing=false` is the right value *for this cell* and not the default, because
-activations scale with the micro-batch: see the dial below.
+28 rather than the default `True` because micro-batch 1 leaves ~78 GiB of a 141 GB card unused,
+and rather than `False` because all 40 blocks of activations need ~217 GiB. Both numbers are
+measured; see the dial below, including why an earlier version of this file said `False`.
 
 Measured on 8xH200, `training_mode=full`, micro-batch 1:
 
@@ -542,15 +543,14 @@ that memory somewhere else, which is what the dial below does.
 
 ### `gradient_checkpointing` is a dial
 
-All-or-nothing is the wrong granularity for this model. 40 blocks of activations measured
-121.7 GiB at batch 1, so recompute could not simply be turned off — but an 8xH200 full
-fine-tune sits at 57.0 GB of 141 GB, and **leaving most of that headroom unused costs a quarter
-of every step**. So the field takes a count as well as a bool: `True` checkpoints all 40
-blocks, `False` none, and an int checkpoints that many.
+All-or-nothing is the wrong granularity for this model. All 40 blocks of activations need
+~217 GiB at batch 1, so recompute cannot be turned off on any card that exists — but an 8xH200
+full fine-tune sits at 57.0 GB of 141 GB, and **leaving most of that headroom unused costs a
+quarter of every step**. So the field takes a count as well as a bool: `True` checkpoints all
+40 blocks, `False` none, and an int checkpoints that many.
 
 ```bash
---policy.gradient_checkpointing=false  # 8xH200 at micro-batch 1: no recompute at all
---policy.gradient_checkpointing=20     # half recompute, half the headroom spent
+--policy.gradient_checkpointing=28     # 8xH200 at micro-batch 1: spends ~61 of ~78 GiB
 ```
 
 Which blocks are chosen is immaterial — every block has the same activation footprint and the
@@ -562,63 +562,82 @@ Pricing the ladder with the tool (`--checkpoint-blocks N`). **Only the first row
 the step times below it are that 6.9 s rescaled by hardware FLOPs, which assumes the step stays
 compute-bound — so they are what to expect, not what was observed:
 
-| checkpointed | recompute | step (predicted) | MFU | samples/s | extra activations |
-|---|---|---|---|---|---|
-| 40 (`True`) | 457.1 TFLOP | 6.84 s | 32.9% | 1.17 | — |
-| 25 | 285.7 | 6.23 s | 36.1% | 1.28 | ~25 GiB |
-| 20 | 228.5 | 6.02 s | 37.3% | 1.33 | ~33 GiB |
-| 12 | 137.1 | 5.70 s | 39.4% | 1.40 | ~47 GiB |
-| **0 (`False`)** | 0 | **5.21 s** | **43.2%** | **1.54** | ~67 GiB |
+| checkpointed | recompute | step (predicted) | MFU | samples/s | extra peak | fits 78 GiB? |
+|---|---|---|---|---|---|---|
+| 40 (`True`) | 457.1 TFLOP | 6.84 s | 32.9% | 1.17 | — | yes |
+| 32 | 365.7 | 6.51 s | 34.5% | 1.23 | 38.8 GiB | yes |
+| **28** | 320.0 | 6.35 s | **35.4%** | **1.26** | 61.1 GiB | yes |
+| 25 | 285.7 | 6.23 s | 36.1% | 1.28 | 77.7 GiB | at the line |
+| 20 | 228.5 | 6.02 s | 37.3% | 1.33 | 105.5 GiB | **no** |
+| 0 (`False`) | 0 | 5.21 s | 43.2% | 1.54 | 216.6 GiB | **no** |
 
-**The bottom row is the one to aim for, and it only became reachable by fixing the
-modulation.** Before that, 121.7 GiB over 40 blocks was ~3.04 GiB per block, ~2.9 GiB of it
-chargeable to leaving a block unrecomputed, and 40 of those wanted ~117 GiB against ~78 GiB of
-headroom — so the ladder stopped around 27 blocks and 20 was the safe pick. ~1.22 GiB of that
-per-block figure was the time embedding: `e0` was expanded to one row per token, so every block
-modulated and kept a `[1, 15940, 6, 5120]` tensor (934 MiB) plus the two `1 + scale` operands
-built from it. The blocks now broadcast `e0` from one row per *distinct timestep* — 9 latent
-frames, one for the zeroed clean half, one per action and state register, 118 rows rather than
-15,940 — which leaves ~1.82 GiB per block, ~1.66 GiB chargeable, **~67 GiB for all 40 against
-~78 GiB of headroom**.
+The peak column is **measured**, which it was not before. A sweep on one 950PR card
+(`training_mode=lora`, batch 1, `--log_freq=1`, six steps, perfectly flat from step two) reads:
 
-Read the measured/derived line carefully before trusting the last column: the 3.04 GiB came off
-a card, the 1.22 GiB subtracted from it is tensor shapes, and both are a different card (950PR)
-and a different parallel layout than the 8xH200 recipe. Bisect down from `True` rather than
-starting at `False`.
+| checkpointed | un-recomputed blocks | peak | step over previous |
+|---|---|---|---|
+| 40 | 0 | 56.68 GiB | — |
+| 38 | 2 | 62.20 GiB | +5.52 |
+| 36 | 4 | 73.31 GiB | +11.11 |
+| 34 | 6 | 84.41 GiB | +11.10 |
+| 32 | 8 | 95.52 GiB | +11.11 |
 
-On a 950PR at batch 1, `True` was the only safe value before the change: 121.7 GiB of a
-123.2 GiB card, with 1/2/4/8-card runs all OOMing between 119.70 and 121.74 GiB because FSDP
-shards parameters and gradients and not activations. Keeping 5 of the 40 blocks unrecomputed
-did run on one card there (9.54 vs 9.89 s/step, the 3.5% the ladder predicts). Whether the
-~49 GiB the modulation change gives back is enough to open the dial on that card has not been
-measured.
+Three consecutive increments of 11.11 GiB over two blocks: **5.56 GiB per block left
+unrecomputed**. The first pair costs half that because at `True` the peak is not at the end of
+the forward — it is reached during recompute — so the first two blocks fit inside the slack
+before the forward's live set becomes the peak. A clean crossover, not noise.
+
+**An earlier version of this file said `False` was reachable and recommended it. That was
+wrong, and the way it was wrong is worth keeping.** The figure it rested on, "40 blocks of
+activations reach 121.7 GiB", was read off the allocator's message when a GC-off run OOMed —
+*121.74 GiB already allocated* of a 123.16 GiB card. That is where the run ran out, not what it
+needed. Both the pre-change run and the post-change one fail at ~122 GiB, because both want
+more than the card has and both fill it before the next allocation fails; the number carries no
+information about the requirement. Divided by 40 it gave 3.04 GiB per block, a figure that then
+survived two rounds of argument about what to subtract from it. The measured answer is 5.56,
+and all 40 blocks want ~217 GiB — over twice what the OOM point suggested.
+
+So on 8xH200 at micro-batch 1, ~78 GiB of headroom buys 15 blocks (5.52 + 13 x 5.555 = 77.7),
+i.e. `gradient_checkpointing=25` at the line and **28 as the value to start from** — it leaves
+~17 GiB for fragmentation and FSDP's all-gather transients, and `max_memory_allocated` does not
+count either. The dial is worth ~2.5 points of MFU and ~8% of throughput here, not the ten
+points to HFU.
+
+One reason not to carry 5.56 GiB/block straight to an H200: `rope_dtypes` returns complex64 on
+NPU and **complex128 on CUDA**, and each block ropes a q and a k of shape [1, 15940, 40, 64] —
+326 MB apiece in complex64, 653 MB in complex128. If those are retained, CUDA pays ~0.65 GiB
+per block more, so expect ~6.2 GiB there and measure it. That also makes the rope dtype a
+memory lever on CUDA, which it is not on NPU, against the accuracy it is there to buy.
+
+On a 950PR, `True` remains the only value that fits under FSDP: a single card runs with a few
+blocks unrecomputed (9.54 vs 9.89 s/step at 5 of them) but 8-card FSDP shards parameters and
+gradients and not activations, so the per-card activation bill is unchanged by adding cards.
 
 #### Why the default stays `True`, and why batch is not the other answer
 
-Activations are per sample, so the dial and the micro-batch compete for the same ~78 GiB and
-`False` only fits at micro-batch 1. The default has to work everywhere -- `batch_size` defaults
-to 8 and a 950PR has no headroom at all -- so it stays `True`, and the recipe that can afford
-`False` says so on the command line.
+Activations are per sample, so the dial and the micro-batch compete for the same ~78 GiB. At
+5.56 GiB a block the default has to stay `True`: `batch_size` defaults to 8, which at any
+setting below 40 is an immediate OOM, and a 950PR has no headroom at batch 1 at all. The recipe
+that can afford to open the dial says so on its own command line.
 
 The competition is not a throughput trade, though, because model FLOPs per sample do not depend
-on the batch: step time grows with N and `samples/s = 8N / step(N)` cancels it. Per-sample
-activations run about `74.8 - 1.66 * checkpointed` GiB against a ~86.6 GiB budget, so what the
-two knobs actually trade is throughput against *effective* batch:
+on the batch: step time grows with N and `samples/s = 8N / step(N)` cancels it. What the two
+knobs actually trade is throughput against *effective* batch:
 
 | | checkpointed | micro-batch | samples/s | effective batch |
 |---|---|---|---|---|
-| **the recipe above** | **0** | **1** | **1.54** | **8** |
-| | 20 | 2 | 1.33 | 16 |
-| | 32 | 4 | 1.21 | 32 |
-| | 40 | 10 | 1.17 | 80 |
+| **the recipe above** | **28** | **1** | **1.26** | **8** |
+| | 36 | 2 | 1.20 | 16 |
+| | 40 | 6 | 1.17 | 48 |
 
-Raising the micro-batch at a *fixed* dial setting is free — 20 blocks at micro-batch 2 reads the
-same 1.33 samples/s as micro-batch 1 — so the cost of a larger effective batch is entirely in
-having to turn the dial up to make room. There is no gradient accumulation to get it cheaper:
-`lerobot_train` steps the optimizer every micro-batch and never calls
-`accelerator.accumulate`, so accelerate's `gradient_accumulation_steps` would only rescale the
-loss. Upstream's and RLinf's published DROID recipe is 8 ranks at micro-batch 1, effective
-batch 8, which is the first row.
+Raising the micro-batch at a *fixed* dial setting would be free, since samples/s does not depend
+on N — the cost of a larger effective batch is entirely in having to turn the dial up to make
+room, and at 5.56 GiB a block that is expensive: a second sample needs another ~57 GiB of the
+~78, which is most of the dial's range. There is no gradient accumulation to get it cheaper:
+`lerobot_train` steps the optimizer every micro-batch and never calls `accelerator.accumulate`,
+so accelerate's `gradient_accumulation_steps` would only rescale the loss. Upstream's and
+RLinf's published DROID recipe is 8 ranks at micro-batch 1, effective batch 8, which is the
+first row.
 
 Where the per-sample FLOPs go, and what each part is billed:
 
