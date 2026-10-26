@@ -38,7 +38,10 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from lerobot.policies.dreamzero.wan.ulysses import (
+    gather_seq,
     pad_to_multiple,
+    segment_in_shard,
+    segment_sizes,
     shard_bounds,
     shard_runs,
     to_head_shard,
@@ -343,3 +346,101 @@ def test_a_sharded_block_matches_one_rank_exactly():
         scale = want.abs().max().double().clamp_min(1e-30)
         error = (got.double() - want.double()).abs().max()
         assert error <= 2e-2 * scale, f"{name}: summed SP gradient off by {error / scale:.3%} of full scale"
+
+
+# --- the segment arithmetic the sharded tail needs ---------------------------------------
+# The tail has to pull three global ranges out of a contiguous shard -- the video tokens, the
+# action registers, the state registers -- and a rank's share of any of them can be empty or
+# straddle a boundary. All of it is static index arithmetic, so none of it needs ranks.
+
+DROID = {"total": 15940, "clean": (0, 7920), "video": (7920, 15840), "action": (15840, 15936)}
+
+
+@pytest.mark.parametrize("world", [1, 2, 4, 5, 10, 20])
+def test_segment_sizes_account_for_every_token_of_a_segment(world):
+    """Whatever the degree, the ranks' shares of a segment add up to it and nothing else."""
+    for lo, hi in (DROID["clean"], DROID["video"], DROID["action"]):
+        sizes = segment_sizes(DROID["total"], world, lo, hi)
+        assert len(sizes) == world
+        assert sum(sizes) == hi - lo, f"world={world} segment=({lo},{hi})"
+        assert all(size >= 0 for size in sizes)
+
+
+@pytest.mark.parametrize("world", [2, 4, 5])
+def test_a_shard_can_hold_none_of_a_segment(world):
+    """At degree 4 rank 0 is entirely inside the clean half, so its video share is empty."""
+    sizes = segment_sizes(DROID["total"], 4, *DROID["video"])
+    assert sizes[0] == 0
+    assert sum(sizes) == 7920
+    # And the same arithmetic agrees with slicing the shard directly.
+    for rank in range(world):
+        start, end = shard_bounds(DROID["total"], world, rank)
+        a, b = segment_in_shard(start, end, *DROID["video"])
+        assert b - a == segment_sizes(DROID["total"], world, *DROID["video"])[rank]
+
+
+def test_segment_in_shard_is_a_slice_of_the_shard_not_of_the_sequence():
+    """It returns shard-local indices, which is what `x_local[:, a:b]` wants."""
+    assert segment_in_shard(100, 200, 150, 400) == (50, 100)
+    assert segment_in_shard(100, 200, 0, 120) == (0, 20)
+    assert segment_in_shard(100, 200, 0, 50) == (0, 0)
+    assert segment_in_shard(100, 200, 300, 400) == (0, 0)
+
+
+def test_the_droid_segments_tile_the_window():
+    """A sanity check on the ranges themselves: clean, video, action, state, nothing lost."""
+    assert DROID["clean"][1] == DROID["video"][0]
+    assert DROID["video"][1] == DROID["action"][0]
+    assert DROID["total"] - DROID["action"][1] == 4  # the state registers
+
+
+def _gather_worker(rank: int, port: int, queue) -> None:
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group("gloo", rank=rank, world_size=WORLD)
+    try:
+        # A 10-token sequence whose "video" segment is tokens 3..9, so the two ranks hold 2 and
+        # 4 of it -- uneven on purpose, which is the case `all_gather_into_tensor` cannot do.
+        total, lo, hi = 10, 3, 9
+        torch.manual_seed(3)
+        full = torch.randn(1, hi - lo, 2, dtype=torch.float64)
+        sizes = segment_sizes(total, WORLD, lo, hi)
+        offset = sum(sizes[:rank])
+        mine = full[:, offset : offset + sizes[rank]].clone().requires_grad_()
+
+        whole = gather_seq(mine, sizes, rank, WORLD)
+        grad = torch.randn_like(whole)
+        whole.backward(grad)
+        queue.put(
+            (
+                rank,
+                sizes,
+                torch.equal(whole.detach(), full),
+                torch.equal(mine.grad, grad[:, offset : offset + sizes[rank]]),
+            )
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+def test_the_uneven_gather_reassembles_and_its_backward_is_a_slice():
+    """Over gloo: pieces of different lengths, and a backward that slices rather than sums."""
+    import socket
+
+    with socket.socket() as probe:
+        probe.bind(("", 0))
+        port = probe.getsockname()[1]
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    procs = [ctx.Process(target=_gather_worker, args=(rank, port, queue)) for rank in range(WORLD)]
+    for proc in procs:
+        proc.start()
+    results = [queue.get(timeout=120) for _ in range(WORLD)]
+    for proc in procs:
+        proc.join(timeout=60)
+        assert proc.exitcode == 0, f"rank exited {proc.exitcode}"
+
+    for rank, sizes, whole_ok, grad_ok in results:
+        assert sizes == [2, 4], f"rank {rank} expected uneven pieces, got {sizes}"
+        assert whole_ok, f"rank {rank} did not reassemble the segment"
+        assert grad_ok, f"rank {rank} backward is not a slice of the incoming gradient"
