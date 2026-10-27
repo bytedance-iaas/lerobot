@@ -613,6 +613,74 @@ On a 950PR, `True` remains the only value that fits under FSDP: a single card ru
 blocks unrecomputed (9.54 vs 9.89 s/step at 5 of them) but 8-card FSDP shards parameters and
 gradients and not activations, so the per-card activation bill is unchanged by adding cards.
 
+### Ulysses sequence parallelism
+
+The dial above tops out at 28 because activations do not shard. `gradient_checkpointing=False`
+wants ~217 GiB and no card has it — H200 has 131, a GB200 179 — and FSDP shards parameters and
+gradients, not activations, so adding cards does nothing. Sequence parallelism is what divides
+that bill, and it is the only route to the ten points between MFU and HFU.
+
+```bash
+--policy.sp_degree=4     # with 8 ranks: 4-way Ulysses x 2-way data parallelism
+```
+
+**Ulysses rather than ring/context parallelism, because of what this model's attention is.**
+The all-to-all moves the shard from tokens to heads *inside* the attention, so every rank then
+holds **all** tokens for N/P heads — and the teacher-forcing pattern, 640 attention calls built
+by slicing token ranges in Python rather than with a mask, is correct with no changes at all.
+Ring parallelism keeps the shard on tokens, which would mean re-deriving the block-causal
+pattern per shard across five functions, and recombining softmax across ranks. The cost of the
+choice is that the degree is bounded by the head count; `wan/ulysses.py` has the details.
+
+Measured on one 950PR, peak memory per card against the blocks left unrecomputed:
+
+| checkpointed | degree 1 | degree 4 |
+|---|---|---|
+| 40 | 56.68 GiB | 47.16 GiB |
+| 24 | — | 68.64 |
+| 8 | — | 91.47 |
+| **per block** | **5.56 GiB** | **1.385 GiB** |
+
+5.56 / 4 = 1.39 against a measured 1.385, so the activation bill divides by the degree to
+within half a percent — and the 5.56 that the whole dial rests on is now two independent slopes
+rather than one derivation.
+
+**Both divisibility constraints bind, and they do not agree.** The heads must divide, because
+each rank runs `num_heads / degree` of them: 40 admits 1, 2, 4, 5, 8, 10, 20, 40. The sequence
+must divide, because the all-to-all splits it evenly: L = 15,940 = 2² x 5 x 797 admits 1, 2, 4,
+5, 10, 20. **8 is in one set and not the other**, so eight cards means degree 4 against 2-way
+data parallelism — which is enough, since 217/4 = 54 GiB fits the ~78 GiB micro-batch 1 leaves
+free. A degree of 8 would need the sequence padded, which is not implemented.
+
+Three things have to be true alongside it, and **none of them raises when it is false** — the
+forward is exact either way:
+
+* **The loss is multiplied by the degree** (`DreamZeroPolicy.forward`). Every weight's gradient
+  is a partial sum over the rank's own tokens and the partials add up to the whole; FSDP
+  averages across ranks rather than summing, which leaves everything short by exactly the
+  degree. The symptom of dropping it is a run that converges as if the learning rate were
+  `degree` times smaller.
+* **The dataloader shards over the data-parallel axis only.** The ranks of one Ulysses group
+  hold shards of the *same sample*, so `accelerator.prepare`'s `world_size`-way sharding would
+  hand each a different episode and then exchange shards between them.
+  `PreTrainedPolicy.replicated_data_ranks()` is the hook; the training script shards
+  `world_size / degree` ways.
+* **The random draws are broadcast within the group** (`ulysses.sync_in_group`). Equal seeds
+  are not enough: the states start equal and drift, because a DataLoader's worker seeds come
+  out of the main process's generator and the ranks do not consume the same amount of it.
+  Drifting noise has each rank denoising its shard towards a different target.
+
+That the head runs **on the shard**, with only its 64-wide output gathered rather than its
+5120-wide input, is what makes the first of those a single uniform factor: run it redundantly
+on a gathered input instead and its weights get a whole gradient where every other weight has a
+partial one, and no one scale factor corrects both.
+
+Verified: a whole `_forward_train` at degree 2 against one rank, prediction **bitwise**
+identical and the summed per-rank weight gradients within a bf16 ulp (`LEROBOT_TEST_SP=1`), and
+the all-to-alls over hccl on four 950PR cards as well as gloo. Not yet verified: a long enough
+run to compare loss curves against a degree-1 control, which is the only thing that can catch
+the three items above.
+
 #### Why the default stays `True`, and why batch is not the other answer
 
 Activations are per sample, so the dial and the micro-batch compete for the same ~78 GiB. At
