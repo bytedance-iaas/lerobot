@@ -243,6 +243,20 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
             model.to(map_location)
         return model
 
+    def replicated_data_ranks(self) -> int:
+        """How many consecutive ranks must be handed the **identical** batch. 1 for most.
+
+        A policy that splits one sample across ranks -- sequence or tensor parallelism -- needs
+        the ranks in each such group to see the same data, while the data-parallel axis is what
+        is left over. The training script shards the dataloader over `world_size / this` instead
+        of over `world_size`, and groups ranks contiguously, matching how those policies build
+        their process groups.
+
+        Returning the wrong value here does not raise: the ranks sharing a sample would each
+        get a different one, and a parallel policy would silently train on a blend of them.
+        """
+        return 1
+
     @abc.abstractmethod
     def get_optim_params(self) -> dict:
         """

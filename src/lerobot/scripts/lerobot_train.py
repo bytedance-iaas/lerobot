@@ -709,7 +709,39 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
     # Prepare everything with accelerator
     accelerator.wait_for_everyone()
-    if eval_dataloader is not None:
+    # A policy that splits one sample across ranks (sequence or tensor parallelism) needs each
+    # such group of ranks to receive the IDENTICAL batch, so the dataloader is sharded over the
+    # data-parallel axis only -- `world_size / replicas` ways, indexed by `rank // replicas`,
+    # with the groups contiguous to match how those policies build their process groups.
+    # `accelerator.prepare` would shard it `world_size` ways, which for a sequence-parallel run
+    # hands each rank a different sample and then exchanges shards between them. That does not
+    # raise; it trains on a blend.
+    replicas = policy.replicated_data_ranks()
+    if replicas > 1:
+        if accelerator.num_processes % replicas:
+            raise ValueError(
+                f"{accelerator.num_processes} ranks do not divide into groups of {replicas} "
+                f"for {type(policy).__name__}"
+            )
+        from accelerate.data_loader import prepare_data_loader
+
+        dp_size = accelerator.num_processes // replicas
+        dp_index = accelerator.process_index // replicas
+        if is_main_process:
+            logging.info(
+                f"{type(policy).__name__} replicates data across {replicas} ranks: "
+                f"sharding the dataloader {dp_size} ways, effective batch "
+                f"{cfg.batch_size} x {dp_size} = {cfg.batch_size * dp_size}"
+            )
+        dataloader = prepare_data_loader(
+            dataloader, accelerator.device, num_processes=dp_size, process_index=dp_index
+        )
+        if eval_dataloader is not None:
+            eval_dataloader = prepare_data_loader(
+                eval_dataloader, accelerator.device, num_processes=dp_size, process_index=dp_index
+            )
+        policy, optimizer, lr_scheduler = accelerator.prepare(policy, optimizer, lr_scheduler)
+    elif eval_dataloader is not None:
         policy, optimizer, dataloader, lr_scheduler, eval_dataloader = accelerator.prepare(
             policy, optimizer, dataloader, lr_scheduler, eval_dataloader
         )
