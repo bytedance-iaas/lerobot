@@ -613,6 +613,32 @@ On a 950PR, `True` remains the only value that fits under FSDP: a single card ru
 blocks unrecomputed (9.54 vs 9.89 s/step at 5 of them) but 8-card FSDP shards parameters and
 gradients and not activations, so the per-card activation bill is unchanged by adding cards.
 
+#### `EI0006` at the first barrier, on Ascend
+
+An 8-rank run on a 950PR fails before the model exists, with a traceback that points at
+`HcclAllreduce` and bottoms out in `accelerator.wait_for_everyone()`. Three things make that
+hard to read, and it is worth knowing all three:
+
+* HCCL errors surface asynchronously, so the operator named is usually the next synchronisation
+  point rather than the one that failed.
+* torch_npu implements `dist.barrier()` **as an all-reduce**, so the failure reads like a
+  gradient reduction when it is a barrier.
+* the real code is `EI0006`, an HCCL connect timeout, and it only appears in the log as a bare
+  error code.
+
+The first barrier is where HCCL actually builds the communicator, and with 8 processes each
+importing torch_npu and initialising a device under a container CPU quota, the slowest ranks
+arrive past `HCCL_CONNECT_TIMEOUT`'s 120 s default. Four ranks fit under it, which is why
+smaller runs on the same box are fine. Raise it:
+
+```bash
+export HCCL_CONNECT_TIMEOUT=1800 HCCL_EXEC_TIMEOUT=1800
+```
+
+Nothing about this is specific to sequence parallelism — it reproduced identically with
+`sp_degree=1`, which is how it was ruled out as a cause. When a parallel change and an
+environment failure land in the same run, the control is what separates them.
+
 ### Ulysses sequence parallelism
 
 The dial above tops out at 28 because activations do not shard. `gradient_checkpointing=False`
