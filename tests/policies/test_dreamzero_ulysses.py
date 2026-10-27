@@ -565,3 +565,20 @@ def test_the_whole_forward_matches_one_rank():
         scale = want.abs().max().double().clamp_min(1e-30)
         error = (got.double() - want.double()).abs().max()
         assert error <= 3e-2 * scale, f"{name}: off by {error / scale:.3%} of full scale"
+
+
+def test_the_sp_helpers_resolve_where_they_are_called():
+    """A guard against the import going missing again, which cost a real training run.
+
+    `sync_in_group` is called from `WANPolicyHead.forward` at `sp_degree=1` as well as above
+    it -- it returns its input when there is no group -- so a missing import breaks ordinary
+    single-card training, not just the parallel path. It did: `NameError` on the first run
+    after the calls were added, because the patch touched two modules and only one was linted.
+
+    Nothing in this suite reaches `WANPolicyHead.forward` (the sharded-forward tests drive
+    `CausalWanModel` directly), so ruff's F821 and this are what stand between that call site
+    and a run. Cheap enough to be worth the tautology.
+    """
+    from lerobot.policies.dreamzero.wan import action_head, ulysses
+
+    assert action_head.sync_in_group is ulysses.sync_in_group
