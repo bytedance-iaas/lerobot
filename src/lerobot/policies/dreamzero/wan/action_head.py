@@ -706,8 +706,11 @@ class WANPolicyHead(ActionHead):
         ys = ys.to(self._device)
         prompt_embs = prompt_embs.to(self._device)
        
-        # Loss
-        noise = torch.randn_like(latents)
+        # Loss. Under sequence parallelism every rank in a group holds a shard of this same
+        # sample, so all of them have to agree on the noise and the timesteps -- see
+        # `ulysses.sync_in_group` for why equal seeds are not enough.
+        sp_group = self.dit().sp_group
+        noise = sync_in_group(torch.randn_like(latents), sp_group)
 
         # specific to autoregressive 
         noise = noise.transpose(1, 2)
@@ -716,19 +719,27 @@ class WANPolicyHead(ActionHead):
         # ============ VIDEO TIMESTEP SAMPLING ============
         if self.config.decouple_video_action_noise:
             # Decoupled mode: sample video from Beta distribution biased towards HIGH noise
-            video_noise_ratio = self.video_beta_dist.sample([noise.shape[0], noise.shape[1]])
+            video_noise_ratio = sync_in_group(
+                self.video_beta_dist.sample([noise.shape[0], noise.shape[1]]), sp_group, latents.device
+            )
             timestep_id = ((1.0 - video_noise_ratio) * self.scheduler.num_train_timesteps).long()
             timestep_id = torch.clamp(timestep_id, 0, self.scheduler.num_train_timesteps - 1)
             noise_mode = "DECOUPLED"
         elif self.config.use_high_noise_emphasis:
             # High noise emphasis mode (coupled): BOTH video and action use Beta distribution
-            noise_ratio = self.high_noise_beta_dist.sample([noise.shape[0], noise.shape[1]])
+            noise_ratio = sync_in_group(
+                self.high_noise_beta_dist.sample([noise.shape[0], noise.shape[1]]), sp_group, latents.device
+            )
             timestep_id = ((1.0 - noise_ratio) * self.scheduler.num_train_timesteps).long()
             timestep_id = torch.clamp(timestep_id, 0, self.scheduler.num_train_timesteps - 1)
             noise_mode = "HIGH_NOISE_EMPHASIS"
         else:
             # Original: uniform sampling over full range
-            timestep_id = torch.randint(0, self.scheduler.num_train_timesteps, (noise.shape[0], noise.shape[1]))
+            timestep_id = sync_in_group(
+                torch.randint(0, self.scheduler.num_train_timesteps, (noise.shape[0], noise.shape[1])),
+                sp_group,
+                latents.device,
+            )
             noise_mode = "STANDARD"
         
         timestep_id_block = timestep_id[:, 1:].reshape(
@@ -736,17 +747,21 @@ class WANPolicyHead(ActionHead):
         timestep_id_block[:, :, 1:] = timestep_id_block[:, :, 0:1]
         
         if actions.numel() > 0:
-            noise_action = torch.randn_like(actions)
+            noise_action = sync_in_group(torch.randn_like(actions), sp_group)
             assert actions.shape[1] / (noise.shape[1]-1) == (self.model.num_action_per_block // self.num_frame_per_block), f"actions.shape, {actions.shape}, noise.shape, {noise.shape}, video.shape, {videos.shape}, latents.shape, {latents.shape}"
             assert (noise.shape[1]-1) / state_features.shape[1] == (self.num_frame_per_block // self.model.num_state_per_block), f"state_features.shape, {state_features.shape}, noise.shape, {noise.shape}, video.shape, {videos.shape}, latents.shape, {latents.shape}"
             
             # ============ ACTION TIMESTEP SAMPLING ============
             if self.config.decouple_video_action_noise:
                 # Decoupled: sample action timestep independently with full range
-                timestep_action_id = torch.randint(
-                    0, 
-                    self.scheduler.num_train_timesteps, 
-                    (actions.shape[0], actions.shape[1])
+                timestep_action_id = sync_in_group(
+                    torch.randint(
+                        0,
+                        self.scheduler.num_train_timesteps,
+                        (actions.shape[0], actions.shape[1]),
+                    ),
+                    sp_group,
+                    latents.device,
                 )
                 action_mode = "INDEPENDENT"
             else:

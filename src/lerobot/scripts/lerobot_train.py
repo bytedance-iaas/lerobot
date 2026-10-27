@@ -918,6 +918,20 @@ def train(cfg: TrainPipelineConfig) -> None:
     if cfg.resume:
         step = resume_before_prepare(cfg)  # step + RNG only; sharded state loads after prepare
 
+    # A policy that splits one sample across ranks needs every rank in such a group to get the
+    # IDENTICAL batch. `make_dataloaders` shards over `parallel_dims.dp_world_size`, which already
+    # excludes the context-parallel axis -- but only for the degree declared in `cfg.accelerator`.
+    # A policy carrying its own degree (DreamZero's `sp_degree`) must agree with it, or each rank
+    # of a group gets a different sample and the shards are then exchanged between them. That does
+    # not raise anywhere downstream; it trains on a blend.
+    replicas = policy.replicated_data_ranks()
+    if replicas != parallel_dims.cp_size:
+        raise ValueError(
+            f"{type(policy).__name__} replicates data across {replicas} ranks, but the configured "
+            f"context-parallel degree is {parallel_dims.cp_size}. Set "
+            f"--accelerator.parallelism.context_parallel.ulysses_degree={replicas} to match."
+        )
+
     dataloader, eval_dataloader = make_dataloaders(cfg, dataset, eval_dataset, step, parallel_dims)
 
     # --- prepare & resume phase 2 ---------------------------------------------------------------

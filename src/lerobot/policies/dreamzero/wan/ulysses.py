@@ -273,3 +273,29 @@ def make_sp_group(degree: int):
         if rank in members:
             mine = group
     return mine
+
+
+def sync_in_group(x: torch.Tensor, group=None, device=None) -> torch.Tensor:
+    """Make every rank in `group` agree on a tensor that was drawn at random.
+
+    Ranks in one Ulysses group hold shards of **the same sample**, so they must agree on the
+    noise and the timesteps applied to it. Relying on identical seeds is not enough: the ranks'
+    RNG states start equal but drift, because a DataLoader's worker seeds are drawn from the
+    main process's generator and the ranks do not consume the same amount of it. Drifting
+    noise would not raise -- each rank would simply denoise its shard of the sequence towards a
+    different target, and the loss would be a blend of several problems.
+
+    `device` is for the CPU tensors a `torch.distributions` sample produces: a collective on a
+    device backend cannot carry them, so they make the round trip and come back where they were.
+    """
+    if group is None or not dist.is_available() or not dist.is_initialized():
+        return x
+    src = dist.distributed_c10d.get_global_rank(group, 0)
+    if x.device.type == "cpu" and dist.get_backend(group) != "gloo":
+        if device is None:
+            raise ValueError("a CPU tensor needs a device to be synced over a device backend")
+        moved = x.to(device)
+        dist.broadcast(moved, src=src, group=group)
+        return moved.to("cpu")
+    dist.broadcast(x, src=src, group=group)
+    return x

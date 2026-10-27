@@ -387,6 +387,10 @@ class DreamZeroPolicy(PreTrainedPolicy):
         if self.config.compile_encoders:
             self._compile_encoders()
 
+    def replicated_data_ranks(self) -> int:
+        """Each Ulysses group shards one sample, so all of its ranks need that same sample."""
+        return self.config.sp_degree
+
     def _compile_dit(self) -> None:
         """torch.compile each DiT block, which is where the non-matmul time is.
 
