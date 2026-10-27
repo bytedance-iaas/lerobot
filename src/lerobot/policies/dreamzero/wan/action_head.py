@@ -71,6 +71,7 @@ from .schedulers import FlowUniPCMultistepScheduler
 from .image_encoder import WanImageEncoder
 from .vae import WanVideoVAE, WanVideoVAE38
 from .causal_wan_model import CausalWanModel
+from .ulysses import sync_in_group
 
 
 def _component_kwargs(cfg):
