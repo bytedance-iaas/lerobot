@@ -144,6 +144,11 @@ def _init(rank: int, port: int) -> None:
     dist.init_process_group(BACKEND, rank=rank, world_size=WORLD)
 
 
+# A spawned rank on an accelerator spends most of a minute in device init alone, so the wait
+# for its result has to scale with that; 120 s is right for CPU gloo and far too short for NPU.
+QUEUE_TIMEOUT = 120 if BACKEND == "gloo" else 900
+
+
 def _device() -> str:
     return "cpu" if BACKEND == "gloo" else BACKEND.replace("hccl", "npu")
 
@@ -189,9 +194,9 @@ def test_the_all_to_alls_move_the_shard_from_tokens_to_heads(seed):
     procs = [ctx.Process(target=_worker, args=(rank, port, queue)) for rank in range(WORLD)]
     for proc in procs:
         proc.start()
-    results = [queue.get(timeout=120) for _ in range(WORLD)]
+    results = [queue.get(timeout=QUEUE_TIMEOUT) for _ in range(WORLD)]
     for proc in procs:
-        proc.join(timeout=60)
+        proc.join(timeout=QUEUE_TIMEOUT)
         assert proc.exitcode == 0, f"rank exited {proc.exitcode}"
 
     assert len(results) == WORLD
@@ -332,11 +337,11 @@ def test_a_sharded_block_matches_one_rank_exactly():
     procs = [ctx.Process(target=_sp_worker, args=(rank, port, queue)) for rank in range(WORLD)]
     for proc in procs:
         proc.start()
-    # Short on purpose: a mismatched collective sequence between ranks shows up as a hang,
-    # and a hang that fails in two minutes is diagnosable where one that fails in five is not.
-    results = sorted((queue.get(timeout=120) for _ in range(WORLD)), key=lambda r: r[0])
+    # Bounded on purpose: a mismatched collective sequence between ranks shows up as a hang,
+    # and a hang that fails is diagnosable where one that waits forever is not.
+    results = sorted((queue.get(timeout=QUEUE_TIMEOUT) for _ in range(WORLD)), key=lambda r: r[0])
     for proc in procs:
-        proc.join(timeout=60)
+        proc.join(timeout=QUEUE_TIMEOUT)
         assert proc.exitcode == 0, f"rank exited {proc.exitcode}"
 
     # The forward: each rank's shard is the matching slice of the single-rank output.
@@ -447,9 +452,9 @@ def test_the_uneven_gather_reassembles_and_its_backward_is_a_slice():
     procs = [ctx.Process(target=_gather_worker, args=(rank, port, queue)) for rank in range(WORLD)]
     for proc in procs:
         proc.start()
-    results = [queue.get(timeout=120) for _ in range(WORLD)]
+    results = [queue.get(timeout=QUEUE_TIMEOUT) for _ in range(WORLD)]
     for proc in procs:
-        proc.join(timeout=60)
+        proc.join(timeout=QUEUE_TIMEOUT)
         assert proc.exitcode == 0, f"rank exited {proc.exitcode}"
 
     for rank, sizes, whole_ok, grad_ok in results:
@@ -544,9 +549,9 @@ def test_the_whole_forward_matches_one_rank():
     procs = [ctx.Process(target=_model_worker, args=(rank, port, queue)) for rank in range(WORLD)]
     for proc in procs:
         proc.start()
-    results = sorted((queue.get(timeout=120) for _ in range(WORLD)), key=lambda r: r[0])
+    results = sorted((queue.get(timeout=QUEUE_TIMEOUT) for _ in range(WORLD)), key=lambda r: r[0])
     for proc in procs:
-        proc.join(timeout=60)
+        proc.join(timeout=QUEUE_TIMEOUT)
         assert proc.exitcode == 0, f"rank exited {proc.exitcode}"
 
     # Every rank reconstructs the same whole prediction, and it is the single-rank one.
