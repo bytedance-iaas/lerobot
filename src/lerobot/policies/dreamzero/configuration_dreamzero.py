@@ -260,6 +260,12 @@ class DreamZeroConfig(PreTrainedConfig):
     # the loss has to be multiplied by the degree to compensate. Get that wrong and nothing
     # raises -- the forward is exact either way, and the symptom is that multi-card converges
     # as if the learning rate were `degree` times smaller.
+    #
+    # **The logged loss is therefore `degree` times larger than a degree-1 run's.** Divide by
+    # `sp_degree` before comparing curves. The alternative -- correcting the gradients after
+    # the backward instead, which would leave the number honest -- costs a pass over every
+    # gradient in the model, ~33 GB of traffic a step for 16.5 B parameters, to make a log line
+    # read better. Scaling the loss is free, so the cost is paid here in documentation instead.
     sp_degree: int = 1
 
     # Diffusion. `num_inference_timesteps` is a TRAINING parameter (the released DROID checkpoint
