@@ -685,7 +685,10 @@ forward is exact either way:
   is a partial sum over the rank's own tokens and the partials add up to the whole; FSDP
   averages across ranks rather than summing, which leaves everything short by exactly the
   degree. The symptom of dropping it is a run that converges as if the learning rate were
-  `degree` times smaller.
+  `degree` times smaller. **It also makes the logged loss `degree` times larger than a
+  degree-1 run's** — divide before comparing curves. Correcting the gradients after the
+  backward instead would keep the number honest and cost a pass over all 16.5 B gradients each
+  step, which is not worth a log line.
 * **The dataloader shards over the data-parallel axis only.** The ranks of one Ulysses group
   hold shards of the *same sample*, so `accelerator.prepare`'s `world_size`-way sharding would
   hand each a different episode and then exchange shards between them.
