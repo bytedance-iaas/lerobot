@@ -704,11 +704,39 @@ That the head runs **on the shard**, with only its 64-wide output gathered rathe
 on a gathered input instead and its weights get a whole gradient where every other weight has a
 partial one, and no one scale factor corrects both.
 
-Verified: a whole `_forward_train` at degree 2 against one rank, prediction **bitwise**
-identical and the summed per-rank weight gradients within a bf16 ulp (`LEROBOT_TEST_SP=1`), and
-the all-to-alls over hccl on four 950PR cards as well as gloo. Not yet verified: a long enough
-run to compare loss curves against a degree-1 control, which is the only thing that can catch
-the three items above.
+Verified in the unit tests: a whole `_forward_train` at degree 2 against one rank, prediction
+**bitwise** identical and the summed per-rank weight gradients within a bf16 ulp
+(`LEROBOT_TEST_SP=1`), and the all-to-alls over hccl on four 950PR cards as well as gloo.
+
+And verified where it counts, on a 950PR, because the three items above are what unit tests
+cannot reach. Two `lora` runs, batch 1, seed 1000, `num_workers=0`, both with **one** data-
+parallel group so they see the same samples in the same order — one card at degree 1 with
+recompute on, four cards at degree 4 with it off:
+
+| step | degree 1 | degree 4 | ratio |
+|---|---|---|---|
+| 1 | 0.083 | 0.332 | 4.000 |
+| 2 | 0.082 | 0.326 | 3.976 |
+| 3 | 0.116 | 0.462 | 3.983 |
+| 4 | 0.097 | 0.390 | 4.021 |
+| 5 | 0.093 | 0.371 | 3.989 |
+| 6 | 0.106 | 0.425 | 4.009 |
+| 7 | 0.068 | 0.273 | 4.015 |
+| 8 | 0.104 | 0.415 | 3.990 |
+
+Exactly the degree, every step, within half a percent. **The ratio is not the interesting
+part — the agreement of the noise is.** Flow matching draws a timestep per step, so the
+single-card losses swing +-25% between steps; the four-card run reproduces that swing exactly,
+which can only happen if both runs drew the same samples in the same order *and* all four ranks
+agreed with each other and with the single card on the noise. That is the dataloader sharding,
+`sync_in_group`, and the loss scale all confirmed at once, and a misaligned shard or gather
+would not land on a clean multiple of the single-card value.
+
+One thing that does **not** add up, and is open: the four-card run peaked at 107.93 GiB, which
+matches the arithmetic *without* FSDP sharding (47.16 + 40 x 1.385 = 102.6) rather than with it
+(~70). FSDP appears not to be sharding much under `lora`, where only 108.6 M of 22,943 M
+parameters require grad. So an earlier claim in this file that FSDP brings degree-4 recompute-off
+down to ~65 GiB per card is wrong: measured, it is ~108.
 
 #### Why the default stays `True`, and why batch is not the other answer
 
