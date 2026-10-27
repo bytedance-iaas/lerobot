@@ -733,13 +733,27 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 f"sharding the dataloader {dp_size} ways, effective batch "
                 f"{cfg.batch_size} x {dp_size} = {cfg.batch_size * dp_size}"
             )
-        dataloader = prepare_data_loader(
-            dataloader, accelerator.device, num_processes=dp_size, process_index=dp_index
-        )
-        if eval_dataloader is not None:
-            eval_dataloader = prepare_data_loader(
-                eval_dataloader, accelerator.device, num_processes=dp_size, process_index=dp_index
+
+        # Everything here except num_processes/process_index mirrors what
+        # `Accelerator.prepare_data_loader` would pass. `put_on_device` especially: it defaults
+        # to False in the bare function, so leaving it out hands the training step CPU batches.
+        def _shard_over_dp(loader):
+            return prepare_data_loader(
+                loader,
+                accelerator.device,
+                num_processes=dp_size,
+                process_index=dp_index,
+                split_batches=accelerator.split_batches,
+                put_on_device=getattr(accelerator, "device_placement", True),
+                rng_types=list(getattr(accelerator, "rng_types", None) or []),
+                dispatch_batches=accelerator.dispatch_batches,
+                even_batches=accelerator.even_batches,
+                use_seedable_sampler=accelerator.use_seedable_sampler,
             )
+
+        dataloader = _shard_over_dp(dataloader)
+        if eval_dataloader is not None:
+            eval_dataloader = _shard_over_dp(eval_dataloader)
         policy, optimizer, lr_scheduler = accelerator.prepare(policy, optimizer, lr_scheduler)
     elif eval_dataloader is not None:
         policy, optimizer, dataloader, lr_scheduler, eval_dataloader = accelerator.prepare(
