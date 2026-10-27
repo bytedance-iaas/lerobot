@@ -644,7 +644,30 @@ environment failure land in the same run, the control is what separates them.
 The dial above tops out at 28 because activations do not shard. `gradient_checkpointing=False`
 wants ~217 GiB and no card has it — H200 has 131, a GB200 179 — and FSDP shards parameters and
 gradients, not activations, so adding cards does nothing. Sequence parallelism is what divides
-that bill, and it is the only route to the ten points between MFU and HFU.
+that bill, and it is the only route to recompute-free training at this window.
+
+**It is not a throughput win, and the ten points between MFU and HFU are not free this way.**
+Measured on a 950PR, `lora`, batch 1, same data:
+
+| | step | throughput | per-card MFU | peak |
+|---|---|---|---|---|
+| 1 card, degree 1, 40 checkpointed | 10.3 s | 0.097 samples/s | **31.2%** | 56.68 GiB |
+| 4 cards, degree 4, none checkpointed | 6.8 s | 0.147 samples/s | **14.8%** | 107.93 GiB |
+
+Four cards buy 1.5x the throughput where plain data parallelism over the same four would buy
+4x, and per-card MFU halves. Two reasons are structural rather than incidental. The encoders
+run **before** the shard — VAE encode 84.6 TFLOP, umt5 4.7, CLIP 0.3 — so every rank computes
+all ~90 of them, and a card's work falls from 1078 to 337 TFLOP rather than to 270. And the
+four all-to-alls per block, 160 per forward, are not overlapped with anything.
+
+So the honest reading: sequence parallelism trades per-card efficiency for a window that
+otherwise does not fit. Reach for it when one sample does not fit on a card — a longer horizon,
+a bigger canvas — not to make a run that already fits go faster. For throughput at a fixed card
+count, plain data parallelism with `gradient_checkpointing=28` is the better configuration.
+
+What the measurement cannot yet say is whether raising the micro-batch recovers the gap, which
+depends on how much of that overhead is per step rather than per sample; one data point cannot
+separate them.
 
 ```bash
 --policy.sp_degree=4     # with 8 ranks: 4-way Ulysses x 2-way data parallelism
