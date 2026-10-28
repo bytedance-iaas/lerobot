@@ -656,3 +656,36 @@ def test_the_modulation_layout_covers_every_padded_shard(degree):
         assert row_start >= 0 and row_end <= rows_total
         seen_rows = max(seen_rows, row_end)
     assert seen_rows == rows_total, "every modulation row must land in some shard"
+
+
+def test_teacher_forcing_split_is_computed_from_the_unpadded_length():
+    """Why `sp_pad` has to be subtracted back out inside the attention.
+
+    The clean/noisy boundary is `(s - action_register_length) // 2` -- DERIVED from the length,
+    not read from a fixed index. So padding the sequence moves it, and the first 8-card run died
+    on exactly these two numbers: `tensor a (7922) must match tensor b (7920)`.
+
+    The `pad_to_multiple` docstring claimed the padding sits "past every index the teacher-forcing
+    slicing refers to". That is false for a boundary the code recomputes, which is what this
+    guards.
+    """
+    length, registers, degree = 15940, 100, 8
+    pad = pad_to_multiple(length, degree)
+    assert pad == 4
+    assert (length - registers) // 2 == 7920, "the boundary the attention must use"
+    assert (length + pad - registers) // 2 == 7922, "the boundary a padded length would give"
+
+
+def test_the_padded_tail_must_not_become_attention_keys():
+    """The tail lands after the noisy half, so trimming to the real length is not cosmetic.
+
+    `k_noisy = k[:, split:]` takes everything to the end, so padded tokens left in place become
+    keys that real queries attend to -- a silently wrong answer rather than a shape error. The
+    attention therefore slices q/k/v to the real length right after the all-to-all.
+    """
+    length, registers, degree = 15940, 100, 8
+    pad = pad_to_multiple(length, degree)
+    split = (length - registers) // 2
+    padded_noisy = slice(split, length + pad)
+    real_noisy = slice(split, length)
+    assert padded_noisy.stop - real_noisy.stop == pad, "the tail would ride along as keys"
