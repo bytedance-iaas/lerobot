@@ -21,6 +21,7 @@ from typing import Any, TypeAlias
 from .causal_attention import AttentionModule
 from .ulysses import (
     gather_seq,
+    pad_to_multiple,
     segment_in_shard,
     segment_sizes,
     shard_bounds,
@@ -2341,10 +2342,31 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # slice, which `shard_runs` can express because a shard only ever cuts a row part-way.
         world = self.sp_world
         shard_start, shard_stop = 0, x.shape[1]
+        shard_total = x.shape[1]
         sp_rank = 0
         if world > 1:
             sp_rank = dist.get_rank(self.sp_group)
-            shard_start, shard_stop = shard_bounds(x.shape[1], world, sp_rank)
+            # The all-to-all splits the sequence evenly, so a degree that does not divide the
+            # length has to pad first. 15940 = 2^2 x 5 x 797, so degrees 2, 4, 5, 10 and 20 need
+            # nothing and degree 8 needs 4 tokens.
+            #
+            # The padding goes at the END, past every index the teacher-forcing slicing reads.
+            # That is what makes it free of consequences rather than merely cheap: `k_context` is
+            # assembled from explicit slices (first image, the image blocks, the current action
+            # and state block), so no attention call can take a padded token as a key, and the
+            # head only ever reads back its own segments. Norms, modulation and the FFN are all
+            # per token, so whatever lands in a padded position stays there. They cost their
+            # share of those and nothing else -- 4 tokens in 15944 at degree 8, 0.025%.
+            pad = pad_to_multiple(x.shape[1], world)
+            if pad:
+                x = torch.nn.functional.pad(x, (0, 0, 0, pad))
+                # One more modulation row covers them. WHICH row is immaterial, since the value
+                # reaches no output, but `shard_runs` refuses a shard that runs past the layout,
+                # so the run list and the rows tensor both have to grow with the tokens.
+                e_runs = _join_runs(*e_runs, (1, pad))
+                e0 = torch.cat([e0, e0[:, -1:]], dim=1)
+            shard_total = x.shape[1]
+            shard_start, shard_stop = shard_bounds(shard_total, world, sp_rank)
             x = x[:, shard_start:shard_stop]
             row_start, row_end, run_slice = shard_runs(e_runs, shard_start, shard_stop)
             kwargs["e"] = e0[:, row_start:row_end]
@@ -2378,7 +2400,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             action_noise_pred = self.action_decoder(x[:, lo:hi], embodiment_id)
             action_noise_pred = gather_seq(
                 action_noise_pred,
-                segment_sizes(total, world, video_hi, action_hi),
+                segment_sizes(shard_total, world, video_hi, action_hi),
                 sp_rank,
                 world,
                 self.sp_group,
@@ -2397,7 +2419,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         row_lo, row_hi, head_runs = shard_runs((video_run,), inner_lo, inner_lo + (hi - lo))
         x_video = self.head(x[:, lo:hi], e[:, row_lo:row_hi].unsqueeze(2), head_runs)
         x_video = gather_seq(
-            x_video, segment_sizes(total, world, video_lo, video_hi), sp_rank, world, self.sp_group
+            x_video, segment_sizes(shard_total, world, video_lo, video_hi), sp_rank, world, self.sp_group
         )
 
         # Unpatchify video-only tokens

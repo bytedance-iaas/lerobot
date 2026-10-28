@@ -597,3 +597,62 @@ def test_sp_requires_recompute_off():
         DreamZeroConfig(sp_degree=4, gradient_checkpointing=gc)
     for gc in (True, 40, 0, False):
         DreamZeroConfig(sp_degree=1, gradient_checkpointing=gc)
+
+
+# --- padding, which is what makes a degree that does not divide the sequence reachable -------
+
+def test_pad_to_multiple_on_the_real_sequence_length():
+    """15940 = 2^2 x 5 x 797, so only degrees built from {2, 2, 5, 797} divide it."""
+    assert pad_to_multiple(15940, 1) == 0
+    for degree in (2, 4, 5, 10, 20):
+        assert pad_to_multiple(15940, degree) == 0, degree
+    assert pad_to_multiple(15940, 8) == 4  # -> 15944 = 8 x 1993
+    assert pad_to_multiple(15940, 16) == 12  # -> 15952 = 16 x 997
+    for degree in (2, 4, 5, 8, 10, 16, 20):
+        assert (15940 + pad_to_multiple(15940, degree)) % degree == 0, degree
+
+
+@pytest.mark.parametrize("degree", [2, 4, 8, 16])
+def test_padding_makes_the_shards_equal_and_covering(degree):
+    total = 15940
+    padded = total + pad_to_multiple(total, degree)
+    bounds = [shard_bounds(padded, degree, r) for r in range(degree)]
+    widths = {hi - lo for lo, hi in bounds}
+    assert len(widths) == 1, f"shards must be equal for an all-to-all, got {widths}"
+    assert bounds[0][0] == 0 and bounds[-1][1] == padded
+    for (_, hi), (lo, _) in zip(bounds[:-1], bounds[1:], strict=True):
+        assert hi == lo, "shards must tile the padded sequence with no gap"
+
+
+def test_unpadded_length_is_rejected_rather_than_split_unevenly():
+    """`shard_bounds` refuses rather than rounding, which is what sends the caller to the pad."""
+    with pytest.raises(ValueError, match="pad it first"):
+        shard_bounds(15940, 8, 0)
+
+
+@pytest.mark.parametrize("degree", [2, 4, 8])
+def test_the_modulation_layout_covers_every_padded_shard(degree):
+    """The run list has to grow with the tokens or `shard_runs` refuses the last shard.
+
+    This mirrors what `_forward_train` does: one extra row of `(1, pad)` after the real runs.
+    """
+    from lerobot.policies.dreamzero.wan.causal_wan_model import _join_runs
+
+    # A stand-in for the real layout: one row per video token group plus the action registers.
+    runs = ((1, 15840), (100, 1))
+    total = sum(rows * repeat for rows, repeat in runs)
+    assert total == 15940
+    pad = pad_to_multiple(total, degree)
+    padded_runs = _join_runs(*runs, (1, pad)) if pad else runs
+    covered = sum(rows * repeat for rows, repeat in padded_runs)
+    assert covered == total + pad
+
+    rows_total = sum(rows for rows, _ in padded_runs)
+    seen_rows = 0
+    for rank in range(degree):
+        lo, hi = shard_bounds(total + pad, degree, rank)
+        row_start, row_end, local = shard_runs(padded_runs, lo, hi)
+        assert sum(rows * repeat for rows, repeat in local) == hi - lo
+        assert row_start >= 0 and row_end <= rows_total
+        seen_rows = max(seen_rows, row_end)
+    assert seen_rows == rows_total, "every modulation row must land in some shard"
