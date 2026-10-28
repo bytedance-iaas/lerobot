@@ -355,6 +355,14 @@ def update_policy(
     train_metrics.update_s = time.perf_counter() - start_time
     if backend is not None:
         train_metrics.gpu_mem_gb = backend.max_memory_allocated() / (1024**3)
+        # A run that sits near capacity does not fail, it slows down: when the pool has no free
+        # block big enough, the allocator reclaims cached blocks, and that path SYNCHRONIZES the
+        # device. The cost lands in the step time with no kernel to blame it on, so without this
+        # counter a memory-bound slowdown is indistinguishable from a compute-bound one.
+        # `reserved - allocated` is the fragmentation it is fighting.
+        stats = backend.memory_stats() if hasattr(backend, "memory_stats") else {}
+        train_metrics.alloc_retries = stats.get("num_alloc_retries", 0)
+        train_metrics.gpu_mem_resv_gb = stats.get("reserved_bytes.all.peak", 0) / (1024**3)
     return train_metrics, output_dict
 
 
@@ -793,6 +801,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     if accelerator_module(accelerator.device) is not None:
         # max() because headroom is gated by the worst-case rank.
         train_metrics["gpu_mem_gb"] = AverageMeter("mem_gb", ":.2f", reduction="max")
+        train_metrics["gpu_mem_resv_gb"] = AverageMeter("resv_gb", ":.2f", reduction="max")
+        train_metrics["alloc_retries"] = AverageMeter("retries", ":.0f", reduction="max")
 
     # Keep global batch size for logging; MetricsTracker handles world size internally.
     effective_batch_size = cfg.batch_size * accelerator.num_processes
