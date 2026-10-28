@@ -82,6 +82,26 @@ def _component_kwargs(cfg):
 KVCacheType: TypeAlias = torch.Tensor
 
 
+def mask_per_sample(loss: torch.Tensor, keep: torch.Tensor) -> torch.Tensor:
+    """Zero out the samples whose `keep` flag is False.
+
+    `keep` carries one flag per sample, shape `[B]`, while `loss` is `[B, ...]`. The reshape
+    rather than an index is the whole point: `keep[:, None]` is `[B, 1]`, and broadcasting
+    right-aligns that onto the loss's TRAILING dims, so the batch axis lands on the action
+    horizon and agrees only when `B == 1`. At batch 1 that broadcasts to the right answer by
+    coincidence, which is why the bug stayed hidden -- every DreamZero run so far used batch 1.
+    At batch 2 it raises `size of tensor a (2) must match tensor b (96)`.
+
+    The flag count is checked rather than broadcast, so a mismatch is an error instead of a
+    silently rescaled loss.
+    """
+    if keep.ndim != 1:
+        raise ValueError(f"keep must be one flag per sample, got shape {tuple(keep.shape)}")
+    if keep.shape[0] != loss.shape[0]:
+        raise ValueError(f"{keep.shape[0]} flags for {loss.shape[0]} samples")
+    return keep.to(loss.dtype).reshape(-1, *(1,) * (loss.ndim - 1)) * loss
+
+
 @dataclass
 class WANPolicyHeadConfig:
     add_pos_embed: bool = field(
@@ -845,7 +865,7 @@ class WANPolicyHead(ActionHead):
                 action_loss_per_sample = torch.nn.functional.mse_loss(
                     action_noise_pred.float(), training_target_action.float(), reduction='none'
                 ) * action_mask  # shape: [B, ...]
-                action_loss_per_sample = has_real_action[:, None].float() * action_loss_per_sample  # apply has_real_action
+                action_loss_per_sample = mask_per_sample(action_loss_per_sample, has_real_action)
                 weight_action = action_loss_per_sample.mean(dim=2) * self.scheduler.training_weight(
                     timestep_action.flatten(0, 1),
                 ).unflatten(0, (noise_action.shape[0], noise_action.shape[1])).to(self._device)
