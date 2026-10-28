@@ -441,6 +441,24 @@ class DreamZeroConfig(PreTrainedConfig):
                     f"sp_degree must divide the {heads} attention heads of {self.model_variant}; "
                     f"got {self.sp_degree}."
                 )
+            # Sequence parallelism exists to make `gradient_checkpointing=0` reachable -- it
+            # shards the activations that are the only reason recompute is needed. Asking for
+            # both pays twice, and the second payment is worse than it looks: the all-to-all
+            # lives inside `CausalWanSelfAttention.forward`, the checkpoint wraps the whole
+            # block, so recompute re-runs the exchange. SP+GC pays the communication over three
+            # passes (forward, recompute, backward) where SP alone pays two.
+            #
+            # Measured on 8 cards, full, matched at 8 samples/step: SP=4 with GC=40 at batch 4
+            # ran 15.585 s against the DP=8 baseline's 11.655 s, and the same SP=4 with GC=40 at
+            # batch 8 degraded to 31-39 s. Neither is a configuration anyone should land on by
+            # forgetting a flag, so it is refused rather than warned about.
+            if self.gradient_checkpointing != 0:  # covers True (== 1) and any positive count
+                raise ValueError(
+                    "sp_degree > 1 requires gradient_checkpointing=0: sequence parallelism is "
+                    "what makes turning recompute off affordable, and combining the two pays "
+                    f"for both. Got sp_degree={self.sp_degree} with "
+                    f"gradient_checkpointing={self.gradient_checkpointing}."
+                )
         if not isinstance(self.gradient_checkpointing, bool):
             # Clamping instead would hide a typo: a value above the depth reads as "all of them"
             # and would silently cost a quarter of the step, which is the thing the dial exists
