@@ -262,6 +262,11 @@ class CausalWanSelfAttention(nn.Module):
         # code path either way.
         self.sp_world = 1
         self.sp_group = None
+        # Tokens appended to make the sequence divide by `sp_world`. They have to be subtracted
+        # back out here, because the teacher-forcing split below is COMPUTED from the length
+        # (`(s - action_register_length) // 2`) rather than read from fixed indices -- so four
+        # padded tokens move the clean/noisy boundary by two and nothing lines up.
+        self.sp_pad = 0
         self.causal_attn = AttentionModule(num_heads=self.num_heads, head_dim=self.head_dim, causal=True)
 
     def _visualize_attention_mask(self, total_len, first_image_len, image_blocks_len, 
@@ -859,7 +864,11 @@ class CausalWanSelfAttention(nn.Module):
         # teacher-forcing pattern is built by indexing token ranges in Python, and those ranges
         # are only meaningful against a complete sequence. `s` is therefore the global length.
         world = self.sp_world
-        s = s_local * world
+        # The REAL global length. Everything below indexes token ranges that only mean anything
+        # against the unpadded sequence, and the padded tail must not reach `k_noisy` either:
+        # there it would become a key that real queries attend to, which is a silent wrong
+        # answer rather than a shape error.
+        s = s_local * world - self.sp_pad
 
         # query, key, value function
         def qkv_fn(x):
@@ -875,6 +884,11 @@ class CausalWanSelfAttention(nn.Module):
             )
 
         q, k, v = qkv_fn(x)
+        if self.sp_pad:
+            # `to_head_shard` returns the whole padded sequence; the attention runs on the real
+            # part of it only. The tail is restored before `to_seq_shard`, which needs the
+            # padded length back to split evenly again.
+            q, k, v = q[:, :s], k[:, :s], v[:, :s]
 
         updated_kv_cache: torch.Tensor | None = None
 
@@ -1154,6 +1168,8 @@ class CausalWanSelfAttention(nn.Module):
 
         # output. Back to a sequence shard first: `self.o` mixes the head axis, so it needs
         # all n heads, and it is per-token, so a shard of the tokens is all this rank needs.
+        if self.sp_pad:
+            x = torch.nn.functional.pad(x, (0, 0, 0, 0, 0, self.sp_pad))
         x = to_seq_shard(x, world, self.sp_group)
         x = x.flatten(2)
         x = self.o(x)
@@ -2358,6 +2374,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             # per token, so whatever lands in a padded position stays there. They cost their
             # share of those and nothing else -- 4 tokens in 15944 at degree 8, 0.025%.
             pad = pad_to_multiple(x.shape[1], world)
+            for block in self.blocks:
+                block.self_attn.sp_pad = pad
             if pad:
                 x = torch.nn.functional.pad(x, (0, 0, 0, pad))
                 # One more modulation row covers them. WHICH row is immaterial, since the value
