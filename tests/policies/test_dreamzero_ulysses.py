@@ -582,3 +582,18 @@ def test_the_sp_helpers_resolve_where_they_are_called():
     from lerobot.policies.dreamzero.wan import action_head, ulysses
 
     assert action_head.sync_in_group is ulysses.sync_in_group
+
+
+def test_sp_requires_recompute_off():
+    """SP exists to make GC=0 affordable; asking for both pays the all-to-all three passes."""
+    from lerobot.policies.dreamzero.configuration_dreamzero import DreamZeroConfig
+
+    for gc in (True, 40, 1, 25):
+        with pytest.raises(ValueError, match="requires gradient_checkpointing=0"):
+            DreamZeroConfig(sp_degree=4, gradient_checkpointing=gc)
+
+    # Both spellings of "none" are accepted, and sp_degree=1 is unconstrained.
+    for gc in (False, 0):
+        DreamZeroConfig(sp_degree=4, gradient_checkpointing=gc)
+    for gc in (True, 40, 0, False):
+        DreamZeroConfig(sp_degree=1, gradient_checkpointing=gc)
