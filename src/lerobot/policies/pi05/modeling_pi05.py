@@ -82,7 +82,7 @@ class ActionSelectKwargs(TypedDict, total=False):
 
 def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
-    if device_type == "mps" and target_dtype == torch.float64:
+    if device_type in ("mps", "ada") and target_dtype == torch.float64:
         return torch.float32
     if device_type == "cpu":
         # CPU doesn't support bfloat16, use float32 instead
@@ -1255,9 +1255,9 @@ class PI05Policy(PreTrainedPolicy):
                 original_state_dict = load_file(resolved_file)
                 print("✓ Loaded state dict from model.safetensors")
             except Exception as e:
-                print(f"Could not load state dict from remote files: {e}")
-                print("Returning model without loading pretrained weights")
-                return model
+                raise StateDictLoadError(
+                    f"Could not load Pi0.5 pretrained weights from {pretrained_name_or_path}"
+                ) from e
 
             # First, fix any key differences (see openpi model.py, _fix_pytorch_state_dict_keys)
             fixed_state_dict = model._fix_pytorch_state_dict_keys(original_state_dict, model.config)
@@ -1333,7 +1333,9 @@ class PI05Policy(PreTrainedPolicy):
             # A genuine key mismatch must fail loud — don't return a partially random model.
             raise
         except Exception as e:
-            print(f"Warning: Could not load state dict: {e}")
+            raise StateDictLoadError(
+                f"Could not initialize Pi0.5 from pretrained weights at {pretrained_name_or_path}"
+            ) from e
 
         return model
 

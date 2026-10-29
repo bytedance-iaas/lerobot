@@ -19,6 +19,15 @@ import logging
 import torch
 
 
+def _ada_available() -> bool:
+    """Register the optional Torch Ada backend before querying its devices."""
+    try:
+        import torch_ada  # noqa: F401
+    except ImportError:
+        return False
+    return torch.ada.is_available()
+
+
 def _npu_available() -> bool:
     """True when torch_npu is installed and an Ascend device is visible.
 
@@ -47,6 +56,9 @@ def auto_select_torch_device() -> torch.device:
     elif _npu_available():
         logging.info("Ascend NPU backend detected, using npu.")
         return torch.device("npu")
+    elif _ada_available():
+        logging.info("Ada backend detected, using ada.")
+        return torch.device("ada")
     else:
         logging.warning("No accelerated backend detected. Using default cpu, this will be slow.")
         return torch.device("cpu")
@@ -69,6 +81,10 @@ def get_safe_torch_device(try_device: str, log: bool = False) -> torch.device:
         device = torch.device("cpu")
         if log:
             logging.warning("Using CPU, this will be slow.")
+    elif try_device.split(":", 1)[0] == "ada":
+        if not _ada_available():
+            raise ValueError("Ada device requested but torch_ada or an Ada device is unavailable")
+        device = torch.device(try_device)
     else:
         device = torch.device(try_device)
         if log:
@@ -113,15 +129,19 @@ def is_torch_device_available(try_device: str) -> bool:
         return torch.xpu.is_available()
     elif try_device.startswith("npu"):
         return _npu_available()
+    elif try_device.split(":", 1)[0] == "ada":
+        return _ada_available()
     elif try_device == "cpu":
         return True
     else:
         raise ValueError(
-            f"Unknown device {try_device}. Supported devices are: cuda, mps, xpu, npu or cpu."
+            f"Unknown device {try_device}. Supported devices are: cuda, mps, xpu, npu, ada or cpu."
         )
 
 
 def is_amp_available(device: str):
+    if device.split(":", 1)[0] == "ada":
+        return _ada_available() and torch.bfloat16 in torch.ada.get_amp_supported_dtype()
     if device.startswith("npu"):
         return _npu_available()
     if device in ["cuda", "xpu", "cpu"]:

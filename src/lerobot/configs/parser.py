@@ -34,6 +34,7 @@ from draccus.help_formatter import SimpleHelpFormatter
 from lerobot.utils.utils import has_method
 
 F = TypeVar("F", bound=Callable[..., object])
+T = TypeVar("T")
 
 PATH_KEY = "path"
 PLUGIN_DISCOVERY_SUFFIX = "discover_packages_path"
@@ -307,7 +308,7 @@ class SafeHelpFormatter(SimpleHelpFormatter):
         return help_string if help_string is None else _escape_literal_percents(help_string)
 
 
-def parse[T](
+def parse(
     config_class: type[T],
     config_path: Path | str | None = None,
     args: Sequence[str] | None = None,

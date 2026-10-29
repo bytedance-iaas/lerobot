@@ -424,12 +424,20 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         # non-tensor fields (the `task` instruction string) across processes at all.
         # StreamingLeRobotDataset now splits itself across ranks/workers (`_ddp_shard_plan`), so
         # dispatching would ALSO re-split the already-split stream, leaving each rank with 1/N².
-        accelerator = Accelerator(
+        accelerator_cls = Accelerator
+        device_kwargs = {}
+        if str(cfg.trainable_config.device).split(":", 1)[0] == "ada":
+            from lerobot.utils.ada import AdaSingleDeviceAccelerator
+
+            accelerator_cls = AdaSingleDeviceAccelerator
+            device_kwargs["device"] = str(cfg.trainable_config.device)
+        accelerator = accelerator_cls(
             step_scheduler_with_optimizer=False,
             mixed_precision=mixed_precision,
             kwargs_handlers=[ddp_kwargs],
             cpu=force_cpu,
             dataloader_config=DataLoaderConfiguration(dispatch_batches=False),
+            **device_kwargs,
         )
 
     init_logging(accelerator=accelerator)
