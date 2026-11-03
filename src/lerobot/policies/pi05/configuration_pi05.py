@@ -79,6 +79,7 @@ class PI05Config(PreTrainedConfig):
 
     # Training settings
     gradient_checkpointing: bool = False  # Enable gradient checkpointing for memory optimization
+    attention_implementation: str = "eager"  # Options: eager, sdpa
     npu_fused_geglu: bool = False  # Fuse Gemma GELU(tanh) and gating, including backward, on NPU
     npu_fused_rms_norm: bool = True  # Fold RMSNorm into torch_npu.npu_rms_norm on NPU
     npu_fused_attention: bool = True  # Use torch_npu.npu_fusion_attention instead of eager attention
@@ -149,6 +150,9 @@ class PI05Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+
+        if self.attention_implementation not in ("eager", "sdpa"):
+            raise ValueError(f"Invalid attention_implementation: {self.attention_implementation}")
 
         # VLM MLP FP8 validations
         if self.vlm_mlp_fp8_format not in ["hybrid", "e4m3"]:

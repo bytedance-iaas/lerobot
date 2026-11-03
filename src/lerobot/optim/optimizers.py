@@ -98,6 +98,15 @@ class AdamConfig(OptimizerConfig):
         return torch.optim.Adam(params, **kwargs)
 
 
+def _restore_ada2s_adamw_dispatch(optimizer: torch.optim.Optimizer, state_dict: dict) -> dict:
+    """Keep automatic device dispatch when loading older unfused checkpoints."""
+    # Set these before load_state_dict moves step buffers to the parameter device.
+    return {
+        **state_dict,
+        "param_groups": [{**group, "fused": True, "foreach": False} for group in state_dict["param_groups"]],
+    }
+
+
 @OptimizerConfig.register_subclass("adamw")
 @dataclass
 class AdamWConfig(OptimizerConfig):
@@ -121,6 +130,23 @@ class AdamWConfig(OptimizerConfig):
         allow_npu_fused = kwargs.pop("allow_npu_fused")
         optimizer = torch.optim.AdamW(params, **kwargs)
         devices = {parameter.device.type for group in optimizer.param_groups for parameter in group["params"]}
+        if devices == {"ada"}:
+            from lerobot.utils.device_utils import is_ada2s_device
+
+            if all(
+                is_ada2s_device(parameter.device)
+                for group in optimizer.param_groups
+                for parameter in group["params"]
+            ):
+                logging.info("Using Ada2S fused AdamW")
+                # Existing parameter groups already contain fused=None, which
+                # overrides the new optimizer's constructor defaults.
+                for group in optimizer.param_groups:
+                    group["fused"] = True
+                    group["foreach"] = False
+                ada_optimizer = torch.optim.AdamW(optimizer.param_groups, **kwargs, fused=True, foreach=False)
+                ada_optimizer.register_load_state_dict_pre_hook(_restore_ada2s_adamw_dispatch)
+                return ada_optimizer
         if not allow_npu_fused:
             return optimizer
         if devices == {"npu"} and is_npu_fused_adamw_available():

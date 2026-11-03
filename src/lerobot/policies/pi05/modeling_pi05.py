@@ -59,6 +59,7 @@ from lerobot.utils.constants import (
     OBS_LANGUAGE_TOKENS,
     OPENPI_ATTENTION_MASK_VALUE,
 )
+from lerobot.utils.device_utils import is_ada2s_device
 
 from ..pi_te_fp8 import (
     StateDictLoadError,
@@ -70,6 +71,7 @@ from ..pi_te_fp8 import (
 )
 from ..pretrained import PreTrainedPolicy, T
 from ..rtc.modeling_rtc import RTCProcessor
+from .attention import sdpa_attention_forward
 from .configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
 from .rope import RotaryCache, apply_rotary_pos_emb_npu, cached_rotary_embeddings
 
@@ -252,6 +254,7 @@ def compute_layer_complete(
     inputs_embeds, attention_mask, position_ids, adarms_cond, layers, rotary_emb,
     rotary_cache: RotaryCache | None = None, npu_fused_rope: bool = False,
     npu_fused_attention: bool = True,
+    attention_implementation: str = "eager",
 ):
     query_states = []
     key_states = []
@@ -284,7 +287,11 @@ def compute_layer_complete(
             dtype=query_states.dtype,
         )
         cos, sin = rotary_emb(dummy_tensor, position_ids)
-    if npu_fused_rope:
+    if is_ada2s_device(query_states.device):
+        from .ada_ops import rotary
+
+        query_states, key_states = rotary(query_states, key_states, cos, sin)
+    elif npu_fused_rope:
         query_states, key_states = apply_rotary_pos_emb_npu(query_states, key_states, cos, sin)
     else:
         query_states, key_states = modeling_gemma.apply_rotary_pos_emb(
@@ -294,7 +301,11 @@ def compute_layer_complete(
     paligemma_layer = layers[0]
     scaling = paligemma_layer.self_attn.scaling
     # Attention computation
-    if torch_npu is not None and query_states.device.type == "npu" and npu_fused_attention:
+    if is_ada2s_device(query_states.device) or attention_implementation == "sdpa":
+        att_output, _ = sdpa_attention_forward(
+            paligemma_layer.self_attn, query_states, key_states, value_states, attention_mask, scaling
+        )
+    elif torch_npu is not None and query_states.device.type == "npu" and npu_fused_attention:
         # npu_fusion_attention handles grouped-query attention natively, so the single
         # key/value head is not expanded to 8 here. Its atten_mask marks the positions
         # to drop, which is the inverse of the additive mask the eager path adds in.
@@ -419,6 +430,10 @@ class PaliGemmaWithExpertModel(
         self.reuse_rope_embeddings = getattr(config, "reuse_rope_embeddings", False)
         self.npu_fused_rope = getattr(config, "npu_fused_rope", False)
         self.npu_fused_attention = getattr(config, "npu_fused_attention", True)
+        self.attention_implementation = getattr(config, "attention_implementation", "eager")
+        if is_ada2s_device(getattr(config, "device", None)):
+            self.attention_implementation = "sdpa"
+            self.reuse_rope_embeddings = True
         npu_fused_rms_norm = getattr(config, "npu_fused_rms_norm", True)
 
         # VLM MLP FP8 (Transformer Engine). Recipe is built once here; the swap happens after
@@ -471,8 +486,20 @@ class PaliGemmaWithExpertModel(
         self.gemma_expert = PiGemmaForCausalLM(config=action_expert_config_hf)
         self.gemma_expert.model.embed_tokens = None
 
+        if self.attention_implementation == "sdpa":
+            from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+            ALL_ATTENTION_FUNCTIONS.register("lerobot_sdpa", sdpa_attention_forward)
+            self.paligemma.model.language_model.config._attn_implementation = "lerobot_sdpa"
+            self.gemma_expert.model.config._attn_implementation = "lerobot_sdpa"
+
         self.to_bfloat16_for_selected_params(precision)
         self._set_requires_grad()
+
+        if is_ada2s_device(getattr(config, "device", None)):
+            from .ada_ops import configure_ada2s_model
+
+            configure_ada2s_model(self)
 
         # Fuse VLM language-model MLPs into te.LayerNormMLP for FP8 (no-op unless enabled).
         # Runs AFTER to_bfloat16_for_selected_params so weights are copied in their final dtype.
@@ -616,6 +643,7 @@ class PaliGemmaWithExpertModel(
                             rotary_cache=rotary_cache,
                             npu_fused_rope=self.npu_fused_rope,
                             npu_fused_attention=self.npu_fused_attention,
+                            attention_implementation=self.attention_implementation,
                         )
                     else:
                         inputs_embeds = compute_layer_complete(
@@ -628,6 +656,7 @@ class PaliGemmaWithExpertModel(
                             rotary_cache=rotary_cache,
                             npu_fused_rope=self.npu_fused_rope,
                             npu_fused_attention=self.npu_fused_attention,
+                            attention_implementation=self.attention_implementation,
                         )
 
             # final norm
@@ -1070,7 +1099,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = (
+            "lerobot_sdpa" if self.paligemma_with_expert.attention_implementation == "sdpa" else "eager"
+        )  # noqa: SLF001
 
         _, past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
@@ -1140,7 +1171,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
-        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
+        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = (
+            "lerobot_sdpa" if self.paligemma_with_expert.attention_implementation == "sdpa" else "eager"
+        )  # noqa: SLF001
 
         past_key_values = clone_past_key_values(past_key_values)
         outputs_embeds, _ = self.paligemma_with_expert.forward(

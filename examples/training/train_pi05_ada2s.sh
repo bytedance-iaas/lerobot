@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Run inside the ada2s_compute container with the ada2s branch installed.
+# Run inside an Ada container with the ada2s branch installed.
 set -euo pipefail
 
-run_root="${ADA2S_RUN_ROOT:-/workspace/ada2s-training-20261030}"
+run_root="${ADA2S_RUN_ROOT:-/workspace/ada2s-newimage-20261030}"
 steps="${STEPS:-20}"
 if [[ ! "${steps}" =~ ^[1-9][0-9]*$ ]]; then
     printf 'STEPS must be a positive integer\n' >&2
@@ -24,6 +24,9 @@ export ADAX_RT_USE_TSIM_MODE=0
 export ADAX_VISIBLE_DEVICES="${ADAX_VISIBLE_DEVICES:-0}"
 export TRITON_ADA_ARCH=s
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+if [[ -z "${CXX:-}" ]] && [[ -x /usr/local/llvm-adax/bin/clang++ ]]; then
+    export CXX=/usr/local/llvm-adax/bin/clang++
+fi
 
 test -s "${run_root}/pi05-base/model.safetensors"
 test -f "${run_root}/pusht/meta/info.json"

@@ -24,6 +24,7 @@ try:  # optional: Ascend NPU fused kernels
 except ImportError:
     torch_npu = None
 
+from lerobot.utils.device_utils import is_ada2s_device
 from lerobot.utils.import_utils import _transformers_available
 
 if TYPE_CHECKING or _transformers_available:
@@ -68,6 +69,10 @@ def _gated_residual(
         return x if x is not None else y
     if gate is None:
         return x + y
+    if is_ada2s_device(x.device):
+        from .pi05.ada_ops import gated_residual
+
+        return gated_residual(x, y, gate)
     return x + y * gate
 
 
@@ -127,6 +132,10 @@ class PiGemmaRMSNorm(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         dtype = x.dtype
         if cond is None or self.dense is None:
+            if is_ada2s_device(x.device):
+                from .pi05.ada_ops import rms_norm
+
+                return rms_norm(x, 1.0 + self.weight.float(), self.eps), None
             if torch_npu is not None and x.device.type == "npu" and self.use_npu_fused:
                 # npu_rms_norm folds square-mean, rsqrt and the gamma multiply into one kernel.
                 gamma = (1.0 + self.weight.float()).to(dtype)
@@ -135,7 +144,13 @@ class PiGemmaRMSNorm(nn.Module):
             return normed.type_as(x), None
         if cond.shape[-1] != self.cond_dim:
             raise ValueError(f"Expected cond dim {self.cond_dim}, got {cond.shape[-1]}")
-        normed = self._norm(x)
+        if is_ada2s_device(x.device):
+            from .pi05.ada_ops import rms_norm
+
+            # Adaptive scale/shift are applied in FP32 before the output cast.
+            normed = rms_norm(x.float(), None, self.eps)
+        else:
+            normed = self._norm(x)
         modulation = self.dense(cond)
         if len(x.shape) == 3:
             modulation = modulation.unsqueeze(1)

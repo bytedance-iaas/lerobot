@@ -15,8 +15,19 @@
 # limitations under the License.
 
 import logging
+from functools import cache
 
 import torch
+
+
+@cache
+def is_ada2s_device(device: str | torch.device | None) -> bool:
+    """Identify Ada2S from runtime hardware properties, without an environment toggle."""
+    if device is None or str(device).split(":", 1)[0] != "ada":
+        return False
+    dev = torch.device(device)
+    properties = torch.ada.get_device_properties(dev.index or 0)
+    return properties.major == 2 and properties.name.startswith("accel_adas")
 
 
 def _ada_available() -> bool:

@@ -59,7 +59,7 @@ from lerobot.optim.grad_clip import clip_grad_norm_npu_
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
 from lerobot.rewards import make_reward_pre_post_processors
 from lerobot.utils.collate import lerobot_collate_fn
-from lerobot.utils.device_utils import accelerator_module
+from lerobot.utils.device_utils import accelerator_module, is_ada2s_device
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
@@ -324,6 +324,9 @@ def update_policy(
 
     # Use accelerator's backward method
     accelerator.backward(loss)
+    if is_ada2s_device(accelerator.device):
+        # Finish Ada backward work before computing the global gradient norm.
+        backend.synchronize()
 
     # Clip gradients if specified
     if grad_clip_norm > 0:
@@ -336,6 +339,9 @@ def update_policy(
         )
 
     # Optimizer step
+    if is_ada2s_device(accelerator.device):
+        # Complete gradient scaling before the fused optimizer reads its buffers.
+        backend.synchronize()
     with lock if lock is not None else nullcontext():
         optimizer.step()
 
