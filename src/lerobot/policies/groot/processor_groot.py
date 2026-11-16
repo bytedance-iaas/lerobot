@@ -1428,10 +1428,16 @@ def _groot_image_processor_cls() -> type:
                         min_pixels=size.shortest_edge,
                         max_pixels=size.longest_edge,
                     )
+                    # Since transformers 5.22 the base `resize` runs `smart_resize` itself, so it
+                    # takes the processor's own size dict (shortest_edge/longest_edge) plus the
+                    # factor, not a resolved height/width. Given the same inputs it lands on the
+                    # `resized_height`/`resized_width` computed above, which the grid math below
+                    # still needs.
                     stacked = self.resize(
-                        image=stacked,
-                        size=SizeDict(height=resized_height, width=resized_width),
+                        images=stacked,
+                        size=size,
                         resample=kwargs["resample"],
+                        factor=patch_size * merge_size,
                     )
                 resized_grouped[shape] = stacked
             resized_images = reorder_images(resized_grouped, index)
