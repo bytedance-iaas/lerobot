@@ -2,7 +2,7 @@
 
 本控制台在标准 [LeRobot](https://github.com/huggingface/lerobot) 之上，把「云端 GPU × 远端机器人 × 对象存储数据 × AI Agent 运维」这套组合搬进一个浏览器页面：既增强了 LeRobot 本身，也让训练 / 评估 / 遥操作的日常操作可以对着 Agent 聊天完成。
 
-**基线版本**：LeRobot **v0.6.0**
+**基线版本**：LeRobot **v0.7.0**
 
 **增强后的 LeRobot 开源代码**（含下述所有增强）：[bytedance-iaas/lerobot @ release\_v1](https://github.com/bytedance-iaas/lerobot/tree/release_v1)。
 
@@ -118,6 +118,8 @@ LiveKit 服务端配置：信令 `7880/TCP`、rtc `7881/TCP`、媒体 `7882/UDP`
 
 ### 2.1 远程本体 × 远程推理 · WebRTC 接入 async_inference（零改代码）
 
+> **v0.7.0 变更**：社区在 v0.7.0 把 `lerobot/async_inference/` 整体换成了 `lerobot/remote_inference/` + Zenoh 传输，`python -m lerobot.async_inference.policy_server` 这个入口已不存在，改为 `lerobot-policy-server`（配置由 `ServerConfig` 描述，传输走 `ZenohTransport`）。本节的拓扑和「零改代码」结论仍然成立——客户端依旧通过 `make_robot_from_config` 构造机器人，`--robot.type=webrtc_proxy` 照常可选——但下面的命令行需要按新入口调整。两者的分工见 [§2.2](#22-webrtc_proxy-和社区-remote-server-的分工)。
+
 上面的 LiveKit 远程把**机器人本体**搬到了远端；LeRobot 的 `async_inference` 则把**策略推理**搬到远端（机器人只发观测、收回成块的动作 `action chunk`，推理延迟由动作队列吸收，不打断执行）。这两件事是**正交的**，可以叠加——而且**不用改任何代码**就能把「被 WebRTC 代理的远端机器人」交给一个 policy server 驱动。
 
 原因：`RobotClient` 用标准工厂 `make_robot_from_config(config.robot)` 构造机器人，而工厂**原生支持** `--robot.type=webrtc_proxy`（`WebRTCProxyRobot` 实现了完整 `Robot` 接口，其 observation/action schema 与 `so_follower` 完全一致：`<motor>.pos` 浮点 + 每路相机 `HxWx3`）。于是拓扑变成：
@@ -181,6 +183,26 @@ python src/lerobot/async_inference/robot_client.py \
 **延迟注意：** PolicyServer 的推理延迟被 async_inference 的动作队列吸收（这正是它和逐帧遥操作相比的优势），但 **LiveKit 取观测那一跳仍在环里**（`WebRTCProxyRobot.send_action` 内含 `timeout=2.0`，链路卡超过 2s 会抛）。网络差时调大 `--chunk_size_threshold` 留足缓冲。
 
 > 一句话选型：要**人在环的遥操作 / 数据采集 / 实时视频**，用上面的 §2 遥操作路径；要**纯策略的远程推理部署**，用本节的 async_inference 路径——动作块机制天生比逐帧 WebRTC 更抗延迟。
+
+### 2.2 `webrtc_proxy` 和社区 remote server 的分工
+
+v0.7.0 带来了社区自己的远程方案，于是仓库里同时存在三样听起来都像「远程」的东西。它们解决的是不同的问题，**不互相替代**，所以我们的 `webrtc_proxy` 继续保留。
+
+| | 搬到远端的是什么 | 传输 | 视频 | 寻址 |
+|-|-|-|-|-|
+| 社区 `remote_inference`（v0.7.0 新增） | 策略推理 | Zenoh pub/sub | 每步一帧 JPEG，打进 MessagePack 消息 | 显式 endpoint 或 router 地址 |
+| 我们的 `webrtc_proxy` | 机器人本体 | WebRTC（LiveKit） | 编码后的连续视频流 | NAT 穿透，两端都不需要公网地址 |
+| 我们的 `RemoteEnv`（`services.proto`） | 仿真环境 | gRPC streaming | 不涉及 | 显式 host:port |
+
+三点实质区别：
+
+**寻址。** 社区方案要求客户端能直接连到 server 的 endpoint，或双方都连得上同一个 router。我们的场景是「一台放在办公室 NAT 后面的 Mac 接着真机，云上 GPU 来驱动它」——两端都没有公网地址，这正是 WebRTC 打洞要解决的事。
+
+**视频。** 社区方案把每一步的观测图像当作消息负载逐帧 JPEG 编码（单条消息上限 32 MB）。这对「观测 → 动作」的推理回路够用，但多路相机做人在环遥操作或数据采集时，逐帧编码既吃带宽也不好做帧同步；WebRTC 走的是编码后的连续视频流。
+
+**设备控制面。** `webrtc_proxy` 的 Mac 侧 daemon 还提供 `list_cameras` / `list_ports` / `find_port` —— 远程枚举和挑选真机上的摄像头与串口。社区的 remote server 只管「喂观测、收动作」，没有这一层。
+
+一句话选型：**要远程推理，用社区的 `remote_inference`**；**要把一台 NAT 后面的真机整体搬到云上用（遥操作、采数据、实时视频）**，用 `webrtc_proxy`；两者可以叠加，见 §2.1。
 
 ### 3. fp8（float8）训练 · NVIDIA TransformerEngine
 

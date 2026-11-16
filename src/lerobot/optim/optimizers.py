@@ -15,6 +15,7 @@
 # limitations under the License.
 import abc
 import logging
+import os
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -126,6 +127,11 @@ class AdamWConfig(OptimizerConfig):
         kwargs = asdict(self)
         kwargs.pop("grad_clip_norm")
         allow_npu_fused = kwargs.pop("allow_npu_fused")
+        # Benchmark-only escape hatch: reproducing a pre-fused-AdamW baseline needs the plain
+        # torch update on NPU, which no config field reaches. Unset -- the default -- changes
+        # nothing.
+        if os.environ.get("LEROBOT_DISABLE_NPU_FUSED_ADAMW") == "1":
+            allow_npu_fused = False
         # torch's own `fused` flag selects its CUDA/CPU foreach-fused AdamW. Ascend's kernel is a
         # separate implementation that does not take it, so it is popped here and handed only to
         # torch.optim.AdamW.

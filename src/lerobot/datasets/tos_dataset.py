@@ -22,14 +22,13 @@ per-provider code:
 1. **metadata** — the small ``meta/`` tree is mirrored to a local dir via fsspec and handed to
    the parent as ``root``, so the stock metadata path runs unchanged (a few MB; ``data/`` and
    ``videos/`` are never downloaded).
-2. **low-dim data** — overrides the parent's ``_load_hf_dataset`` seam:
-   ``load_dataset("parquet", data_files="<url>/data/*/*.parquet", storage_options=…,
-   streaming=True)`` streams the parquet shards over fsspec, plus the ``episodes`` filter.
-3. **video** — overrides the parent's ``_get_video_path`` seam to return the full ``<url>/…mp4``
-   fsspec URL; lerobot's decoder opens it with ``fsspec.open(...)`` and lets torchcodec
-   range-read it (frame-accurate — verified bit-exact vs the non-streaming reader).
+2. **payload** — the TOS URL is handed to the parent as ``data_root``. ``StorageLocation`` parses
+   any non-Hub URI as ``FSSPEC`` and picks the generic fsspec byte-range reader, so the parent's
+   own per-episode parquet reads and MP4 range reads go straight at ``tos://`` with no override
+   here. The MP4 sidecar is built and cached locally (it is never uploaded), so a read-only
+   bucket is fine.
 
-Everything else — shuffle buffer, sharding, delta-timestamp windows, per-item construction — is
+Everything else — episode sharding, shuffle, delta-timestamp windows, per-item construction — is
 inherited from the parent. Credentials come from ``TOS_ACCESS_KEY`` / ``TOS_SECRET_KEY`` (plus optional
 ``TOS_SESSION_TOKEN`` for STS temporary credentials, and ``TOS_ENDPOINT`` / ``TOS_REGION``);
 pass ``storage_options`` to override. Install
@@ -49,9 +48,7 @@ from __future__ import annotations
 import os
 import tempfile
 
-import datasets
 import fsspec
-from datasets import load_dataset
 
 from .streaming_dataset import StreamingLeRobotDataset
 
@@ -125,9 +122,10 @@ class StreamingTOSRobotDataset(StreamingLeRobotDataset):
         # repo_id is only a label (metadata comes from the mirrored meta/); derive from the URL.
         repo_id = repo_id or (self._rpath.rsplit("/", 1)[-1] or "dataset")
         # Mirror meta/ locally and hand it to the parent as `root`: the stock metadata,
-        # version-check, delta-timestamp and shuffle/shard setup then run unchanged. The
-        # parent's data loading goes through the `_load_hf_dataset` seam overridden below.
+        # version-check, delta-timestamp and shard setup then run unchanged. `data_root` keeps
+        # every payload read (parquet and MP4 byte ranges) pointed at TOS, over fsspec.
         meta_root = self._mirror_meta(meta_cache_dir, repo_id)
+        kwargs.setdefault("data_root", self._url)
         super().__init__(repo_id, root=meta_root, **kwargs)
 
     # ---- metadata mirror -------------------------------------------------
@@ -145,23 +143,3 @@ class StreamingTOSRobotDataset(StreamingLeRobotDataset):
                 f"no meta/info.json under {self._url}/meta — is this a LeRobot v3.0 dataset on TOS?"
             )
         return dst
-
-    # ---- low-dim data: stream the parquet shards off the backend ---------
-    def _load_hf_dataset(self) -> datasets.IterableDataset:
-        ds = load_dataset(
-            "parquet",
-            data_files=f"{self._url}/data/*/*.parquet",
-            storage_options=self.storage_options,
-            split="train",
-            streaming=True,
-        )
-        if self.episodes is not None:
-            keep = {int(e) for e in self.episodes}
-            # the parent ignores `episodes` when streaming; apply a lazy per-frame filter here.
-            ds = ds.filter(lambda x: int(x["episode_index"]) in keep)
-        return ds
-
-    # ---- video: decoded straight off fsspec (no download) ----------------
-    def _get_video_path(self, ep_idx: int, video_key: str) -> str:
-        # lerobot's decoder opens this with fsspec.open(...) and lets torchcodec range-read it.
-        return f"{self._url}/{self.meta.get_video_file_path(ep_idx, video_key)}"

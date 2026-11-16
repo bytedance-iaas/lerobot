@@ -16,6 +16,7 @@
 
 import builtins
 import logging
+import os
 from collections import deque
 from collections.abc import Callable
 from contextlib import nullcontext
@@ -218,9 +219,7 @@ def _joint_attention(
         # the additive mask the eager path adds in.
         atten_mask = (
             (attention_mask < -1e30)
-            .expand(
-                query_states.shape[0], 1, query_states.shape[2], attention_mask.shape[-1]
-            )
+            .expand(query_states.shape[0], 1, query_states.shape[2], attention_mask.shape[-1])
             .contiguous()
         )
         return torch_npu.npu_fusion_attention(
@@ -331,7 +330,13 @@ def compute_layer_complete(
         if attention_fn is not None:
             return attention_fn(paligemma_layer.self_attn, query, key, value, mask, scaling, part)
         return _joint_attention(
-            paligemma_layer.self_attn, query, key, value, mask, scaling, fp32_attention,
+            paligemma_layer.self_attn,
+            query,
+            key,
+            value,
+            mask,
+            scaling,
+            fp32_attention,
             npu_fused_attention=npu_fused_attention,
         )
 
@@ -467,7 +472,9 @@ class PaliGemmaWithExpertModel(
         # the model is materialized in its final dtype (see below). All no-ops unless enabled.
         # The VLM has plain RMSNorm (foldable); the action expert (adaRMS) stays bf16.
         self._vlm_mlp_fp8_config = config
-        self.vlm_mlp_fp8_enable = getattr(config, "vlm_mlp_fp8_enable", False) if config is not None else False
+        self.vlm_mlp_fp8_enable = (
+            getattr(config, "vlm_mlp_fp8_enable", False) if config is not None else False
+        )
         self.vlm_mlp_fp8_recipe = build_vlm_mlp_fp8_recipe(config)
         self.vlm_mlp_quant_inference = (
             getattr(config, "vlm_mlp_quant_inference", True) if config is not None else True
@@ -634,9 +641,7 @@ class PaliGemmaWithExpertModel(
         if inputs_embeds[1] is None:
             # Standalone VLM prefill runs the fused te.LayerNormMLP layers, so it needs the
             # FP8 autocast too (no-op when FP8 disabled or eval + quant_inference=False).
-            with vlm_mlp_fp8_autocast(
-                self._vlm_mlp_fp8_config, self.vlm_mlp_fp8_recipe, self.training
-            ):
+            with vlm_mlp_fp8_autocast(self._vlm_mlp_fp8_config, self.vlm_mlp_fp8_recipe, self.training):
                 prefix_output = self.paligemma.model.language_model.forward(
                     inputs_embeds=inputs_embeds[0],
                     attention_mask=attention_mask,
@@ -666,7 +671,7 @@ class PaliGemmaWithExpertModel(
             rotary_emb = self.paligemma.model.language_model.rotary_emb
             # A new cache per forward prevents stale positions across batches and
             # stays attached to the correct forward during checkpoint recomputation.
-            rotary_cache = {} if self.reuse_rope_embeddings else None
+            rotary_cache: RotaryCache | None = {} if self.reuse_rope_embeddings else None
 
             # Check if gradient checkpointing is enabled for any of the models
             use_gradient_checkpointing = (
@@ -678,9 +683,7 @@ class PaliGemmaWithExpertModel(
             # Process all layers with gradient checkpointing if enabled.
             # Hoist the TE FP8 autocast outside the layer loop so the fused VLM te.LayerNormMLP
             # calls quantize (no-op when FP8 disabled or eval + quant_inference=False).
-            with vlm_mlp_fp8_autocast(
-                self._vlm_mlp_fp8_config, self.vlm_mlp_fp8_recipe, self.training
-            ):
+            with vlm_mlp_fp8_autocast(self._vlm_mlp_fp8_config, self.vlm_mlp_fp8_recipe, self.training):
                 for layers in zip(paligemma_layers, gemma_expert_layers, strict=True):
                     if use_gradient_checkpointing:
                         inputs_embeds = torch.utils.checkpoint.checkpoint(
@@ -944,9 +947,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         in_fwd += 2.0 * (self._matmul_params(self.time_mlp_in) + self._matmul_params(self.time_mlp_out))
         in_mult = 3.0 if self._trainable(self.action_in_proj) else 1.0
         out_fwd = 2.0 * self._matmul_params(self.action_out_proj) * suffix
-        out_mult = (
-            3.0 if self._trainable(self.action_out_proj) else (2.0 if upstream_trains else 1.0)
-        )
+        out_mult = 3.0 if self._trainable(self.action_out_proj) else (2.0 if upstream_trains else 1.0)
         parts["action heads"] = in_fwd * in_mult + out_fwd * out_mult
 
         parts["total"] = sum(parts.values())
@@ -1184,9 +1185,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         # The decoder layers inside forward_func are already checkpointed one by one
         # (see PaliGemmaWithExpertModel.forward), so wrapping the whole stack a second
         # time only buys a third forward pass per step at no memory saving.
-        suffix_out = forward_func(
-            prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
-        )
+        #
+        # Benchmark-only: the published 950PR baseline predates that fix, so reproducing its
+        # step time needs the redundant wrap back. Unset -- the default -- changes nothing.
+        if os.environ.get("LEROBOT_PI05_REDUNDANT_OUTER_CKPT") == "1":
+            suffix_out = self._apply_checkpoint(
+                forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+            )
+        else:
+            suffix_out = forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond)
 
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)

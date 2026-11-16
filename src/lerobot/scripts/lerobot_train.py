@@ -180,6 +180,7 @@ def _preprocess_dataset_batch(
     batch = rename_batch_keys(batch, rename_map)
     return preprocessor(batch)
 
+
 class _NullProfiler:
     """Stand-in used when profiling is off, so the loop needs no conditional."""
 
@@ -364,7 +365,6 @@ def update_policy(
     lock: AbstractContextManager[Any] | None = None,
     sample_weighter: SampleWeighter | None = None,
     ema: EMA | None = None,
-    npu_fused_grad_clip: bool = False,
 ) -> tuple[MetricsTracker, dict | None]:
     """
     Performs a single training step to update the policy's weights.
@@ -395,8 +395,6 @@ def update_policy(
             per-sample loss weighting. Defaults to None.
         ema (EMA | None, optional): The EMA of the policy weights, stepped after every applied
             optimizer update. Defaults to None.
-        npu_fused_grad_clip (bool, optional): Kept for compatibility and ignored; the clip helper
-            selects its fused path itself, only for compatible NPU tensors. Defaults to False.
 
     Returns:
         tuple[MetricsTracker, dict | None]: The updated MetricsTracker with new statistics for this
@@ -1095,7 +1093,6 @@ def train(cfg: TrainPipelineConfig) -> None:
             lr_scheduler=lr_scheduler,
             sample_weighter=sample_weighter,
             ema=ema,
-            npu_fused_grad_clip=cfg.npu_fused_grad_clip,
         )
         step_duration = time.perf_counter() - step_start
         train_tracker.step_s = step_duration
