@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from lerobot.policies.common.qwen2vl_npu import patch_qwen2vl_patchify
 from lerobot.utils.import_utils import _transformers_available, require_package
 
 if TYPE_CHECKING or _transformers_available:
@@ -67,6 +68,9 @@ def load_latent_world_processor(
     """Load and configure the Qwen processor described by a portable spec."""
     require_package("transformers", extra="lawam")
     processor = AutoProcessor.from_pretrained(spec.model_id)
+    # Upstream's Qwen2-VL patchify expands to nine dimensions, one more than CANN's copy op
+    # accepts, so without this every preprocessing call raises on an Ascend device.
+    patch_qwen2vl_patchify(processor)
     return configure_latent_world_processor(
         processor,
         placeholder_token=spec.placeholder_token,
