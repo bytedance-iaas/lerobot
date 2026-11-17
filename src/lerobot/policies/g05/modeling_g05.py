@@ -764,6 +764,42 @@ class G05NativeBackend(nn.Module):
         batch_frames, channels, height, width = images.shape
         grid_h, grid_w = height // patch_size, width // patch_size
         temporal = images.unsqueeze(2).expand(-1, -1, temporal_patch_size, -1, -1)
+        if images.device.type == "npu":
+            # The nine-dimensional reshape below copies, and CANN's `aclnnInplaceCopy` takes at
+            # most eight ("The self tensor cannot be larger than 8 dimensions"), so on an Ascend
+            # device it raises. These two passes never exceed eight and, verified element for
+            # element against the branch below, produce the identical tensor.
+            #
+            # Pass one keeps the (temporal, channel) pair the reshape above yields fused, which
+            # is what costs the ninth axis; pass two splits it and moves `channels` in front of
+            # `temporal`, which is what the permutation does.
+            fused = temporal.reshape(
+                batch_frames,
+                temporal_patch_size * channels,
+                grid_h // merge_size,
+                merge_size,
+                patch_size,
+                grid_w // merge_size,
+                merge_size,
+                patch_size,
+            )
+            patches = fused.permute(0, 2, 5, 3, 6, 1, 4, 7).reshape(
+                batch_frames * grid_h * grid_w,
+                temporal_patch_size * channels,
+                patch_size,
+                patch_size,
+            )
+            return (
+                patches.reshape(
+                    batch_frames * grid_h * grid_w,
+                    temporal_patch_size,
+                    channels,
+                    patch_size,
+                    patch_size,
+                )
+                .permute(0, 2, 1, 3, 4)
+                .reshape(batch_frames * grid_h * grid_w, -1)
+            )
         return (
             temporal.reshape(
                 batch_frames,
