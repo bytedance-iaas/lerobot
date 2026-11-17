@@ -30,6 +30,7 @@ from torchvision.transforms.v2.functional import resize as tv_resize
 
 from lerobot.configs import FeatureType, PipelineFeatureType, PolicyFeature
 from lerobot.lerobot_types import TransitionKey
+from lerobot.policies.common.qwen2vl_npu import patch_qwen2vl_patchify
 from lerobot.processor import (
     AbsoluteActionsProcessorStep,
     PolicyAction,
@@ -228,6 +229,9 @@ class LingbotVLAV2ImageProcessorStep(ProcessorStep):
             max_pixels=self.image_max_pixels,
             min_pixels=self.image_min_pixels,
         )
+        # Upstream's Qwen2-VL patchify expands to nine dimensions, one more than CANN's copy op
+        # accepts, so without this every preprocessing call raises on an Ascend device.
+        patch_qwen2vl_patchify(self._image_processor)
 
     def __call__(self, transition):
         transition = transition.copy()
