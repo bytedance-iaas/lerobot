@@ -123,10 +123,18 @@ ENV PIP_INDEX_URL=${PIP_INDEX} \
 # which actually hosts the files in China -- the same reason pyproject.toml's `pytorch-cu128`
 # index points there. `--find-links` and not `--index-url` because the mirror is a directory
 # listing, not a PEP 503 index; the regular index stays available for pillow and numpy.
+#
+# The check below reads the installed version instead of importing torchvision, because
+# `import torch` cannot work during a build on this base: torch auto-loads the torch_npu
+# backend, torch_npu needs libascend_hal.so, and that lives in the host driver which is
+# mounted at run time and absent here. What matters at build time is which wheel landed --
+# a plain `torchvision` would be the CUDA build and must fail the step.
 ARG TORCHVISION_FIND_LINKS=https://mirrors.aliyun.com/pytorch-wheels/cpu/
 RUN pip install --no-cache-dir --find-links "${TORCHVISION_FIND_LINKS}" \
         'torchvision==0.25.0+cpu' \
- && python3 -c "import torchvision, torch; print('torchvision', torchvision.__version__, '| torch', torch.__version__)"
+ && v=$(python3 -c "import importlib.metadata as m; print(m.version('torchvision'))") \
+ && echo "torchvision installed: $v" \
+ && case "$v" in *+cpu) ;; *) echo "expected a +cpu build, got $v" >&2; exit 1 ;; esac
 
 # Freeze the base image's torch stack into a pip constraint before installing anything.
 # lerobot asks for `torch>=2.7,<2.16.0`, which the CPU build already satisfies -- but any
