@@ -59,9 +59,12 @@ from transformers.models.dinov2.modeling_dinov2 import Dinov2Layer
 
 # arch: (hidden size, depth, heads), DINOv2 /14 with a 518 px (37 x 37) position grid
 DINOV2_ARCHS = {"dinov2_vitb14": (768, 12, 12), "dinov2_vitl14": (1024, 24, 16)}
+# transformers 5.22 flattened `Dinov2Layer`'s attention: the three projections moved from
+# `attention.attention.{query,key,value}` to `attention.{q,k,v}_proj` and the output from
+# `attention.output.dense` to `attention.o_proj`. The layer scales kept their names.
 DINOV2_BLOCK_KEYS = {
-    "attn.qkv": ("attention.attention.query", "attention.attention.key", "attention.attention.value"),
-    "attn.proj": "attention.output.dense",
+    "attn.qkv": ("attention.q_proj", "attention.k_proj", "attention.v_proj"),
+    "attn.proj": "attention.o_proj",
     "ls1.gamma": "layer_scale1.lambda1",
     "ls2.gamma": "layer_scale2.lambda1",
 }
