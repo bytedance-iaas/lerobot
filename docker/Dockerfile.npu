@@ -116,12 +116,29 @@ ENV PIP_CONSTRAINT=/etc/pip-torch-constraints.txt
 WORKDIR /lerobot
 COPY . .
 
-# draccus first, from the fallback index, for the same reason as gym-hil below: v0.7.0 raised
-# the floor to 0.11.6 and the Volcengine mirror stops at 0.11.5, which makes the pin
-# unsatisfiable and fails the install step outright. Installing it here leaves it already
-# satisfied for the big install, so that step still queries a single index and keeps its
-# 34 s instead of the 938 s a global --extra-index-url cost.
-RUN pip install --no-cache-dir --extra-index-url "${PIP_EXTRA_INDEX}" 'draccus>=0.11.6,<0.12.0'
+# The packages whose floor the Volcengine mirror cannot satisfy, installed first and from the
+# fallback index, for the same reason as gym-hil below. v0.7.0 raised several floors past that
+# mirror's snapshot (it has draccus 0.11.5 but no 0.11.6, filelock 3.29.4 but no 4.x), and a
+# lagging mirror makes the pin unsatisfiable and fails the install outright.
+#
+# The list is every direct or extra dependency whose floor was published after that snapshot,
+# which is inferred from the two versions the mirror was observed to be missing rather than
+# measured against the mirror itself. So it may name a package the mirror actually carries --
+# harmless, since both indexes mirror the same upstream and pip then just installs the same
+# version from either.
+#
+# Installing them here leaves them already satisfied for the big install, so that step still
+# queries a single index and keeps its 34 s instead of the 938 s a global --extra-index-url
+# cost. Add to this line when a new floor outruns the mirror; the symptom is always
+# "Could not find a version that satisfies the requirement <pkg>" with the mirror's highest
+# version listed just below the floor.
+RUN pip install --no-cache-dir --extra-index-url "${PIP_EXTRA_INDEX}" \
+        'draccus>=0.11.6,<0.12.0' \
+        'filelock>=4.2.1,<5.0.0' \
+        'huggingface-hub>=1.31.0' \
+        'transformers>=5.22.0,<5.23.0' \
+        'trackio>=0.44.0' \
+        'gym-pusht>=0.1.8'
 
 RUN pip install --no-cache-dir -e ".[${LEROBOT_EXTRAS}]"
 
