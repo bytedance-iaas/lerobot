@@ -116,6 +116,13 @@ ENV PIP_CONSTRAINT=/etc/pip-torch-constraints.txt
 WORKDIR /lerobot
 COPY . .
 
+# draccus first, from the fallback index, for the same reason as gym-hil below: v0.7.0 raised
+# the floor to 0.11.6 and the Volcengine mirror stops at 0.11.5, which makes the pin
+# unsatisfiable and fails the install step outright. Installing it here leaves it already
+# satisfied for the big install, so that step still queries a single index and keeps its
+# 34 s instead of the 938 s a global --extra-index-url cost.
+RUN pip install --no-cache-dir --extra-index-url "${PIP_EXTRA_INDEX}" 'draccus>=0.11.6,<0.12.0'
+
 RUN pip install --no-cache-dir -e ".[${LEROBOT_EXTRAS}]"
 
 # The SAC / HIL-SERL simulator, installed on its own rather than via the `hilserl` extra so
