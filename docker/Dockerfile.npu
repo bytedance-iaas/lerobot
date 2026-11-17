@@ -46,10 +46,18 @@
 # is mounted from the host, so that pairing is a real precondition, not a formality.
 #
 # Replaces quay.io/ascend/vllm-ascend:v0.23.0-a5 (CANN 9.1), which was only ever used as a
-# CANN+torch_npu base -- nothing here depended on vLLM. In CN, pull through a mirror:
-#   docker pull m.daocloud.io/quay.io/ascend/torch-npu:2.10.0.post7-cann9.2.0-950-ubuntu22.04-py3.12
-ARG BASE_IMAGE=quay.io/ascend/torch-npu:2.10.0.post7-cann9.2.0-950-ubuntu22.04-py3.12
-FROM ${BASE_IMAGE}
+# CANN+torch_npu base -- nothing here depended on vLLM.
+#
+# The default goes through the daocloud mirror because quay.io is not reachable from the CN
+# builders; outside CN, strip the `m.daocloud.io/` prefix.
+#
+# The arg is NOT called BASE_IMAGE: the CI pipeline that builds this file passes
+# `--build-arg BASE_IMAGE=...vllm-ascend:v0.23.0-a5` (CANN 9.1), and a --build-arg overrides
+# an ARG default silently, so every "CANN 9.2" image built under that name was in fact 9.1.
+# Naming the arg something the pipeline does not pass makes the version in this file the one
+# that ships. Override it explicitly with --build-arg ASCEND_BASE_IMAGE=.
+ARG ASCEND_BASE_IMAGE=m.daocloud.io/quay.io/ascend/torch-npu:2.10.0.post7-cann9.2.0-950-ubuntu22.04-py3.12
+FROM ${ASCEND_BASE_IMAGE}
 
 # Extras to install. The default covers the policies that have been exercised on NPU; add
 # your own with --build-arg. Deliberately excluded:
@@ -141,7 +149,7 @@ RUN pip install --no-cache-dir --find-links "${TORCHVISION_FIND_LINKS}" \
 # extra that nudges the resolver is one CUDA wheel away from replacing it, and torch_npu
 # then refuses to load against the mismatched ABI. The constraint makes that impossible
 # rather than merely unlikely. Generated, not hardcoded, so it stays correct when
-# BASE_IMAGE is bumped.
+# ASCEND_BASE_IMAGE is bumped.
 #
 # This is also why the install below uses pip and not `uv sync`: `[tool.uv.sources]` in
 # pyproject.toml points torchvision at the pytorch-cu128 index on Linux. pip ignores that
@@ -218,7 +226,7 @@ RUN pip install --no-cache-dir --extra-index-url "${PIP_EXTRA_INDEX}" 'gym-hil>=
 # worth having, neither is a different order of magnitude. The reason to pin rather than
 # uninstall is the failure mode above, not throughput.
 #
-# Derived rather than hardcoded so it stays correct when BASE_IMAGE moves. The 2.X <-> 0.X
+# Derived rather than hardcoded so it stays correct when ASCEND_BASE_IMAGE moves. The 2.X <-> 0.X
 # rule holds from torch 2.9 onwards; if a future base predates that, this fails loudly at
 # build time, which is the point.
 #
