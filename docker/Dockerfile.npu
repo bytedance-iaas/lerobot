@@ -41,7 +41,9 @@ FROM ${BASE_IMAGE}
 #   - `all`      : drags in hardware/webrtc stacks that no NPU trainer needs.
 #   - `hilserl`  : pulls placo (real-robot kinematics). SAC in simulation does not use it;
 #                  gym-hil is installed directly below instead.
-ARG LEROBOT_EXTRAS=dataset,training,transformers-dep,peft,diffusion,pi,smolvla,groot,eo1,evo1,xvla,wallx,molmoact2,multi_task_dit,lingbot_va,vla_jepa,fastwam,dreamzero,pusht
+#   - `flux3`    : its video VAE imports NATTEN, which publishes CUDA wheels only. The policy
+#                  cannot run on an Ascend device at all, so installing it buys nothing.
+ARG LEROBOT_EXTRAS=dataset,training,transformers-dep,peft,diffusion,pi,smolvla,groot,eo1,evo1,xvla,wallx,molmoact2,multi_task_dit,lingbot_va,vla_jepa,fastwam,dreamzero,pusht,cosmos3,dm05,fineart_vla,g05,lawam,longwam,wall_oss_05
 
 ENV DEBIAN_FRONTEND=noninteractive \
     # MuJoCo has to render the camera observations offscreen. EGL is not an option on an
