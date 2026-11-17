@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# lerobot on Ascend NPU (Atlas 800 / 950PR, CANN 9.1).
+# lerobot on Ascend NPU (Atlas 800 / 950PR, CANN 9.2).
 #
 #   docker build -f docker/Dockerfile.npu -t lerobot-npu .
 #
@@ -29,11 +29,26 @@
 # The HF endpoint is likewise not set here — which mirror to use is per-site knowledge, and
 # hardcoding it into the image makes the image lie about where weights come from.
 
-# The Ascend vLLM image is the only widely published base that ships CANN, a matching
-# torch_npu and a CPU-built torch in one place. We use it purely as a CANN+torch_npu base;
-# nothing here depends on vLLM. In CN, pull it through a mirror:
-#   docker pull m.daocloud.io/quay.io/ascend/vllm-ascend:v0.23.0-a5
-ARG BASE_IMAGE=quay.io/ascend/vllm-ascend:v0.23.0-a5
+# Ascend's own torch_npu image: CANN plus a matching torch_npu on a CPU-built torch, and
+# nothing else. The tag encodes all four axes that have to line up --
+# `<torch>.post<N>-cann<ver>-<SoC>-<os>-py<ver>`:
+#
+#   - `-950-`        : the SoC this is built for. The other branches (910b, 310p, a3) ship
+#                      kernels for different hardware.
+#   - `-ubuntu22.04-`: apt-based, which the system-package step below needs. The openeuler
+#                      tags are dnf and would need that step rewritten.
+#   - `2.10.0`       : held at the torch minor the policies here were validated against, so
+#                      a CANN bump moves one variable and not two. The tags also offer 2.11
+#                      and 2.12, both inside lerobot's `torch>=2.7,<2.16.0`.
+#
+# Verified on a 950PR against host driver 25.7.rc1.9: torch.npu available, a bf16 matmul,
+# a ConvTranspose2d forward and a backward all run. CANN ships in the image but the driver
+# is mounted from the host, so that pairing is a real precondition, not a formality.
+#
+# Replaces quay.io/ascend/vllm-ascend:v0.23.0-a5 (CANN 9.1), which was only ever used as a
+# CANN+torch_npu base -- nothing here depended on vLLM. In CN, pull through a mirror:
+#   docker pull m.daocloud.io/quay.io/ascend/torch-npu:2.10.0.post7-cann9.2.0-950-ubuntu22.04-py3.12
+ARG BASE_IMAGE=quay.io/ascend/torch-npu:2.10.0.post7-cann9.2.0-950-ubuntu22.04-py3.12
 FROM ${BASE_IMAGE}
 
 # Extras to install. The default covers the policies that have been exercised on NPU; add
@@ -97,8 +112,24 @@ ENV PIP_INDEX_URL=${PIP_INDEX} \
     PIP_TRUSTED_HOST="${PIP_HOST} ${PIP_EXTRA_HOST}" \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
+# torchvision is a hard dependency (`torchvision>=0.22.0,<0.30.0`) that this base image does
+# not ship, unlike the vLLM one it replaces. Left to the extras install it would come from
+# PyPI, whose linux torchvision wheels are CUDA builds -- unusable on an Ascend device and a
+# CUDA torch away from breaking torch_npu's ABI. So it is installed here, explicitly, from a
+# CPU-wheel index, and BEFORE the constraint below so the constraint pins it too.
+#
+# 0.25.x is the release built against torch 2.10 (0.26 pairs with 2.11), the same version the
+# previous base image carried. The index is Aliyun's flat mirror of download.pytorch.org,
+# which actually hosts the files in China -- the same reason pyproject.toml's `pytorch-cu128`
+# index points there. `--find-links` and not `--index-url` because the mirror is a directory
+# listing, not a PEP 503 index; the regular index stays available for pillow and numpy.
+ARG TORCHVISION_FIND_LINKS=https://mirrors.aliyun.com/pytorch-wheels/cpu/
+RUN pip install --no-cache-dir --find-links "${TORCHVISION_FIND_LINKS}" \
+        'torchvision==0.25.0+cpu' \
+ && python3 -c "import torchvision, torch; print('torchvision', torchvision.__version__, '| torch', torch.__version__)"
+
 # Freeze the base image's torch stack into a pip constraint before installing anything.
-# lerobot asks for `torch>=2.7,<2.12`, which the CPU build already satisfies -- but any
+# lerobot asks for `torch>=2.7,<2.16.0`, which the CPU build already satisfies -- but any
 # extra that nudges the resolver is one CUDA wheel away from replacing it, and torch_npu
 # then refuses to load against the mismatched ABI. The constraint makes that impossible
 # rather than merely unlikely. Generated, not hardcoded, so it stays correct when
