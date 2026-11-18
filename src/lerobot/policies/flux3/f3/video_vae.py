@@ -31,14 +31,24 @@ import torch.nn.functional as F  # noqa: N812
 from safetensors.torch import load_file
 from torch import Tensor
 
-from lerobot.utils.import_utils import _natten_available, require_package
+from lerobot.utils.import_utils import _natten_available
 
 from ..utils import resolve_weights
+from .neighborhood_torch import na2d_torch, na3d_torch
 from .positional import prc_vid, scatter_ids, times_to_ids
 
 if TYPE_CHECKING or _natten_available:
     from natten import backends as nb
     from natten.functional import na2d, na3d
+
+# Device types NATTEN will actually run on. Its own backend ladder ends at `flex-fna`, which
+# `can_run_flex_attention` refuses for anything else -- an Ascend NPU included -- so the
+# fallback in neighborhood_torch is what runs there. See that module for the semantics.
+_NATTEN_DEVICES = frozenset({"cuda", "cpu"})
+
+
+def _use_natten(x: Tensor) -> bool:
+    return _natten_available and x.device.type in _NATTEN_DEVICES
 
 logger = logging.getLogger(__name__)
 
@@ -370,14 +380,17 @@ class Natten3D(nn.Module):
 
         if t == 1:
             q2, k2, v2 = q.squeeze(1), k.squeeze(1), v.squeeze(1)
-            out = na2d(
-                q2,
-                k2,
-                v2,
-                kernel_size=self.window_size[1:],
-                attention_kwargs=_natten_attention_kwargs(q2, k2, v2),
-            ).unsqueeze(1)
-        else:
+            if _use_natten(q2):
+                out = na2d(
+                    q2,
+                    k2,
+                    v2,
+                    kernel_size=self.window_size[1:],
+                    attention_kwargs=_natten_attention_kwargs(q2, k2, v2),
+                ).unsqueeze(1)
+            else:
+                out = na2d_torch(q2, k2, v2, kernel_size=self.window_size[1:]).unsqueeze(1)
+        elif _use_natten(q):
             out = na3d(
                 q,
                 k,
@@ -385,6 +398,14 @@ class Natten3D(nn.Module):
                 is_causal=[self.causal, False, False],
                 kernel_size=self.window_size,
                 attention_kwargs=_natten_attention_kwargs(q, k, v),
+            )
+        else:
+            out = na3d_torch(
+                q,
+                k,
+                v,
+                kernel_size=self.window_size,
+                is_causal=[self.causal, False, False],
             )
         out = out.reshape(b, t, h, w, c)
         return self.proj(out)
@@ -996,15 +1017,10 @@ def load_video_vae(
 
     ``weights``: ``None`` -> random init (shapes only, for wiring tests), a ``.safetensors`` file, a
     distributed-checkpoint directory (``.metadata`` + ``__*.distcp``), or a Hub ``repo_id[:filename]``
-    (default filename ``video_vae.safetensors``). Requires NATTEN to construct the model.
+    (default filename ``video_vae.safetensors``). NATTEN is used for the neighborhood attention
+    where it runs; elsewhere, and on devices it refuses, the plain-PyTorch equivalent in
+    ``neighborhood_torch`` is used instead, which costs speed and memory but needs no kernels.
     """
-    try:
-        require_package("natten", "flux3")
-    except ImportError as e:
-        raise ImportError(
-            "The FLUX3 video VAE requires NATTEN. Install a torch/CUDA-matched wheel from "
-            "https://whl.natten.org; see docs/source/flux3.mdx."
-        ) from e
     params = ViTNormInferenceParams(
         use_compile=compile_model,
         compile_decoder=compile_model,

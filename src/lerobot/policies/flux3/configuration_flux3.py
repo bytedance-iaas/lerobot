@@ -355,6 +355,11 @@ class Flux3Config(PreTrainedConfig):
             if not -self.action_dim <= d < self.action_dim:
                 raise ValueError(f"gripper_flip_dims entry {d} outside the action dim {self.action_dim}")
 
+    def _beta2_survives_param_dtype(self) -> bool:
+        """Whether beta2 is still below 1 once rounded to the dtype the parameters train in."""
+        dtype = self.dtype or torch.float32
+        return float(torch.tensor(self.optimizer_betas[1], dtype=dtype)) < 1.0
+
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
             lr=self.optimizer_lr,
@@ -362,6 +367,14 @@ class Flux3Config(PreTrainedConfig):
             eps=self.optimizer_eps,
             weight_decay=self.optimizer_weight_decay,
             grad_clip_norm=self.optimizer_grad_clip_norm,
+            # Ascend's fused ApplyAdamW takes its scalars in the parameter dtype, and FLUX3
+            # trains in bfloat16, which has no value between 0.99609375 and 1.0. The default
+            # beta2 of 0.999 therefore reaches the kernel as exactly 1.0, the second-moment
+            # bias correction divides by zero, and the loss is NaN from the second step on --
+            # measured on a 950PR, where disabling this is the only difference between NaN and
+            # a finite loss. The test is the rounding itself rather than the dtype, so a beta2
+            # the parameter dtype can hold -- or a float32 run -- keeps the fused path.
+            allow_npu_fused=self._beta2_survives_param_dtype(),
         )
 
     def get_scheduler_preset(self) -> FrozenWarmupConstantSchedulerConfig:
