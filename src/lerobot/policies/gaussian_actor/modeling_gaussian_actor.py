@@ -42,6 +42,7 @@ class GaussianActorPolicy(
     def __init__(
         self,
         config: GaussianActorConfig | None = None,
+        **kwargs,
     ) -> None:
         if config is None:
             # Same error PreTrainedPolicy.__init__ raises, kept for the legacy no-argument constructor.

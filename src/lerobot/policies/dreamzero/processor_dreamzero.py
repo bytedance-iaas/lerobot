@@ -50,6 +50,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from lerobot.lerobot_types import EnvTransition, TransitionKey
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
@@ -62,7 +63,6 @@ from lerobot.processor import (
     transition_to_policy_action,
 )
 from lerobot.processor.relative_action_processor import to_absolute_actions, to_relative_actions
-from lerobot.types import EnvTransition, TransitionKey
 from lerobot.utils.constants import (
     OBS_IMAGE,
     OBS_IMAGES,
