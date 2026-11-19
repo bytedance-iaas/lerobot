@@ -60,7 +60,10 @@ class ImagePrepProcessorStep(ObservationProcessorStep):
     def observation(self, observation: dict) -> dict:
         new_observation = dict(observation)
         for key in observation:
-            if "image" not in key:
+            # The dataset reader emits a `<key>_is_pad` flag beside every delta-timestamp
+            # window, so a substring match on "image" also catches `observation.image_is_pad`
+            # -- a 1-D bool tensor, which has no channel axis to read.
+            if "image" not in key or "_is_pad" in key:
                 continue
             image = observation[key].float()
             if self.expand_channels and image.shape[-3] == 1:
@@ -88,7 +91,7 @@ class ImagePrepProcessorStep(ObservationProcessorStep):
 
     def transform_features(self, features):
         for key in features[PipelineFeatureType.OBSERVATION]:
-            if "image" not in key:
+            if "image" not in key or "_is_pad" in key:
                 continue
             feat = features[PipelineFeatureType.OBSERVATION][key]
             # Match `to_pixel_values`: only a single channel is expanded to 3.
