@@ -49,6 +49,7 @@ from safetensors.torch import load_file
 from torch import Tensor
 from torch.nn import CrossEntropyLoss
 
+from lerobot.policies.common.qwen2vl_npu import patch_qwen2vl_patchify
 from lerobot.utils.constants import ACTION, MESSAGES_RENDERED
 from lerobot.utils.import_utils import (
     _wallx_deps_available,
@@ -341,6 +342,8 @@ class Qwen2_5_VLMoEForAction(Qwen2_5_VLForConditionalGeneration):  # noqa: N801
             revision=revision,
             use_fast=True,
         )
+        # See processor_wall_x: CANN's copy op caps at eight dimensions.
+        patch_qwen2vl_patchify(processor)
         if action_tokenizer_path is not None:
             action_tokenizer = AutoProcessor.from_pretrained(action_tokenizer_path, trust_remote_code=True)
             processor.action_processor = action_tokenizer

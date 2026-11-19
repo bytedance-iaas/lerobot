@@ -23,6 +23,7 @@ import torch
 
 from lerobot.configs import PipelineFeatureType, PolicyFeature
 from lerobot.lerobot_types import EnvTransition, TransitionKey
+from lerobot.policies.common.qwen2vl_npu import patch_qwen2vl_patchify
 from lerobot.processor import (
     ComplementaryDataProcessorStep,
     PolicyAction,
@@ -391,6 +392,9 @@ class WallXTokenizerStep(ProcessorStep):
                 revision=self.processor_revision,
                 use_fast=True,
             )
+            # Upstream's Qwen2-VL patchify expands to nine dimensions, one more than CANN's
+            # copy op accepts, so without this every preprocessing call raises on Ascend.
+            patch_qwen2vl_patchify(self._processor)
             if self.use_fast_tokenizer:
                 if self.action_tokenizer_name is None:
                     raise ValueError("Fast WALL-X tokenization requires action_tokenizer_name.")
