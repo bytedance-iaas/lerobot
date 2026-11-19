@@ -53,9 +53,13 @@ try:
 except ImportError:  # torch<2.10
     _varlen_attn = None
 
-_VARLEN_USES_WINDOW_SIZE = (
-    _varlen_attn is not None and "window_size" in inspect.signature(_varlen_attn).parameters
+_VARLEN_SIGNATURE_PARAMS = (
+    frozenset(inspect.signature(_varlen_attn).parameters) if _varlen_attn is not None else frozenset()
 )
+_VARLEN_USES_WINDOW_SIZE = "window_size" in _VARLEN_SIGNATURE_PARAMS
+# Stable PyTorch 2.10 dropped `scale` along with `window_size`; it always applies
+# SDPA's default 1/sqrt(head_dim). Passing it anyway raises TypeError.
+_VARLEN_USES_SCALE = "scale" in _VARLEN_SIGNATURE_PARAMS
 
 
 VisionAttentionBackend = Literal["auto", "sdpa", "varlen"]
@@ -67,6 +71,17 @@ logger = logging.getLogger(__name__)
 @lru_cache
 def _log_resolved_backend(requested: str, resolved: str) -> None:
     logger.info("Wall-X vision attention backend: %s (requested: %s)", resolved, requested)
+
+
+@lru_cache
+def _warn_custom_scale_unsupported(scaling: float, default_scaling: float) -> None:
+    logger.warning(
+        "Wall-X vision attention falls back to SDPA: this torch.nn.attention.varlen takes no "
+        "`scale`, and the module's scaling %r differs from the 1/sqrt(head_dim) default %r it "
+        "would apply.",
+        scaling,
+        default_scaling,
+    )
 
 
 def _varlen_unavailable_reason(
@@ -164,14 +179,30 @@ class WallXVisionAttention(Qwen2_5_VLVisionAttention):
             sin,
         )
 
-        if cu_seqlens.dtype != torch.int32:
-            cu_seqlens = cu_seqlens.to(dtype=torch.int32)
-        max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
-        varlen_kwargs = {"scale": self.scaling}
+        varlen_kwargs: dict[str, Any] = {}
+        if _VARLEN_USES_SCALE:
+            varlen_kwargs["scale"] = self.scaling
+        else:
+            # No `scale` parameter means the kernel hard-codes SDPA's default. Only take the
+            # varlen path when that is the scale this module wanted; a mismatch would compute
+            # a different attention and still run to completion.
+            default_scaling = query_states.shape[-1] ** -0.5
+            if abs(self.scaling - default_scaling) > 1e-6 * max(default_scaling, 1.0):
+                _warn_custom_scale_unsupported(float(self.scaling), float(default_scaling))
+                return super().forward(
+                    hidden_states=hidden_states,
+                    cu_seqlens=cu_seqlens,
+                    position_embeddings=position_embeddings,
+                    **kwargs,
+                )
         if _VARLEN_USES_WINDOW_SIZE:
             varlen_kwargs["window_size"] = (-1, -1)
         else:  # Stable PyTorch 2.10 API; pre-release variants used window_size.
             varlen_kwargs["is_causal"] = False
+
+        if cu_seqlens.dtype != torch.int32:
+            cu_seqlens = cu_seqlens.to(dtype=torch.int32)
+        max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
         attn_output = _varlen_attn(
             query_states,
             key_states,
