@@ -29,7 +29,7 @@
 # build time with --build-arg DEPS_IMAGE=...
 # ⚠️ iaas-us, NOT ai-containers — see the note in lerobot-agent-console/Dockerfile. This image
 # exists on iaas-us only; the same blanket rename broke it the same way.
-ARG DEPS_IMAGE=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot-livekit-deps:a7ec31d3bd5065c01966cf3231b24a5083c94010
+ARG DEPS_IMAGE=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot-livekit-deps:76c6635d8c77e6bd90b36914c2134280b03e5221
 FROM ${DEPS_IMAGE}
 
 # The base already provides the venv (/lerobot/.venv), system deps, uv, WORKDIR /lerobot,
