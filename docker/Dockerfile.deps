@@ -158,6 +158,32 @@ RUN set -eux; \
     uv pip install --python "$PY" --default-index "$TE_PIP_INDEX" --no-cache onnxscript; \
     ln -sfn cuda_runtime "$NV/cuda_cudart"
 
+# NATTEN — neighborhood attention for flux3's Video VAE (src/lerobot/policies/flux3/f3/video_vae.py).
+# Same shape as the TE install above: CUDA-only, DELIBERATELY not in uv.lock, kept alive by
+# Dockerfile.user's `uv sync --inexact`.
+#
+# Why it can't go in pyproject.toml: the wheel's local version pins torch AND CUDA
+# (`+torch2100cu128`), so `uv sync` would fail to resolve on NPU, macOS and CPU. PyPI carries only
+# an sdist, which means compiling CUTLASS from source. Hence the vendor wheel index.
+#
+# Without it the policy still runs: `_natten_available` is False and f3/neighborhood_torch.py
+# computes the same thing in plain torch (checked pointwise against 0.21.6 — max abs diff 3e-07 for
+# na2d, 4e-07 for na3d), at a speed/memory cost. So this layer is a performance choice, not a
+# correctness one. Keep NATTEN_VERSION at the version that fallback was validated against.
+#
+# NATTEN_FIND_LINKS must match torch's version and CUDA minor (torch 2.10.0+cu128 → cu128/torch2.10.0).
+# It serves github.com release URLs; if the build cluster can't reach those, override it with a
+# mirror via --build-arg NATTEN_FIND_LINKS=... . --no-index keeps the pinned pypi.org default index
+# out of it (it only has the sdist).
+ARG NATTEN_VERSION=0.21.6
+ARG NATTEN_LOCAL=torch2100cu128
+ARG NATTEN_FIND_LINKS=https://whl.natten.org/cu128/torch2.10.0/index.html
+RUN set -eux; \
+    PY=/lerobot/.venv/bin/python; \
+    uv pip install --python "$PY" --no-cache --no-deps --no-index \
+        --find-links "$NATTEN_FIND_LINKS" "natten==${NATTEN_VERSION}+${NATTEN_LOCAL}"; \
+    "$PY" -c "import natten; print('natten', natten.__version__)"
+
 # KEEP the nvcc toolkit + assembled CUDA_HOME in the image (do NOT delete after the TE build) so the
 # dev pod is a full CUDA build environment for rebuilding/experimenting with TE in-pod. Costs a few
 # hundred MB; acceptable for these dev/console images.
