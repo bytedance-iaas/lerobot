@@ -55,6 +55,7 @@ import logging
 import os
 
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
@@ -105,16 +106,88 @@ def _loss(out):
     return out
 
 
-def _count(policy, batch):
-    """FLOPs of one forward+backward, total and by aten op."""
+_GEMM = {"mm", "addmm", "bmm", "baddbmm"}
+
+
+def _up(x: int, align: int) -> int:
+    return ((x + align - 1) // align) * align
+
+
+class _ShapeRecorder(TorchDispatchMode):
+    """Record every GEMM's real shape, and what the cube's alignment makes of it.
+
+    The Ascend profiler bills the padded work in `aic_cube_fops`, so a model whose
+    hardware FLOPs run far above its model FLOPs is paying for alignment -- but a profile
+    taken without `record_shapes` cannot say which operator does it. Reading the shapes
+    off the dispatcher answers that without a second profiling run.
+    """
+
+    def __init__(self, align: int = 16):
+        super().__init__()
+        self.align = align
+        self.seen: dict[tuple, list] = {}
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        name = func._schema.name.split("::")[-1]
+        if name in _GEMM:
+            t = [a for a in args if isinstance(a, torch.Tensor)]
+            # mm/bmm take (a, b); addmm/baddbmm take (bias, a, b).
+            off = 1 if name in ("addmm", "baddbmm") else 0
+            if len(t) >= off + 2:
+                a, b = t[off], t[off + 1]
+                if a.dim() == b.dim() and a.dim() in (2, 3):
+                    bb = a.shape[0] if a.dim() == 3 else 1
+                    m, k, n = a.shape[-2], a.shape[-1], b.shape[-1]
+                    model = 2.0 * bb * m * k * n
+                    pad = 2.0 * bb * _up(m, self.align) * _up(k, self.align) * _up(n, self.align)
+                    r = self.seen.setdefault((name, bb, m, k, n), [0, 0.0, 0.0])
+                    r[0] += 1
+                    r[1] += model
+                    r[2] += pad
+        return func(*args, **(kwargs or {}))
+
+
+def _count(policy, batch, shapes: bool = False):
+    """FLOPs of one forward+backward, total and by aten op; optionally GEMM shapes too."""
     from torch.utils.flop_counter import FlopCounterMode
 
     policy.zero_grad(set_to_none=True)
     counter = FlopCounterMode(display=False)
+    rec = _ShapeRecorder() if shapes else None
     with counter:
-        _loss(policy(batch)).backward()
+        if rec is not None:
+            with rec:
+                _loss(policy(batch)).backward()
+        else:
+            _loss(policy(batch)).backward()
     by_op = {str(op): v for op, v in counter.get_flop_counts()["Global"].items()}
-    return float(counter.get_total_flops()), by_op
+    return float(counter.get_total_flops()), by_op, (rec.seen if rec else None)
+
+
+def _report_shapes(seen: dict) -> None:
+    tm = sum(v[1] for v in seen.values())
+    tp = sum(v[2] for v in seen.values())
+    if not tm:
+        return
+    print(f"\nGEMM shapes: {len(seen)} distinct")
+    print(f"  model   {tm / TFLOP:8.3f} TFLOP/step")
+    print(f"  16-aligned {tp / TFLOP:8.3f} TFLOP/step  = {tp / tm:.2f}x model")
+    print(
+        f"\n{'op':<9}{'batch':>8}{'M':>9}{'K':>7}{'N':>7}{'calls':>6}"
+        f"{'model TF':>10}{'padded TF':>11}{'ratio':>7}"
+    )
+    def rows(order, label):
+        print(f"  -- top by {label} --")
+        for (name, bb, m, k, n), v in sorted(seen.items(), key=order)[:10]:
+            print(
+                f"{name:<9}{bb:>8}{m:>9}{k:>7}{n:>7}{v[0]:>6}"
+                f"{v[1] / TFLOP:>10.3f}{v[2] / TFLOP:>11.3f}{v[2] / v[1]:>7.1f}"
+            )
+
+    # Where the model's work actually is, and separately where alignment wastes it: a
+    # shape can dominate one ranking and be absent from the other.
+    rows(lambda kv: -kv[1][1], "model FLOPs")
+    rows(lambda kv: -(kv[1][2] - kv[1][1]), "alignment waste")
 
 
 @parser.wrap()
@@ -134,7 +207,8 @@ def main(cfg: TrainPipelineConfig) -> None:
     batch = _prepare(_one_batch(cfg, dataset), dataset.meta.camera_keys, cfg.rename_map, preprocessor)
     batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
 
-    total, by_op = _count(policy, batch)
+    want_shapes = os.environ.get("LEROBOT_FLOPS_SHAPES") == "1"
+    total, by_op, seen = _count(policy, batch, shapes=want_shapes)
 
     # Price the recompute separately when it is on, so the same run yields both an MFU
     # numerator (model work) and an HFU one (work the hardware ran). Policies that do not
@@ -143,7 +217,7 @@ def main(cfg: TrainPipelineConfig) -> None:
     if getattr(cfg.policy, "gradient_checkpointing", False):
         try:
             policy.gradient_checkpointing_disable()
-            model_total, _ = _count(policy, batch)
+            model_total, _, _ = _count(policy, batch)
             recompute = total - model_total
         except AttributeError:
             logging.warning(
@@ -175,6 +249,8 @@ def main(cfg: TrainPipelineConfig) -> None:
             out["hfu_pct"] = 100.0 * ((model_total + recompute) / float(step_s)) / (peak * TFLOP)
 
     print(json.dumps(out, indent=2))
+    if seen:
+        _report_shapes(seen)
 
 
 if __name__ == "__main__":
