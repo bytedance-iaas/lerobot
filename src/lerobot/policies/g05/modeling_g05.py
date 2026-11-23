@@ -82,6 +82,7 @@ from lerobot.policies.common.flow_matching import (
     sample_beta,
     sample_noise,
 )
+from lerobot.policies.common.qwen3_5_npu import patch_qwen3_5_delta_rule
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, PREDICTION
 from lerobot.utils.device_utils import resolve_safetensors_device
@@ -1819,6 +1820,9 @@ class G05Policy(PreTrainedPolicy):
         require_package("transformers", extra="g05")
         super().__init__(config)
         config.validate_features()
+        # The Qwen3.5 trunk's gated delta rule solves a triangular system twice per linear
+        # attention layer; CANN's solver makes that 54% of a training step's device time.
+        patch_qwen3_5_delta_rule(config.device)
         self.backend = backend if backend is not None else _native_backend(config, checkpoint_dir)
         self._action_queue: deque[Tensor] = deque()
 
