@@ -158,43 +158,6 @@ RUN set -eux; \
     uv pip install --python "$PY" --default-index "$TE_PIP_INDEX" --no-cache onnxscript; \
     ln -sfn cuda_runtime "$NV/cuda_cudart"
 
-# NATTEN — neighborhood attention for flux3's Video VAE (src/lerobot/policies/flux3/f3/video_vae.py).
-# Same shape as the TE install above: CUDA-only, DELIBERATELY not in uv.lock, kept alive by
-# Dockerfile.user's `uv sync --inexact`.
-#
-# Why it can't go in pyproject.toml: the wheel's local version pins torch AND CUDA
-# (`+torch2100cu128`), so `uv sync` would fail to resolve on NPU, macOS and CPU. PyPI carries only
-# an sdist, which means compiling CUTLASS from source. Hence the pinned vendor wheel below.
-#
-# Without it the policy still runs: `_natten_available` is False and f3/neighborhood_torch.py
-# computes the same thing in plain torch (checked pointwise against 0.21.6 — max abs diff 3e-07 for
-# na2d, 4e-07 for na3d), at a speed/memory cost. So this layer is a performance choice, not a
-# correctness one. Keep NATTEN_VERSION at the version that fallback was validated against.
-#
-# The wheel lives on github.com releases, which this build cluster CANNOT reach (it resolves
-# whl.natten.org's index fine, then times out on the release URL — CP run 3e59e97ab3bd). So: try
-# GitHub first, fall back to a mirror, and verify SHA256 either way. The mirror is therefore an
-# untrusted-but-verified transport, not a trusted source; a mirror serving anything else fails the
-# build. NATTEN_SHA256 is the digest GitHub's release API reports for this asset
-# (api.github.com/repos/SHI-Labs/NATTEN/releases/tags/v0.21.6) — re-read it when bumping the version.
-#
-# The wheel name encodes torch's version and CUDA minor, so all four of VERSION / LOCAL / PY tag /
-# SHA256 move together with torch (2.10.0+cu128 → torch2100cu128, cp312).
-ARG NATTEN_VERSION=0.21.6
-ARG NATTEN_LOCAL=torch2100cu128
-ARG NATTEN_WHEEL=natten-0.21.6+torch2100cu128-cp312-cp312-linux_x86_64.whl
-ARG NATTEN_SHA256=333cc930134481798625a5f9e0c4935c0f06ec0c428620f04f8702ccadeb7b36
-ARG NATTEN_URL=https://github.com/SHI-Labs/NATTEN/releases/download/v${NATTEN_VERSION}/natten-${NATTEN_VERSION}%2B${NATTEN_LOCAL}-cp312-cp312-linux_x86_64.whl
-ARG NATTEN_MIRROR_PREFIX=https://ghfast.top/
-RUN set -eux; \
-    PY=/lerobot/.venv/bin/python; W="/tmp/${NATTEN_WHEEL}"; \
-    curl -fSL --retry 3 --connect-timeout 20 --max-time 900 "$NATTEN_URL" -o "$W" \
-      || curl -fSL --retry 3 --connect-timeout 20 --max-time 900 "${NATTEN_MIRROR_PREFIX}${NATTEN_URL}" -o "$W"; \
-    echo "${NATTEN_SHA256}  $W" | sha256sum -c -; \
-    uv pip install --python "$PY" --no-cache --no-deps "$W"; \
-    rm -f "$W"; \
-    "$PY" -c "import natten; print('natten', natten.__version__)"
-
 # KEEP the nvcc toolkit + assembled CUDA_HOME in the image (do NOT delete after the TE build) so the
 # dev pod is a full CUDA build environment for rebuilding/experimenting with TE in-pod. Costs a few
 # hundred MB; acceptable for these dev/console images.

@@ -11,7 +11,7 @@
 # 1.6.x rejects zstd. The lerobot base images are gzip, so the console image is
 # gzip too.
 #   docker buildx build \
-#     --build-arg BASE_IMAGE=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot:<lerobot-tag> \
+#     --build-arg VARIANT=npu \
 #     --output type=image,name=<registry>/lerobot-agent-console:<tag>,push=true,compression=gzip,oci-mediatypes=true \
 #     .
 # ⚠️ iaas-us, NOT ai-containers. The base images live in one registry and the images built from
@@ -19,8 +19,27 @@
 # `oras manifest fetch`: physicalai/lerobot:18cd48ce exists on iaas-us only, and
 # physicalai/lerobot-agent-console exists on ai-containers only. A blanket registry rename put
 # this line on ai-containers and CI failed at FROM (run 957327e9).
-ARG BASE_IMAGE=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot:18cd48ce718176258aa1a685622f9933f1549a9e
-FROM ${BASE_IMAGE}
+# One console source, two accelerators. Both bases are OUR OWN lerobot images, whose tag is the
+# source commit and therefore changes on every build -- so they are pinned HERE, in git, where a
+# bump is a reviewable commit. CP has no API to create or update a pipeline, so anything carried
+# in the pipeline spec can only be changed by hand in the web console; the spec keeps only the
+# constant `VARIANT`. (Contrast `build-rlinf`, which passes its bases as build-args: those are
+# external images -- nvidia/cuda, quay.io ascend/cann -- that move a few times a year.)
+#
+# Only the selected stage is pulled; the other is resolved for its manifest and then dropped.
+ARG BASE_CUDA=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot:9ad89a575799840c97dc14d0ac2c1c28905993fc
+ARG BASE_NPU=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot-npu:a7ec31d3bd5065c01966cf3231b24a5083c94010
+ARG VARIANT=cuda
+
+FROM ${BASE_CUDA} AS base-cuda
+ARG BASE_CUDA
+ENV LEROBOT_IMAGE=${BASE_CUDA}
+
+FROM ${BASE_NPU} AS base-npu
+ARG BASE_NPU
+ENV LEROBOT_IMAGE=${BASE_NPU}
+
+FROM base-${VARIANT}
 
 # lerobot's Dockerfile.user ends with `USER user_lerobot` (non-root). The build
 # steps below need root (apt, /opt, pip into the venv), and the console runs as
@@ -269,15 +288,15 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh scripts/install_skill.sh
 # base image is at /lerobot). Do NOT set LEROBOT_HOME — that is lerobot's own reserved
 # cache var and lerobot 0.6.x HARD-ERRORS if it's set; server.py reads CONSOLE_WORKDIR.
 # LEROBOT_IMAGE records which base image this was built from — provenance for anyone inside the
-# container (`env | grep LEROBOT_IMAGE`), nothing reads it programmatically. CONSOLE_COMMIT is
-# gone with the version banner it fed: the pipeline never passed the build-arg, so it was always
-# "unknown" on screen. The deployed console's commit is its image tag, which the pipeline sets
-# from ${SCM_COMMIT_ID} and `kubectl get pod -o jsonpath='{.spec.containers[0].image}'` shows.
-ARG BASE_IMAGE
+# container (`env | grep LEROBOT_IMAGE`), nothing reads it programmatically. It is set by the
+# base stage selected above, so it names the cuda or npu image without a branch here.
+# CONSOLE_COMMIT is gone with the version banner it fed, and this Dockerfile no longer declares
+# the ARG — a pipeline still passing it gets a buildkit warning and nothing else. The deployed
+# console's commit is its image tag, which the pipeline sets from ${SCM_COMMIT_ID} and
+# `kubectl get pod -o jsonpath='{.spec.containers[0].image}'` shows.
 ENV PORT=8080 \
     CONSOLE_WORKDIR=/lerobot \
-    HERMES_CHAT_SKILL=robot_sft \
-    LEROBOT_IMAGE=${BASE_IMAGE}
+    HERMES_CHAT_SKILL=robot_sft
 
 # Auto-activate the lerobot uv venv in interactive login shells. The console terminal spawns
 # `bash -l`, whose /etc/profile hardcodes PATH and drops /lerobot/.venv/bin — so `python`
