@@ -27,8 +27,8 @@
 # external images -- nvidia/cuda, quay.io ascend/cann -- that move a few times a year.)
 #
 # Only the selected stage is pulled; the other is resolved for its manifest and then dropped.
-ARG BASE_CUDA=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot:9ad89a575799840c97dc14d0ac2c1c28905993fc
-ARG BASE_NPU=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot-npu:a7ec31d3bd5065c01966cf3231b24a5083c94010
+ARG BASE_CUDA=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot:a90e5073a989a87f772e4e47b0047f37d89dd1f4
+ARG BASE_NPU=iaas-us-cn-beijing.cr.volces.com/physicalai/lerobot-npu:a90e5073a989a87f772e4e47b0047f37d89dd1f4
 ARG VARIANT=cuda
 
 FROM ${BASE_CUDA} AS base-cuda
