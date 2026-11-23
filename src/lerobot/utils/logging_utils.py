@@ -19,6 +19,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
+from .device_utils import accelerator_module, auto_select_torch_device
 from .utils import format_big_number
 
 _VALID_REDUCTIONS = ("none", "max", "mean", "sum")
@@ -221,11 +222,13 @@ class MetricsTracker:
         if not buckets:
             return
 
-        device = (
-            torch.device("cuda", torch.cuda.current_device())
-            if torch.cuda.is_available()
-            else torch.device("cpu")
-        )
+        # The collective has to run on the accelerator, not on CPU: HCCL (and NCCL) register no
+        # CPU backend, so a CPU tensor here fails with "No backend type associated with device
+        # type cpu" at the first logged step of every multi-rank run. Asking `torch.cuda` alone
+        # left every non-CUDA accelerator on that path.
+        dev = auto_select_torch_device()
+        mod = accelerator_module(dev)
+        device = torch.device(dev.type, mod.current_device()) if mod is not None else dev
         reduce_ops = {
             "mean": dist.ReduceOp.AVG,
             "sum": dist.ReduceOp.SUM,
