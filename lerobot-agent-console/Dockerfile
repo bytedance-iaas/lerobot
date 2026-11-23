@@ -157,13 +157,29 @@ RUN command -v uv >/dev/null 2>&1 || python -m pip install --no-cache-dir uv \
     && ln -sf /opt/hermes/.venv/bin/hermes /usr/local/bin/hermes \
     && hermes acp --check
 
-# --- the console app + its (tiny) deps into the lerobot venv --------------- #
-# The lerobot venv (uv venv) has no `pip`, and `python` resolves to it (on PATH),
-# so install with uv targeting that venv. (CMD runs `python server.py` there.)
+# --- the console app + its (tiny) deps into the base's python -------------- #
 # `tosfs` registers the tos:// fsspec protocol so StreamingTOSRobotDataset can
 # stream a dataset from Volcengine TOS — bake it in so a fresh pod never needs a
-# runtime `uv pip install tosfs` (the venv is in the image layer, not the PVC).
-RUN VIRTUAL_ENV=/lerobot/.venv uv pip install --native-tls --no-cache-dir "aiohttp>=3.9" "pyyaml>=6" tosfs
+# runtime install (the site-packages is in the image layer, not the PVC).
+#
+# The two bases put lerobot in different interpreters, so the target is chosen from
+# what the base actually has instead of being assumed:
+#   cuda (Dockerfile.user) — `uv sync` into /lerobot/.venv. That venv has no `pip`, and
+#                            `python` resolves to it via PATH, so install through uv.
+#   npu  (Dockerfile.npu)  — `pip install -e .` into the image's system python, because
+#                            torch_npu is preinstalled there and a fresh venv would not
+#                            see it. There is no /lerobot/.venv and `uv` is not on PATH
+#                            until the hermes step above installs it. Verified on
+#                            lerobot-npu:236b14dd: python and pip resolve to
+#                            /usr/local/python3.12.15/bin, and /lerobot/.venv is absent.
+# Assuming the venv is what broke the first npu console build (run c2766b2a):
+#   "Python interpreter not found at `/lerobot/.venv/bin/python`".
+RUN if [ -x /lerobot/.venv/bin/python ]; then \
+      VIRTUAL_ENV=/lerobot/.venv uv pip install --native-tls --no-cache-dir \
+        "aiohttp>=3.9" "pyyaml>=6" tosfs; \
+    else \
+      pip install --no-cache-dir "aiohttp>=3.9" "pyyaml>=6" tosfs; \
+    fi
 WORKDIR /opt/agent-console
 COPY server.py ./
 COPY static ./static
