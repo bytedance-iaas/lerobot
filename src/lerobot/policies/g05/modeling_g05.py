@@ -85,7 +85,11 @@ from lerobot.policies.common.flow_matching import (
 from lerobot.policies.common.qwen3_5_npu import patch_qwen3_5_delta_rule
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, PREDICTION
-from lerobot.utils.device_utils import resolve_safetensors_device
+from lerobot.utils.device_utils import (
+    accelerator_module,
+    is_amp_available,
+    resolve_safetensors_device,
+)
 
 from .action_codec_g05 import G05NativeActionCodec, g05_codec_parts
 from .configuration_g05 import (
@@ -1922,10 +1926,15 @@ class G05Policy(PreTrainedPolicy):
 
         result = super().to(*args, **kwargs)
         explicit_dtype = "dtype" in kwargs or any(isinstance(arg, torch.dtype | Tensor) for arg in args)
+        # Any accelerator, not CUDA alone. This gate is what applies the author's released
+        # precision -- BF16 weights with the FP32 islands of `apply_fp32_params` restored -- so
+        # excluding Ascend left every parameter in FP32 there. Measured on a 950PR at bs8, that
+        # put 83% of device time in `aclnnMatmul`/`aclnnAddmm` running at 16.3 TFLOP/s, which is
+        # 70% of this machine's FP32 GEMM ceiling and 4.6% of its BF16 one.
         if (
             self.config.dtype == torch.bfloat16
             and not explicit_dtype
-            and next(self.backend.parameters()).device.type == "cuda"
+            and accelerator_module(next(self.backend.parameters()).device) is not None
         ):
             self._apply_author_inference_precision()
         if self.backend.action_tokenizer is not None:
@@ -1965,7 +1974,12 @@ class G05Policy(PreTrainedPolicy):
         with torch.autocast(
             device_type=device.type,
             dtype=torch.bfloat16,
-            enabled=self.config.dtype == torch.bfloat16 and device.type == "cuda",
+            # `is_amp_available`, not a CUDA literal: autocast works on Ascend through
+            # torch_npu, and an `enabled=False` here does not merely decline to cast -- it
+            # suppresses an outer autocast too, so this line was also what made
+            # `--accelerator.mixed_precision=bf16` a no-op on NPU. The FP32 config still
+            # disables it deliberately, on every backend, as before.
+            enabled=self.config.dtype == torch.bfloat16 and is_amp_available(device.type),
         ):
             result = self.backend.predict_action(prepared)
         action = result["ar_action"] if self.config.action_head == "actioncodec" else result[ACTION]
@@ -2038,7 +2052,12 @@ class G05Policy(PreTrainedPolicy):
         with torch.autocast(
             device_type=device.type,
             dtype=torch.bfloat16,
-            enabled=self.config.dtype == torch.bfloat16 and device.type == "cuda",
+            # `is_amp_available`, not a CUDA literal: autocast works on Ascend through
+            # torch_npu, and an `enabled=False` here does not merely decline to cast -- it
+            # suppresses an outer autocast too, so this line was also what made
+            # `--accelerator.mixed_precision=bf16` a no-op on NPU. The FP32 config still
+            # disables it deliberately, on every backend, as before.
+            enabled=self.config.dtype == torch.bfloat16 and is_amp_available(device.type),
         ):
             loss, loss_dict = self.backend(prepared)
         logging_values = {
