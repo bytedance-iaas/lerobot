@@ -1806,6 +1806,17 @@ def _first_cot_text(metadata: Mapping[str, Any]) -> str | None:
     return None
 
 
+def _bf16_recipe_applies(device: torch.device) -> bool:
+    """True where G0.5's released BF16 precision applies: an accelerator whose autocast does BF16.
+
+    CUDA, as before, plus Ascend. CPU is excluded on purpose: `is_amp_available` admits it and
+    torch's CPU autocast does implement BF16, but this recipe exists to make a 5B trunk fit and
+    run on an accelerator, and leaving CPU on FP32 keeps the behaviour it had. MPS has no BF16
+    autocast at all, which `is_amp_available` is what reports.
+    """
+    return accelerator_module(device) is not None and is_amp_available(device.type)
+
+
 class G05Policy(PreTrainedPolicy):
     """LeRobot policy surface for G0.5's unified CoT and action stream."""
 
@@ -1934,7 +1945,7 @@ class G05Policy(PreTrainedPolicy):
         if (
             self.config.dtype == torch.bfloat16
             and not explicit_dtype
-            and accelerator_module(next(self.backend.parameters()).device) is not None
+            and _bf16_recipe_applies(next(self.backend.parameters()).device)
         ):
             self._apply_author_inference_precision()
         if self.backend.action_tokenizer is not None:
@@ -1974,12 +1985,11 @@ class G05Policy(PreTrainedPolicy):
         with torch.autocast(
             device_type=device.type,
             dtype=torch.bfloat16,
-            # `is_amp_available`, not a CUDA literal: autocast works on Ascend through
-            # torch_npu, and an `enabled=False` here does not merely decline to cast -- it
-            # suppresses an outer autocast too, so this line was also what made
-            # `--accelerator.mixed_precision=bf16` a no-op on NPU. The FP32 config still
-            # disables it deliberately, on every backend, as before.
-            enabled=self.config.dtype == torch.bfloat16 and is_amp_available(device.type),
+            # Not a CUDA literal: autocast works on Ascend through torch_npu, and an
+            # `enabled=False` here does not merely decline to cast -- it suppresses an outer
+            # autocast too, so this line was also what made `--accelerator.mixed_precision=bf16`
+            # a no-op on NPU. The FP32 config still disables it deliberately, on every backend.
+            enabled=self.config.dtype == torch.bfloat16 and _bf16_recipe_applies(device),
         ):
             result = self.backend.predict_action(prepared)
         action = result["ar_action"] if self.config.action_head == "actioncodec" else result[ACTION]
@@ -2052,12 +2062,11 @@ class G05Policy(PreTrainedPolicy):
         with torch.autocast(
             device_type=device.type,
             dtype=torch.bfloat16,
-            # `is_amp_available`, not a CUDA literal: autocast works on Ascend through
-            # torch_npu, and an `enabled=False` here does not merely decline to cast -- it
-            # suppresses an outer autocast too, so this line was also what made
-            # `--accelerator.mixed_precision=bf16` a no-op on NPU. The FP32 config still
-            # disables it deliberately, on every backend, as before.
-            enabled=self.config.dtype == torch.bfloat16 and is_amp_available(device.type),
+            # Not a CUDA literal: autocast works on Ascend through torch_npu, and an
+            # `enabled=False` here does not merely decline to cast -- it suppresses an outer
+            # autocast too, so this line was also what made `--accelerator.mixed_precision=bf16`
+            # a no-op on NPU. The FP32 config still disables it deliberately, on every backend.
+            enabled=self.config.dtype == torch.bfloat16 and _bf16_recipe_applies(device),
         ):
             loss, loss_dict = self.backend(prepared)
         logging_values = {
